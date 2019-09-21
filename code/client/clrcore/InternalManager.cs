@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -19,6 +20,8 @@ namespace CitizenFX.Core
 		private static readonly List<Tuple<DateTime, AsyncCallback>> ms_delays = new List<Tuple<DateTime, AsyncCallback>>();
 		private static int ms_instanceId;
 
+		private string m_resourceName;
+
 		public static IScriptHost ScriptHost { get; internal set; }
 
 		// actually, domain-global
@@ -36,11 +39,33 @@ namespace CitizenFX.Core
 			Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
 
 			InitializeAssemblyResolver();
+
 			CitizenTaskScheduler.Create();
+		}
+
+		[SecuritySafeCritical]
+		public void CreateTaskScheduler()
+		{
+			CitizenTaskScheduler.MakeDefault();
 
 #if !IS_FXSERVER
 			SynchronizationContext.SetSynchronizationContext(new CitizenSynchronizationContext());
 #endif
+		}
+
+		[SecuritySafeCritical]
+		public void Destroy()
+		{
+			if (m_retvalBuffer != IntPtr.Zero)
+			{
+				Marshal.FreeHGlobal(m_retvalBuffer);
+				m_retvalBuffer = IntPtr.Zero;
+			}
+		}
+
+		public void SetResourceName(string resourceName)
+		{
+			m_resourceName = resourceName;
 		}
 
 		[SecuritySafeCritical]
@@ -61,6 +86,8 @@ namespace CitizenFX.Core
 		{
 			if (!ms_definedScripts.Contains(script))
 			{
+				script.InitializeOnAdd();
+
 				ms_definedScripts.Add(script);
 			}
 		}
@@ -85,16 +112,20 @@ namespace CitizenFX.Core
 		{
 			if (ms_loadedAssemblies.ContainsKey(assemblyFile))
 			{
+#if !IS_FXSERVER
 				Debug.WriteLine("Returning previously loaded assembly {0}", ms_loadedAssemblies[assemblyFile].FullName);
+#endif
 				return ms_loadedAssemblies[assemblyFile];
 			}
 
 			var assembly = Assembly.Load(assemblyData, symbolData);
+#if !IS_FXSERVER
 			Debug.WriteLine("Loaded {1} into {0}", AppDomain.CurrentDomain.FriendlyName, assembly.FullName);
+#endif
 
 			ms_loadedAssemblies[assemblyFile] = assembly;
 
-			var definedTypes = assembly.GetTypes().Where(t => !t.IsAbstract && t.IsSubclassOf(typeof(BaseScript)));
+			var definedTypes = assembly.GetTypes().Where(t => !t.IsAbstract && t.IsSubclassOf(typeof(BaseScript)) && t.GetConstructor(Type.EmptyTypes) != null);
 
 			foreach (var type in definedTypes)
 			{
@@ -104,169 +135,7 @@ namespace CitizenFX.Core
 					
 					Debug.WriteLine("Instantiated instance of script {0}.", type.FullName);
 
-					var allMethods = derivedScript.GetType().GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
-
-					IEnumerable<MethodInfo> GetMethods(Type t)
-					{
-						return allMethods.Where(m => m.GetCustomAttributes(t, false).Length > 0);
-					}
-
-					// register all Tick decorators
-					try
-					{
-						foreach (var method in GetMethods(typeof(TickAttribute)))
-						{
-							Debug.WriteLine("Registering Tick for attributed method {0}", method.Name);
-
-							if (method.IsStatic)
-								derivedScript.RegisterTick((Func<Task>)Delegate.CreateDelegate(typeof(Func<Task>), method));
-							else
-								derivedScript.RegisterTick((Func<Task>)Delegate.CreateDelegate(typeof(Func<Task>), derivedScript, method.Name));
-						}
-					}
-					catch (Exception e)
-					{
-						Debug.WriteLine("Registering Tick failed: {0}", e.ToString());
-					}
-
-					// register all EventHandler decorators
-					try
-					{
-						foreach (var method in GetMethods(typeof(EventHandlerAttribute)))
-						{
-							var parameters = method.GetParameters().Select(p => p.ParameterType).ToArray();
-							var actionType = Expression.GetDelegateType(parameters.Concat(new[] { typeof(void) }).ToArray());
-							var attribute = method.GetCustomAttribute<EventHandlerAttribute>();
-
-							Debug.WriteLine("Registering EventHandler {2} for attributed method {0}, with parameters {1}", method.Name, String.Join(", ", parameters.Select(p => p.GetType().ToString())), attribute.Name);
-
-							if (method.IsStatic)
-								derivedScript.RegisterEventHandler(attribute.Name, Delegate.CreateDelegate(actionType, method));
-							else
-								derivedScript.RegisterEventHandler(attribute.Name, Delegate.CreateDelegate(actionType, derivedScript, method.Name));
-						}
-					}
-					catch (Exception e)
-					{
-						Debug.WriteLine("Registering EventHandler failed: {0}", e.ToString());
-					}
-
-					// register all commands
-					try
-					{
-						foreach (var method in GetMethods(typeof(CommandAttribute)))
-						{
-							var attribute = method.GetCustomAttribute<CommandAttribute>();
-							var parameters = method.GetParameters();
-
-							Debug.WriteLine("Registering command {0}", attribute.Command);
-
-							// no params, trigger only
-							if (parameters.Length == 0)
-							{
-								if (method.IsStatic)
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(null, null);
-									}), attribute.Restricted);
-								}
-								else
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(derivedScript, null);
-									}), attribute.Restricted);
-								}
-							}
-							// Player
-							else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 1)
-							{
-#if IS_FXSERVER
-								if (method.IsStatic)
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(null, new object[] { new Player(source.ToString()) });
-									}), attribute.Restricted);
-								}
-								else
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(derivedScript, new object[] { new Player(source.ToString()) });
-									}), attribute.Restricted);
-								}
-#else
-							Debug.WriteLine("Client commands with parameter type Player not supported");
-#endif
-							}
-							// string[]
-							else if (parameters.Length == 1)
-							{
-								if (method.IsStatic)
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(null, new object[] { args.Select(a => (string)a).ToArray() });
-									}), attribute.Restricted);
-								}
-								else
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(derivedScript, new object[] { args.Select(a => (string)a).ToArray() });
-									}), attribute.Restricted);
-								}
-							}
-							// Player, string[]
-							else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 2)
-							{
-#if IS_FXSERVER
-								if (method.IsStatic)
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(null, new object[] { new Player(source.ToString()), args.Select(a => (string)a).ToArray() });
-									}), attribute.Restricted);
-								}
-								else
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(derivedScript, new object[] { new Player(source.ToString()), args.Select(a => (string)a).ToArray() });
-									}), attribute.Restricted);
-								}
-#else
-							Debug.WriteLine("Client commands with parameter type Player not supported");
-#endif
-							}
-							// legacy --> int, List<object>, string
-							else
-							{
-								if (method.IsStatic)
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(null, new object[] { source, args, rawCommand });
-									}), attribute.Restricted);
-								}
-								else
-								{
-									Native.API.RegisterCommand(attribute.Command, new Action<int, List<object>, string>((source, args, rawCommand) =>
-									{
-										method.Invoke(derivedScript, new object[] { source, args, rawCommand });
-									}), attribute.Restricted);
-								}
-							}
-						}
-					}
-					catch (Exception e)
-					{
-						Debug.WriteLine("Registering command failed: {0}", e.ToString());
-					}
-
-					ms_definedScripts.Add(derivedScript);
+					AddScript(derivedScript);
 				}
 				catch (Exception e)
 				{
@@ -290,55 +159,105 @@ namespace CitizenFX.Core
 			Debug.WriteLine("Unhandled exception: {0}", e.ExceptionObject.ToString());
 		}
 
+		private static HashSet<string> ms_assemblySearchPaths = new HashSet<string>();
+
 		public void LoadAssembly(string name)
 		{
 			LoadAssemblyInternal(name.Replace(".dll", ""));
 		}
 
-		static Assembly LoadAssemblyInternal(string name)
+		static Assembly LoadAssemblyInternal(string baseName, bool useSearchPaths = false)
 		{
-			try
+			var attemptPaths = new List<string>();
+			attemptPaths.Add(baseName);
+
+			var exceptions = new StringBuilder();
+
+			if (useSearchPaths)
 			{
-				var assemblyStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".dll")));
-				var assemblyBytes = assemblyStream.ReadBytes((int)assemblyStream.BaseStream.Length);
+				foreach (var path in ms_assemblySearchPaths)
+				{
+					attemptPaths.Add($"{path.Replace('\\', '/')}/{baseName}");
+				}
+			}
 
-				byte[] symbolBytes = null;
-
+			foreach (var name in attemptPaths)
+			{
 				try
 				{
-					var symbolStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".dll.mdb")));
-					symbolBytes = symbolStream.ReadBytes((int)symbolStream.BaseStream.Length);
-				}
-				catch
-				{
+					byte[] assemblyBytes;
+
+					using (var assemblyStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".dll"))))
+					{
+						assemblyBytes = assemblyStream.ReadBytes((int)assemblyStream.BaseStream.Length);
+					}
+
+					byte[] symbolBytes = null;
+
 					try
 					{
-						var symbolStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".pdb")));
-						symbolBytes = symbolStream.ReadBytes((int)symbolStream.BaseStream.Length);
+						using (var symbolStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".dll.mdb"))))
+						{
+							symbolBytes = symbolStream.ReadBytes((int)symbolStream.BaseStream.Length);
+						}
 					}
 					catch
 					{
-						// nothing
+						try
+						{
+							using (var symbolStream = new BinaryReader(new FxStreamWrapper(ScriptHost.OpenHostFile(name + ".pdb"))))
+							{
+								symbolBytes = symbolStream.ReadBytes((int)symbolStream.BaseStream.Length);
+							}
+						}
+						catch
+						{
+							// nothing
+						}
 					}
-				}
 
-				return CreateAssemblyInternal(name + ".dll", assemblyBytes, symbolBytes);
+					if (assemblyBytes != null)
+					{
+						var dirName = Path.GetDirectoryName(name);
+
+						if (!string.IsNullOrWhiteSpace(dirName))
+						{
+							ms_assemblySearchPaths.Add(dirName);
+						}
+					}
+
+					return CreateAssemblyInternal(name + ".dll", assemblyBytes, symbolBytes);
+				}
+				catch (Exception e)
+				{
+					//Switching the FileNotFound to a NotImplemented tells mono to disable I18N support.
+					//See: https://github.com/mono/mono/blob/8fee89e530eb3636325306c66603ba826319e8c5/mcs/class/corlib/System.Text/EncodingHelper.cs#L131
+					if (e is FileNotFoundException && string.Equals(name, "I18N", StringComparison.OrdinalIgnoreCase))
+						throw new NotImplementedException("I18N not found", e);
+
+					exceptions.AppendLine($"Exception loading assembly {name}: {e}");
+				}
 			}
-			catch (Exception e)
+
+			if (!baseName.Contains(".resources"))
 			{
-				//Switching the FileNotFound to a NotImplemented tells mono to disable I18N support.
-				//See: https://github.com/mono/mono/blob/8fee89e530eb3636325306c66603ba826319e8c5/mcs/class/corlib/System.Text/EncodingHelper.cs#L131
-				if (e is FileNotFoundException && string.Equals(name, "I18N", StringComparison.OrdinalIgnoreCase))
-					throw new NotImplementedException("I18N not found", e);
-				Debug.WriteLine($"Exception loading assembly {name}: {e}");
+				Debug.WriteLine($"Could not load assembly {baseName} - loading exceptions: {exceptions}");
 			}
 
 			return null;
 		}
 
+		[SecuritySafeCritical]
+		public byte[] WalkStack(byte[] boundaryStart, byte[] boundaryEnd)
+		{
+			var success = GameInterface.WalkStackBoundary(m_resourceName, boundaryStart, boundaryEnd, out var blob);
+
+			return (success) ? blob : null;
+		}
+
 		static Assembly CurrentDomain_AssemblyResolve(object sender, ResolveEventArgs args)
 		{
-			return LoadAssemblyInternal(args.Name.Split(',')[0]);
+			return LoadAssemblyInternal(args.Name.Split(',')[0], useSearchPaths: true);
 		}
 
 		public static void AddDelay(int delay, AsyncCallback callback)
@@ -351,8 +270,14 @@ namespace CitizenFX.Core
 			GlobalManager.Tick();
 		}
 
+		[SecuritySafeCritical]
 		public void Tick()
 		{
+			if (GameInterface.SnapshotStackBoundary(out var b))
+			{
+				ScriptHost.SubmitBoundaryStart(b, b.Length);
+			}
+
 			try
 			{
 				ScriptContext.GlobalCleanUp();
@@ -380,12 +305,22 @@ namespace CitizenFX.Core
 			}
 			catch (Exception e)
 			{
-				Debug.WriteLine("Error during Tick: {0}", e.ToString());
+				PrintError("tick", e);
+			}
+			finally
+			{
+				ScriptHost.SubmitBoundaryStart(null, 0);
 			}
 		}
 
+		[SecuritySafeCritical]
 		public void TriggerEvent(string eventName, byte[] argsSerialized, string sourceString)
 		{
+			if (GameInterface.SnapshotStackBoundary(out var bo))
+			{
+				ScriptHost.SubmitBoundaryStart(bo, bo.Length);
+			}
+
 			try
 			{
 				var obj = MsgPackDeserializer.Deserialize(argsSerialized, netSource: (sourceString.StartsWith("net") ? sourceString : null)) as List<object> ?? (IEnumerable<object>)new object[0];
@@ -414,7 +349,11 @@ namespace CitizenFX.Core
 			}
 			catch (Exception e)
 			{
-				Debug.WriteLine(e.ToString());
+				PrintError($"event ({eventName})", e);
+			}
+			finally
+			{
+				ScriptHost.SubmitBoundaryStart(null, 0);
 			}
 		}
 
@@ -435,30 +374,46 @@ namespace CitizenFX.Core
 		[SecuritySafeCritical]
 		public void CallRef(int refIndex, byte[] argsSerialized, out IntPtr retvalSerialized, out int retvalSize)
 		{
-			var retvalData = FunctionReference.Invoke(refIndex, argsSerialized);
-
-			if (retvalData != null)
+			if (GameInterface.SnapshotStackBoundary(out var b))
 			{
-				if (m_retvalBuffer == IntPtr.Zero)
-				{
-					m_retvalBuffer = Marshal.AllocHGlobal(32768);
-					m_retvalBufferSize = 32768;
-				}
-
-				if (m_retvalBufferSize < retvalData.Length)
-				{
-					m_retvalBuffer = Marshal.ReAllocHGlobal(m_retvalBuffer, new IntPtr(retvalData.Length));
-				}
-
-				Marshal.Copy(retvalData, 0, m_retvalBuffer, retvalData.Length);
-
-				retvalSerialized = m_retvalBuffer;
-				retvalSize = retvalData.Length;
+				ScriptHost.SubmitBoundaryStart(b, b.Length);
 			}
-			else
+
+			try
+			{
+				var retvalData = FunctionReference.Invoke(refIndex, argsSerialized);
+
+				if (retvalData != null)
+				{
+					if (m_retvalBuffer == IntPtr.Zero)
+					{
+						m_retvalBuffer = Marshal.AllocHGlobal(32768);
+						m_retvalBufferSize = 32768;
+					}
+
+					if (m_retvalBufferSize < retvalData.Length)
+					{
+						m_retvalBuffer = Marshal.ReAllocHGlobal(m_retvalBuffer, new IntPtr(retvalData.Length));
+						m_retvalBufferSize = retvalData.Length;
+					}
+
+					Marshal.Copy(retvalData, 0, m_retvalBuffer, retvalData.Length);
+
+					retvalSerialized = m_retvalBuffer;
+					retvalSize = retvalData.Length;
+				}
+				else
+				{
+					retvalSerialized = IntPtr.Zero;
+					retvalSize = 0;
+				}
+			}
+			catch (Exception e)
 			{
 				retvalSerialized = IntPtr.Zero;
 				retvalSize = 0;
+
+				PrintError($"reference call", e.InnerException ?? e);
 			}
 		}
 
@@ -500,6 +455,47 @@ namespace CitizenFX.Core
 			return null;
 		}
 
+		[SecuritySafeCritical]
+		private void PrintError(string where, Exception what)
+		{
+			ScriptHost.SubmitBoundaryEnd(null, 0);
+
+			var stackTrace = new StackTrace(what, true);
+			var frames = stackTrace.GetFrames()
+				.Select(a => new
+				{
+					Frame = a,
+					Method = a.GetMethod(),
+					Type = a.GetMethod()?.DeclaringType
+				})
+				.Where(a => a.Method != null && (!a.Type.Assembly.GetName().Name.Contains("mscorlib") && !a.Type.Assembly.GetName().Name.Contains("CitizenFX.Core") && !a.Type.Assembly.GetName().Name.StartsWith("System")))
+				.Select(a => new
+				{
+					name = EnhancedStackTrace.GetMethodDisplayString(a.Method).ToString(),
+					sourcefile = a.Frame.GetFileName() ?? "",
+					line = a.Frame.GetFileLineNumber(),
+					file = $"@{m_resourceName}/{a.Type?.Assembly.GetName().Name ?? "UNK"}.dll"
+				});
+
+			var serializedFrames = MsgPackSerializer.Serialize(frames);
+			var formattedStackTrace = FormatStackTrace(serializedFrames);
+
+			if (formattedStackTrace != null)
+			{
+				Debug.WriteLine($"^1SCRIPT ERROR in {where}: {what.GetType().FullName}: {what.Message}^7");
+				Debug.WriteLine("{0}", formattedStackTrace);
+			}
+		}
+
+		[SecurityCritical]
+		private unsafe string FormatStackTrace(byte[] serializedFrames)
+		{
+			fixed (byte* ptr = serializedFrames)
+			{
+				return Native.Function.Call<string>((Native.Hash)0xd70c3bca, ptr, serializedFrames.Length);
+			}
+		}
+
 		private class DirectScriptHost : IScriptHost
 		{
 			private IntPtr hostPtr;
@@ -509,6 +505,8 @@ namespace CitizenFX.Core
 			private FastMethod<Func<IntPtr, IntPtr, IntPtr, int>> openHostFileMethod;
 			private FastMethod<Func<IntPtr, int, int, IntPtr, int>> canonicalizeRefMethod;
 			private FastMethod<Action<IntPtr, IntPtr>> scriptTraceMethod;
+			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryStartMethod;
+			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryEndMethod;
 
 			[SecuritySafeCritical]
 			public DirectScriptHost(IntPtr hostPtr)
@@ -520,6 +518,8 @@ namespace CitizenFX.Core
 				openHostFileMethod = new FastMethod<Func<IntPtr, IntPtr, IntPtr, int>>(nameof(openHostFileMethod), hostPtr, 2);
 				canonicalizeRefMethod = new FastMethod<Func<IntPtr, int, int, IntPtr, int>>(nameof(canonicalizeRefMethod), hostPtr, 3);
 				scriptTraceMethod = new FastMethod<Action<IntPtr, IntPtr>>(nameof(scriptTraceMethod), hostPtr, 4);
+				submitBoundaryStartMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryStartMethod), hostPtr, 5);
+				submitBoundaryEndMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryEndMethod), hostPtr, 6);
 			}
 
 			[SecuritySafeCritical]
@@ -553,7 +553,10 @@ namespace CitizenFX.Core
 					Marshal.FreeHGlobal(stringRef);
 				}
 
-				return (fxIStream)Marshal.GetObjectForIUnknown(retVal);
+				var s = (fxIStream)Marshal.GetObjectForIUnknown(retVal);
+				Marshal.Release(retVal);
+
+				return s;
 			}
 
 			[SecuritySafeCritical]
@@ -580,7 +583,10 @@ namespace CitizenFX.Core
 					Marshal.FreeHGlobal(stringRef);
 				}
 
-				return (fxIStream)Marshal.GetObjectForIUnknown(retVal);
+				var s = (fxIStream)Marshal.GetObjectForIUnknown(retVal);
+				Marshal.Release(retVal);
+
+				return s;
 			}
 
 			[SecuritySafeCritical]
@@ -622,6 +628,27 @@ namespace CitizenFX.Core
 				fixed (byte* p = bytes)
 				{
 					scriptTraceMethod.method(hostPtr, new IntPtr(p));
+				}
+			}
+
+			[SecuritySafeCritical]
+			public void SubmitBoundaryStart(byte[] boundaryData, int boundarySize)
+			{
+				SubmitBoundaryInternal(submitBoundaryStartMethod, boundaryData, boundarySize);
+			}
+
+			[SecuritySafeCritical]
+			public void SubmitBoundaryEnd(byte[] boundaryData, int boundarySize)
+			{
+				SubmitBoundaryInternal(submitBoundaryEndMethod, boundaryData, boundarySize);
+			}
+
+			[SecurityCritical]
+			private unsafe void SubmitBoundaryInternal(FastMethod<Action<IntPtr, IntPtr, int>> method, byte[] boundaryData, int boundarySize)
+			{
+				fixed (byte* p = boundaryData)
+				{
+					method.method(hostPtr, new IntPtr(p), boundarySize);
 				}
 			}
 		}

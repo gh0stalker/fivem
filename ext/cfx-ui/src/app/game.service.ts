@@ -8,12 +8,18 @@ import { environment } from '../environments/environment';
 import { DiscourseService } from './discourse.service';
 import { LocaleStorage } from 'angular-l10n';
 import { LocalStorage } from './local-storage';
+import { Observable, BehaviorSubject } from 'rxjs';
 
 export class ConnectStatus {
 	public server: Server;
 	public message: string;
 	public count: number;
 	public total: number;
+}
+
+export class ConnectCard {
+	public server: Server;
+	public card: string;
 }
 
 export class Profile {
@@ -30,23 +36,36 @@ export class Profiles {
 	public profiles: Profile[];
 }
 
+class ConvarWrapper {
+	observable: BehaviorSubject<string>;
+	value: string;
+
+	constructor(public name: string) {
+		this.observable = new BehaviorSubject<string>('');
+	}
+}
+
 @Injectable()
 export abstract class GameService {
 	connectFailed = new EventEmitter<[Server, string]>();
 	connectStatus = new EventEmitter<ConnectStatus>();
+	connectCard = new EventEmitter<ConnectCard>();
 	connecting = new EventEmitter<Server>();
 
 	errorMessage = new EventEmitter<string>();
 	infoMessage = new EventEmitter<string>();
 
-	devModeChange = new EventEmitter<boolean>();
-	darkThemeChange = new EventEmitter<boolean>();
-	nicknameChange = new EventEmitter<string>();
-	localhostPortChange = new EventEmitter<string>();
+	devModeChange = new BehaviorSubject<boolean>(false);
+	darkThemeChange = new BehaviorSubject<boolean>(false);
+	nicknameChange = new BehaviorSubject<string>('');
+	localhostPortChange = new BehaviorSubject<string>('');
+	languageChange = new BehaviorSubject<string>('en');
 
 	signinChange = new EventEmitter<Profile>();
 
 	profile: Profile = null;
+
+	convars: { [name: string]: ConvarWrapper } = {};
 
 	get nickname(): string {
 		return 'UnknownPlayer';
@@ -78,8 +97,16 @@ export abstract class GameService {
 
 	set localhostPort(name: string) {
 
-	}	
-	
+	}
+
+	get language(): string {
+		return 'en';
+	}
+
+	set language(lang: string) {
+
+	}
+
 	abstract init(): void;
 
 	abstract connectTo(server: Server, enteredAddress?: string): void;
@@ -144,21 +171,64 @@ export abstract class GameService {
 		});
 	}
 
+	protected invokeConnectCard(server: Server, cardBlob: string) {
+		this.connectCard.emit({
+			server:  server,
+			card:    cardBlob
+		});
+	}
+
 	protected invokeNicknameChanged(name: string) {
-		this.nicknameChange.emit(name);
+		this.nicknameChange.next(name);
 	}
 
 	protected invokeDevModeChanged(value: boolean) {
-		this.devModeChange.emit(value);
+		this.devModeChange.next(value);
 	}
 
 	protected invokeDarkThemeChanged(value: boolean) {
-		this.darkThemeChange.emit(value);
+		this.darkThemeChange.next(value);
 	}
 	
 	protected invokeLocalhostPortChanged(port: string) {
-		this.localhostPortChange.emit(port);
-	}	
+		this.localhostPortChange.next(port);
+	}
+
+	protected invokeLanguageChanged(lang: string) {
+		this.languageChange.next(lang);
+	}
+
+	protected getConvarSubject(name: string) {
+		if (!this.convars[name]) {
+			this.convars[name] = new ConvarWrapper(name);
+		}
+
+		return this.convars[name].observable;
+	}
+
+	public getConvar(name: string): Observable<string> {
+		return this.getConvarSubject(name);
+	}
+
+	public getConvarValue(name: string) {
+		if (!this.convars[name]) {
+			this.convars[name] = new ConvarWrapper(name);
+		}
+
+		return this.convars[name].value;
+	}
+
+	public setConvar(name: string, value: string) {
+
+	}
+
+	public setDiscourseIdentity(token: string, clientId: string) {
+
+	}
+
+	public submitCardResponse(data: any) {
+
+	}
 }
 
 export class ServerHistoryEntry {
@@ -188,6 +258,8 @@ export class CfxGameService extends GameService {
 	private realNickname: string;
 	
 	private _localhostPort: string;
+
+	private _language: string;
 	
 	private inConnecting = false;
 
@@ -197,6 +269,7 @@ export class CfxGameService extends GameService {
 
 	init() {
 		(<any>window).invokeNative('getFavorites', '');
+		(<any>window).invokeNative('getConvars', '');
 
 		fetch('https://nui-internal/profiles/list').then(async response => {
 			const json = <Profiles>await response.json();
@@ -204,6 +277,10 @@ export class CfxGameService extends GameService {
 			if (json.profiles && json.profiles.length > 0) {
 				this.handleSignin(json.profiles[0]);
 			}
+		});
+
+		this.discourseService.signinChange.subscribe(identity => {
+			this.setDiscourseIdentity(this.discourseService.getToken(), this.discourseService.getExtClientId());
 		});
 
 		this.discourseService.messageEvent.subscribe((msg) => {
@@ -230,6 +307,11 @@ export class CfxGameService extends GameService {
 							this.invokeConnectStatus(
 								this.lastServer, event.data.data.message, event.data.data.count, event.data.data.total));
 						break;
+					case 'connectCard':
+						this.zone.run(() =>
+							this.invokeConnectCard(
+								this.lastServer, event.data.data.card));
+						break;
 					case 'serverAdd':
 						if (event.data.addr in this.pingList) {
 							this.pingListEvents.push([event.data.addr, event.data.ping]);
@@ -244,6 +326,18 @@ export class CfxGameService extends GameService {
 					case 'addToHistory':
 						this.history.push(event.data.address);
 						this.saveHistory();
+						break;
+					case 'convarSet':
+						const convar = this.getConvarSubject(event.data.name);
+
+						const convarItem = this.convars[event.data.name];
+						convarItem.value = event.data.value;
+
+						this.zone.run(() => convar.next(event.data.value));
+
+						setTimeout(() => {
+							this.discourseService.setOwnershipTicket(this.getConvarValue('cl_ownershipTicket'));
+						}, 500);
 						break;
 				}
 			});
@@ -266,21 +360,25 @@ export class CfxGameService extends GameService {
 		this.history = JSON.parse(localStorage.getItem('history')) || [];
 
 		if (localStorage.getItem('nickOverride')) {
-			(<any>window).invokeNative('checkNickname', localStorage.getItem('nickOverride'));
-			this.realNickname = localStorage.getItem('nickOverride');
+			//(<any>window).invokeNative('checkNickname', localStorage.getItem('nickOverride'));
+			this.nickname = localStorage.getItem('nickOverride');
 		}
 
 		if (localStorage.getItem('devMode')) {
-			this._devMode = localStorage.getItem('devMode') === 'yes';
+			this.devMode = localStorage.getItem('devMode') === 'yes';
 		}
 
 		if (localStorage.getItem('darkTheme')) {
-			this._darkTheme = localStorage.getItem('darkTheme') === 'yes';
+			this.darkTheme = localStorage.getItem('darkTheme') === 'yes';
 		}
 
 		if (localStorage.getItem('localhostPort')) {
-			this._localhostPort = localStorage.getItem('localhostPort');
-		}		
+			this.localhostPort = localStorage.getItem('localhostPort');
+		}
+
+		if (localStorage.getItem('language')) {
+			this.language = localStorage.getItem('language');
+		}
 		
 		this.connecting.subscribe(server => {
 			this.inConnecting = false;
@@ -361,6 +459,16 @@ export class CfxGameService extends GameService {
 		this._localhostPort = port;
 		localStorage.setItem('localhostPort', port);
 		this.invokeLocalhostPortChanged(port);
+	}
+
+	get language(): string {
+		return this._language;
+	}
+
+	set language(lang: string) {
+		this._language = lang;
+		localStorage.setItem('language', lang);
+		this.invokeLanguageChanged(lang);
 	}
 	
 	private saveHistory() {
@@ -446,6 +554,10 @@ export class CfxGameService extends GameService {
 		(<any>window).invokeNative('cancelDefer', '');
 	}
 
+	public setConvar(name: string, value: string) {
+		(<any>window).invokeNative('setConvar', JSON.stringify({ name, value }));
+	}
+
 	lastQuery: string;
 
 	queryAddress(address: [string, number]): Promise<Server> {
@@ -457,7 +569,7 @@ export class CfxGameService extends GameService {
 					return;
 				}
 
-				reject(new Error("Server query timed out."));
+				reject(new Error('#DirectConnect_TimedOut'));
 
 				window.removeEventListener('message', cb);
 			}, 2500);
@@ -470,7 +582,7 @@ export class CfxGameService extends GameService {
 
 				if (event.data.type == 'queryingFailed') {
 					if (event.data.arg == addrString) {
-						reject(new Error("Failed to query server."));
+						reject(new Error('#DirectConnect_Failed'));
 						window.removeEventListener('message', cb);
 						window.clearTimeout(to);
 					}
@@ -497,6 +609,14 @@ export class CfxGameService extends GameService {
 	openUrl(url: string): void {
 		(<any>window).invokeNative('openUrl', url);
 	}
+
+	setDiscourseIdentity(token: string, clientId: string) {
+		(<any>window).invokeNative('setDiscourseIdentity', JSON.stringify({ token, clientId }));
+	}
+
+	public submitCardResponse(data: any) {
+		(<any>window).invokeNative('submitCardResponse', JSON.stringify({ data }));
+	}
 }
 
 @Injectable()
@@ -504,6 +624,7 @@ export class DummyGameService extends GameService {
 	private _devMode = false;
 	private _darkTheme = false;
 	private _localhostPort = '';
+	private _language = '';
 	private pinExample = '';
 
 	constructor(private serversService: ServersService, @Inject(LocalStorage) private localStorage: any) {
@@ -623,7 +744,7 @@ export class DummyGameService extends GameService {
 		this.localStorage.setItem('localhostPort', port);
 
 		this.invokeLocalhostPortChanged(port);
-	}	
+	}
 	
 	get devMode(): boolean {
 		return this._devMode;
@@ -634,5 +755,15 @@ export class DummyGameService extends GameService {
 		this.localStorage.setItem('devMode', value ? 'yes' : 'no');
 
 		this.invokeDevModeChanged(value);
+	}
+
+	get language(): string {
+		return this.localStorage.getItem('language') || navigator.language;
+	}
+
+	set language(lang: string) {
+		this.localStorage.setItem('language', lang);
+
+		this.invokeLanguageChanged(lang);
 	}
 }

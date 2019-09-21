@@ -1,7 +1,7 @@
-import { Component, OnInit, PLATFORM_ID, Inject } from '@angular/core';
+import { Component, OnInit, PLATFORM_ID, Inject, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 
-import { Server, ServerIcon, PinConfig } from '../server';
+import { Server, ServerIcon, PinConfigCached } from '../server';
 import { ServersService } from '../servers.service';
 import { ServerFilters, ServerFilterContainer, ServerTags } from './server-filter.component';
 
@@ -17,7 +17,8 @@ import 'rxjs/add/operator/bufferTime';
     moduleId: module.id,
     selector: 'servers-container',
     templateUrl: 'servers-container.component.html',
-    styleUrls: ['servers-container.component.scss']
+    styleUrls: ['servers-container.component.scss'],
+    changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class ServersContainerComponent implements OnInit {
     servers: { [addr: string]: Server } = {};
@@ -25,16 +26,16 @@ export class ServersContainerComponent implements OnInit {
     localServers: Server[]; // temp value
     icons: ServerIcon[];
 
-    pinConfig: PinConfig;
+    pinConfig: PinConfigCached;
 
     filters: ServerFilterContainer;
 
     type: string;
 
     constructor(private serverService: ServersService, private gameService: GameService, private route: ActivatedRoute,
-        @Inject(PLATFORM_ID) private platformId: any) {
+        @Inject(PLATFORM_ID) private platformId: any, private cdr: ChangeDetectorRef) {
         this.filters = new ServerFilterContainer();
-        this.pinConfig = new PinConfig();
+        this.pinConfig = new PinConfigCached(null);
     }
 
     serversArray: Server[] = [];
@@ -49,10 +50,14 @@ export class ServersContainerComponent implements OnInit {
 
     setFilters(filters: ServerFilters) {
         this.filters = {...this.filters, filters};
+
+        this.cdr.markForCheck();
     }
 
     setTags(tags: ServerTags) {
-        this.filters = {...this.filters, tags: { tagList: { ...tags.tagList } }};
+        this.filters = {...this.filters, tags: { tagList: { ...tags.tagList }, localeList: { ...tags.localeList } }};
+
+        this.cdr.markForCheck();
     }
 
     isBrowser() {
@@ -61,7 +66,7 @@ export class ServersContainerComponent implements OnInit {
 
     loadServers() {
         this.serverService.loadPinConfig()
-            .then(pinConfig => this.pinConfig = pinConfig);
+            .then(pinConfig => this.pinConfig = new PinConfigCached(pinConfig));
 
 
         const typedServers = this.serverService
@@ -82,6 +87,8 @@ export class ServersContainerComponent implements OnInit {
             this.serversArray = this.serversArray.slice();
 
             this.servers[server.address] = server;
+
+            this.cdr.markForCheck();
         });
 
         // ping new servers after a while

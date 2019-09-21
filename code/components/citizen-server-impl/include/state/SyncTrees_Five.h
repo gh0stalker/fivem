@@ -257,7 +257,7 @@ struct ParentNode : public NodeBase
 template<typename TIds, typename TNode, typename = void>
 struct NodeWrapper : public NodeBase
 {
-	std::array<uint8_t, 768> data;
+	std::array<uint8_t, 1024> data;
 	uint32_t length;
 
 	TNode node;
@@ -295,7 +295,7 @@ struct NodeWrapper : public NodeBase
 			// read into data array
 			auto length = state.buffer.Read<uint32_t>(13);
 			auto endBit = state.buffer.GetCurrentBit();
-			//auto leftoverLength = length - (endBit - curBit);
+
 			auto leftoverLength = length;
 
 			auto oldData = data;
@@ -378,10 +378,26 @@ struct CVehicleCreationDataNode
 	bool Parse(SyncParseState& state)
 	{
 		uint32_t model = state.buffer.Read<uint32_t>(32);
-		uint8_t popType = state.buffer.Read<uint8_t>(4);
-
 		m_model = model;
+
+		uint8_t popType = state.buffer.Read<uint8_t>(4);
 		m_popType = (ePopType)popType;
+
+		auto randomSeed = state.buffer.Read<int>(16);
+
+		if (m_popType - 6 <= 1)
+		{
+			bool carBudget = state.buffer.ReadBit();
+		}
+
+		int maxHealth = state.buffer.Read<int>(19);
+		int vehicleStatus = state.buffer.Read<int>(3);
+
+		auto time = state.buffer.Read<uint32_t>(32);
+
+		bool needsToBeHotwired = state.buffer.ReadBit();
+		bool tyresDontBurst = state.buffer.ReadBit();
+		bool unk5 = state.buffer.ReadBit();
 
 		return true;
 	}
@@ -398,6 +414,192 @@ struct CVehicleGameStateDataNode
 
 	bool Parse(SyncParseState& state)
 	{
+		int radioStation = state.buffer.Read<int>(6);
+		state.entity->data["radioStation"] = radioStation;
+
+		bool unk1 = state.buffer.ReadBit();
+
+		int isEngineOn = state.buffer.ReadBit();
+		state.entity->data["isEngineOn"] = isEngineOn;
+
+		int isEngineStarting = state.buffer.ReadBit();
+		state.entity->data["isEngineStarting"] = isEngineStarting;
+
+		bool unk4 = state.buffer.ReadBit();
+
+		int handbrake = state.buffer.ReadBit();
+		state.entity->data["handbrake"] = handbrake;
+
+		bool unk6 = state.buffer.ReadBit();
+		bool unk7 = state.buffer.ReadBit();
+		int unk8 = state.buffer.ReadBit();
+		state.entity->data["unk8"] = unk8;
+
+		if (!unk8)
+		{
+			int defaultHeadlights = state.buffer.ReadBit();
+			state.entity->data["defaultHeadlights"] = defaultHeadlights;
+
+			if (!defaultHeadlights)
+			{
+				// NOTE: Even if xenon lights are not enabled, this will still work.
+				int headlightsColour = state.buffer.Read<int>(8);
+				state.entity->data["headlightsColour"] = headlightsColour;
+			}
+
+			int sirenOn = state.buffer.ReadBit();
+			state.entity->data["sirenOn"] = sirenOn;
+
+			bool unk12 = state.buffer.ReadBit();
+
+			if (unk12)
+			{
+				bool unk13 = state.buffer.ReadBit();
+			}
+
+			bool unk14 = state.buffer.ReadBit();
+			int unk15 = state.buffer.ReadBit();
+			state.entity->data["unk15"] = unk15;
+
+			if (unk15)
+			{
+				uint8_t lockStatus = state.buffer.Read<uint8_t>(5);
+				state.entity->data["lockStatus"] = lockStatus;
+
+				auto unk17 = state.buffer.Read<int>(7);
+				auto unbreakableDoors = state.buffer.Read<int>(7);
+
+				auto doorsOpen = state.buffer.Read<int>(7);
+				state.entity->data["doorsOpen"] = doorsOpen;
+
+				int v20 = 0;
+				do
+				{
+					if (1 << v20 & doorsOpen)
+					{
+						auto doorPosition = state.buffer.Read<int>(4); // Status 0->7 7 == completely open
+						state.entity->data["doorPosition" + v20] = doorPosition;
+					}
+					v20++;
+				} while (v20 < 7);
+
+				auto unk21 = state.buffer.Read<int>(8);
+
+				int v22 = 0;
+				do
+				{
+					if (1 << v22 & unk21)
+					{
+						auto unk22 = state.buffer.Read<int>(5);
+					}
+					v22++;
+				} while (v22 < 7);
+			}
+
+			bool anyWindowsOpen = state.buffer.ReadBit();
+
+			if (anyWindowsOpen)
+			{
+				auto openWindows = state.buffer.Read<int>(6);
+			}
+
+			bool unk25 = state.buffer.ReadBit();
+			bool unk26 = state.buffer.ReadBit();
+			bool noLongerNeeded = state.buffer.ReadBit();
+			bool unk28 = state.buffer.ReadBit();
+			bool unk29 = state.buffer.ReadBit();
+			bool unk30 = state.buffer.ReadBit();
+			bool unk31 = state.buffer.ReadBit();
+
+			if (unk31)
+			{
+				float unk32 = state.buffer.ReadFloat(10, 3000);
+			}
+		}
+
+		bool unk33 = state.buffer.ReadBit();
+
+		if (unk33)
+		{
+			uint32_t unk34 = state.buffer.Read<uint32_t>(32);
+
+			short unk35 = state.buffer.Read<short>(13);
+		}
+
+		bool unk36 = state.buffer.ReadBit();
+
+		int v15 = 0x0;
+		if (unk36)
+		{
+			v15 = 0x02;
+			do
+			{
+				auto unk37 = state.buffer.Read<short>(13);
+				v15--;
+			} while (v15);
+		}
+
+		bool unk38 = state.buffer.ReadBit();
+
+		if (unk38)
+		{
+			auto unk39 = state.buffer.Read<short>(13);
+		}
+
+		int lightsOn = state.buffer.ReadBit();
+		state.entity->data["lightsOn"] = lightsOn;
+
+		int highbeamsOn = state.buffer.ReadBit();
+		state.entity->data["highbeamsOn"] = highbeamsOn;
+
+		auto lightState = state.buffer.Read<int>(3); // SetVehicleLights
+
+		bool unk43 = state.buffer.ReadBit();
+		bool unk44 = state.buffer.ReadBit();
+		bool unk45 = state.buffer.ReadBit();
+		bool unk46 = state.buffer.ReadBit();
+		bool unk47 = state.buffer.ReadBit();
+		bool unk48 = state.buffer.ReadBit();
+		auto unk49 = state.buffer.Read<int>(32);
+		auto unk50 = state.buffer.Read<int>(3);
+		bool unk51 = state.buffer.ReadBit();
+		bool unk52 = state.buffer.ReadBit();
+		bool unk53 = state.buffer.ReadBit();
+		bool unk54 = state.buffer.ReadBit();
+		bool unk55 = state.buffer.ReadBit();
+		bool unk56 = state.buffer.ReadBit();
+		bool unk57 = state.buffer.ReadBit();
+		bool unk58 = state.buffer.ReadBit();
+
+		int hasLock = state.buffer.ReadBit();
+		state.entity->data["hasLock"] = hasLock;
+
+		if (hasLock != v15)
+		{
+			int lockedPlayers = state.buffer.Read<int>(32);
+			state.entity->data["lockedPlayers"] = lockedPlayers;
+		}
+
+		bool unk61 = state.buffer.ReadBit();
+		int unk62 = state.buffer.ReadBit();
+
+		if (unk62 != v15)
+		{
+			auto unk62_1 = state.buffer.Read<int>(32);
+		}
+
+		bool unk63 = state.buffer.ReadBit();
+		bool unk64 = state.buffer.ReadBit();
+		int unk65 = state.buffer.ReadBit();
+
+		if (unk65 != v15)
+		{
+			auto unk66 = state.buffer.ReadFloat(8, 16);
+		}
+
+		bool unk67 = state.buffer.ReadBit();
+		bool unk68 = state.buffer.ReadBit();
+
 		return true;
 	}
 };
@@ -454,7 +656,112 @@ struct CPhysicalAttachDataNode { bool Parse(SyncParseState& state) { return true
 struct CVehicleAppearanceDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CVehicleDamageStatusDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CVehicleComponentReservationDataNode { bool Parse(SyncParseState& state) { return true; } };
-struct CVehicleHealthDataNode { bool Parse(SyncParseState& state) { return true; } };
+
+struct CVehicleHealthDataNode
+{
+	bool Parse(SyncParseState& state)
+	{
+		bool unk0 = state.buffer.ReadBit();
+		bool unk1 = state.buffer.ReadBit();
+		bool engineDamaged = state.buffer.ReadBit();
+		bool petrolTankDamaged = state.buffer.ReadBit();
+
+		if (engineDamaged)
+		{
+			auto engineHealth = state.buffer.ReadSigned<int>(19);
+			state.entity->data["engineHealth"] = engineHealth;
+		}
+		else
+		{
+			state.entity->data["engineHealth"] = 1000;
+		}
+
+		if (petrolTankDamaged)
+		{
+			auto petrolTankHealth = state.buffer.ReadSigned<int>(19);
+			state.entity->data["petrolTankHealth"] = petrolTankHealth;
+		}
+		else
+		{
+			state.entity->data["petrolTankHealth"] = 1000;
+		}
+
+		bool tyresFine = state.buffer.ReadBit();
+		state.entity->data["tyresFine"] = tyresFine;
+
+		bool unk7 = state.buffer.ReadBit();
+
+		if (!tyresFine || !unk7)
+		{
+			int totalWheels = state.buffer.Read<int>(4);
+
+			if (!tyresFine)
+			{
+				for (int i = 0; i < totalWheels; i++)
+				{
+					bool bursted = state.buffer.ReadBit();
+					bool onRim = state.buffer.ReadBit();
+					auto unk11 = state.buffer.ReadBit();
+					auto unk12 = state.buffer.ReadBit();
+
+					state.entity->data["tyreStatus" + i] = onRim ? 2 : (bursted ? 1 : 0);
+				}
+			}
+
+			if (!unk7)
+			{
+				for (int i = 0; i < totalWheels; i++)
+				{
+					bool unk13 = state.buffer.ReadBit();
+
+					if (unk13)
+					{
+						int unk14 = state.buffer.Read<int>(10); // Maximum 10000.0
+					}
+				}
+			}
+		}
+
+		bool bodyHealthFine = state.buffer.ReadBit();
+
+		if (!bodyHealthFine)
+		{
+			auto bodyHealth = state.buffer.ReadSigned<int>(19);
+			state.entity->data["bodyHealth"] = bodyHealth;
+		}
+		else
+		{
+			state.entity->data["bodyHealth"] = 1000;
+		}
+
+		bool unk16 = state.buffer.ReadBit();
+
+		if (!unk16)
+		{
+			auto unk17 = state.buffer.ReadSigned<int>(19);
+		}
+
+		bool unk18 = state.buffer.ReadBit();
+
+		if (unk18)
+		{
+			auto unk19 = state.buffer.ReadBit();
+			int lastDamageSource = state.buffer.Read<int>(32);
+		}
+
+		int unk21 = state.buffer.Read<int>(4);
+		int totalRepairs = state.buffer.Read<int>(4); // maximum 15
+		auto unk23 = state.buffer.ReadBit();
+
+		if (unk23)
+		{
+			int unk24 = state.buffer.Read<int>(64);
+		}
+
+		return true;
+	}
+};
+
 struct CVehicleTaskDataNode { bool Parse(SyncParseState& state) { return true; } };
 
 struct CSectorDataNode
@@ -772,7 +1079,71 @@ struct CPedScriptCreationDataNode { bool Parse(SyncParseState& state) { return t
 struct CPedComponentReservationDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CPedScriptGameStateDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CPedAttachDataNode { bool Parse(SyncParseState& state) { return true; } };
-struct CPedHealthDataNode { bool Parse(SyncParseState& state) { return true; } };
+
+struct CPedHealthDataNode
+{
+	bool Parse(SyncParseState& state)
+	{
+		bool isFine = state.buffer.ReadBit();
+		auto maxHealthChanged = state.buffer.ReadBit();
+
+		int maxHealth = 200;
+
+		if (maxHealthChanged)
+		{
+			maxHealth = state.buffer.Read<int>(13);
+		}
+
+		state.entity->data["maxHealth"] = maxHealth;
+
+		if (!isFine)
+		{
+			int pedHealth = state.buffer.Read<int>(13);
+			auto unk4 = state.buffer.ReadBit();
+			auto unk5 = state.buffer.ReadBit();
+
+			state.entity->data["health"] = pedHealth;
+		}
+		else
+		{
+			state.entity->data["health"] = maxHealth;
+		}
+
+		bool noArmour = state.buffer.ReadBit();
+
+		if (!noArmour)
+		{
+			int pedArmour = state.buffer.Read<int>(13);
+			state.entity->data["armour"] = pedArmour;
+		}
+		else
+		{
+			state.entity->data["armour"] = 0;
+		}
+
+		auto unk8 = state.buffer.ReadBit();
+
+		if (unk8) // unk9 != 0
+		{
+			auto unk9 = state.buffer.Read<short>(13);
+		}
+
+		int causeOfDeath = state.buffer.Read<int>(32);
+		state.entity->data["causeOfDeath"] = causeOfDeath;
+
+		int injuredStatus = state.buffer.Read<int>(2); // Change below 150 HP, injured data?
+
+		auto unk13 = state.buffer.ReadBit();
+
+		if (unk13)
+		{
+			int unk14 = state.buffer.Read<int>(8);
+		}
+
+		return true;
+	}
+};
+
 struct CPedMovementGroupDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CPedAIDataNode { bool Parse(SyncParseState& state) { return true; } };
 struct CPedAppearanceDataNode { bool Parse(SyncParseState& state) { return true; } };
@@ -1091,7 +1462,7 @@ struct SyncTree : public SyncTreeBase
 
 		return false;
 	}
-
+		
 	virtual void Parse(SyncParseState& state) final override
 	{
 		std::unique_lock<std::mutex> lock(mutex);

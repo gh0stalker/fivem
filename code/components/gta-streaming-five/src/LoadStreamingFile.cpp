@@ -236,7 +236,7 @@ static bool g_reloadMapStore = false;
 
 static std::set<std::string> loadedCollisions;
 
-int GetCollectionIndexByTag(const std::string& tag);
+int GetDummyCollectionIndexByTag(const std::string& tag);
 extern std::unordered_map<int, std::string> g_handlesToTag;
 
 static void ReloadMapStore()
@@ -262,7 +262,7 @@ static void ReloadMapStore()
 
 				auto mgr = streaming::Manager::GetInstance();
 
-				if (_isResourceNotCached(mgr, obj) || GetCollectionIndexByTag(g_handlesToTag[mgr->Entries[obj].handle]) == -1)
+				if (_isResourceNotCached(mgr, obj) || GetDummyCollectionIndexByTag(g_handlesToTag[mgr->Entries[obj].handle]) == -1)
 				{
 					mgr->RequestObject(obj, 0);
 
@@ -530,6 +530,7 @@ static std::set<std::tuple<std::string, std::string>> g_customStreamingFiles;
 static std::set<std::string> g_customStreamingFileRefs;
 static std::map<std::string, std::vector<std::string>, std::less<>> g_customStreamingFilesByTag;
 static std::unordered_map<int, std::list<uint32_t>> g_handleStack;
+static std::set<std::pair<streaming::strStreamingModule*, int>> g_pendingRemovals;
 std::unordered_map<int, std::string> g_handlesToTag;
 
 static std::unordered_set<int> g_ourIndexes;
@@ -613,6 +614,7 @@ static void LoadStreamingFiles(bool earlyLoad)
 			strModule->GetOrCreate(&strId, nameWithoutExt.c_str());
 
 			g_ourIndexes.insert(strId + strModule->baseIdx);
+			g_pendingRemovals.erase({ strModule, strId });
 
 			// if the asset is already registered...
 			if (cstreaming->Entries[strId + strModule->baseIdx].handle != 0)
@@ -896,6 +898,16 @@ static void LoadDataFiles()
 	}
 }
 
+DLL_EXPORT void ForceMountDataFile(const std::pair<std::string, std::string>& dataFile)
+{
+	std::vector<std::pair<std::string, std::string>> dataFiles = { dataFile };
+
+	HandleDataFileList(dataFiles, [](CDataFileMountInterface* mounter, DataFileEntry& entry)
+	{
+		return mounter->MountFile(&entry);
+	});
+}
+
 void ForAllStreamingFiles(const std::function<void(const std::string&)>& cb)
 {
 	for (auto& entry : g_customStreamingFileRefs)
@@ -1004,7 +1016,8 @@ void DLL_EXPORT CfxCollection_RemoveStreamingTag(const std::string& tag)
 						streaming::Manager::GetInstance()->ReleaseObject(strId + strModule->baseIdx);
 					}
 
-					// TODO: fully delete the streaming object from the module/streamer
+					g_pendingRemovals.insert({ strModule, strId });
+
 					g_customStreamingFileRefs.erase(baseName);
 					entry.handle = 0;
 				}
@@ -1223,7 +1236,71 @@ static void ExecuteGroupForWeaponInfo(void* mgr, uint32_t hashValue, bool value)
 	}
 }
 
+static void(*g_origUnloadWeaponInfos)();
+
+static hook::cdecl_stub<void(void*)> wib_ctor([]()
+{
+	// 1604
+	return (void*)0x140E78710;
+});
+
+struct CWeaponInfoBlob
+{
+	char m_pad[248];
+
+	CWeaponInfoBlob()
+	{
+		wib_ctor(this);
+	}
+};
+
+static atArray<CWeaponInfoBlob>* g_weaponInfoArray;
+
+static void UnloadWeaponInfosStub()
+{
+	g_origUnloadWeaponInfos();
+
+	g_weaponInfoArray->Clear();
+	g_weaponInfoArray->Expand(0x80);
+}
+
+static hook::cdecl_stub<void(int32_t)> rage__fwArchetypeManager__FreeArchetypes([]()
+{
+	return hook::get_pattern("8B F9 8B DE 66 41 3B F0 73 33", -0x19);
+});
+
+static void(*g_origUnloadMapTypes)(void*, uint32_t);
+
+void fwMapTypesStore__Unload(char* assetStore, uint32_t index)
+{
+	auto pool = (atPoolBase*)(assetStore + 56);
+	auto entry = pool->GetAt<char>(index);
+
+	if (entry != nullptr)
+	{
+		if (*(uintptr_t*)entry != 0)
+		{
+			if (g_unloadingCfx)
+			{
+				*(uint16_t*)(entry + 16) &= ~0x14;
+			}
+
+			g_origUnloadMapTypes(assetStore, index);
+		}
+		else
+		{
+			AddCrashometry("maptypesstore_workaround_2", "true");
+		}
+	}
+	else
+	{
+		AddCrashometry("maptypesstore_workaround", "true");
+	}
+}
+
 #include <GameInit.h>
+
+static bool g_lockReload;
 
 static HookFunction hookFunction([] ()
 {
@@ -1342,6 +1419,9 @@ static HookFunction hookFunction([] ()
 		// safely drain the RAGE streamer before we unload everything
 		SafelyDrainStreamer();
 
+		g_lockReload = true;
+		g_unloadingCfx = true;
+
 		UnloadDataFiles();
 
 		std::set<std::string> tags;
@@ -1356,12 +1436,38 @@ static HookFunction hookFunction([] ()
 			CfxCollection_RemoveStreamingTag(tag);
 		}
 
+		auto typesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+
+		for (auto [ module, idx ] : g_pendingRemovals)
+		{
+			if (module == typesStore)
+			{
+				atPoolBase* entryPool = (atPoolBase*)((char*)module + 56);
+				auto entry = entryPool->GetAt<char>(idx);
+
+				*(uint16_t*)(entry + 16) &= ~0x14;
+			}
+
+			streaming::Manager::GetInstance()->ReleaseObject(idx + module->baseIdx);
+
+			if (module == typesStore)
+			{
+				// if unloaded at *runtime* but flags were set, archetypes likely weren't freed - we should
+				// free them now.
+				rage__fwArchetypeManager__FreeArchetypes(idx);
+			}
+
+			module->DeleteEntry(idx);
+		}
+
+		g_pendingRemovals.clear();
+
 		g_unloadingCfx = false;
 	}, -9999);
 
 	OnMainGameFrame.Connect([=]()
 	{
-		if (g_reloadStreamingFiles && g_lockedStreamingFiles == 0)
+		if (g_reloadStreamingFiles && g_lockedStreamingFiles == 0 && !g_lockReload)
 		{
 			LoadStreamingFiles();
 
@@ -1391,6 +1497,8 @@ static HookFunction hookFunction([] ()
 	{
 		if (type == rage::INIT_SESSION)
 		{
+			g_lockReload = false;
+
 			LoadStreamingFiles(true);
 		}
 	});
@@ -1407,9 +1515,32 @@ static HookFunction hookFunction([] ()
 	// special point for CWeaponMgr streaming unload
 	// (game calls CExtraContentManager::ExecuteTitleUpdateDataPatchGroup with a specific group intended for weapon info here)
 	{
-		auto location = hook::get_pattern("45 33 C0 BA E9 C8 73 AA E8", 8);
+		auto location = hook::get_pattern<char>("45 33 C0 BA E9 C8 73 AA E8", 8);
 		hook::set_call(&g_origExecuteGroup, location);
 		hook::call(location, ExecuteGroupForWeaponInfo);
+
+		g_weaponInfoArray = hook::get_address<decltype(g_weaponInfoArray)>(location + 0x74);
+	}
+
+	// don't create an unarmed weapon when *unloading* a WEAPONINFO_FILE in the mounter (this will get badly freed later
+	// which will lead to InitSession failing)
+	{
+		hook::return_function(hook::get_pattern("7C 94 48 85 F6 74 0D 48 8B 06 BA 01 00 00 00", 0x3C));
+	}
+
+	// fully clean weaponinfoblob array when resetting weapon manager
+	// not doing so will lead to parser crashes when a half-reset value is reused
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("45 33 C0 BA E9 C8 73 AA E8", -0x11), UnloadWeaponInfosStub, (void**)&g_origUnloadWeaponInfos);
+		MH_EnableHook(MH_ALL_HOOKS);
+	}
+
+	// fwMapTypesStore double unloading workaround
+	{
+		MH_Initialize();
+		MH_CreateHook(hook::get_pattern("4C 63 C2 33 ED 46 0F B6 0C 00 8B 41 4C", -18), fwMapTypesStore__Unload, (void**)&g_origUnloadMapTypes);
+		MH_EnableHook(MH_ALL_HOOKS);
 	}
 
 	// support CfxRequest for pgRawStreamer

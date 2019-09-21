@@ -61,7 +61,7 @@ workspace "CitizenMP"
 		"client/shared/",
 		"../vendor/jitasm/",
 		"../vendor/rapidjson/include/",
-		"../vendor/fmtlib/",
+		"../vendor/fmtlib/include/",
 		"deplibs/include/",
 		os.getenv("BOOST_ROOT")
 	}
@@ -75,13 +75,13 @@ workspace "CitizenMP"
 	location ((_OPTIONS['builddir'] or "build/") .. _OPTIONS['game'])
 
 	if os.istarget('windows') then
-		buildoptions '/std:c++latest'
+		buildoptions '/std:c++17'
 		
 		if _OPTIONS['game'] ~= 'server' then
 			buildoptions '/await'
 		end
 
-		systemversion '10.0.17134.0'
+		systemversion '10.0.18362.0'
 	end
 
 	-- special build dirs for FXServer
@@ -192,6 +192,27 @@ premake.override(premake.vstudio.dotnetbase, 'debugProps', function(base, cfg)
 	_p(2,'<Optimize>%s</Optimize>', iif(premake.config.isOptimizedBuild(cfg), "true", "false"))
 end)
 
+premake.override(premake.vstudio.vc2010, 'importLanguageTargets', function(base, prj)
+	base(prj)
+
+	local hasPostBuild = false
+
+	for cfg in premake.project.eachconfig(prj) do
+		if cfg.postbuildcommands and #cfg.postbuildcommands > 0 then
+			hasPostBuild = true
+			break
+		end
+	end
+
+	if hasPostBuild then
+		_p(1, '<Target Name="DisablePostBuildEvent" AfterTargets="Link" BeforeTargets="PostBuildEvent">')
+		_p(2, '<PropertyGroup>')
+		_p(3, '<PostBuildEventUseInBuild Condition="\'$(LinkSkippedExecution)\' == \'True\'">false</PostBuildEventUseInBuild>')
+		_p(2, '</PropertyGroup>')
+		_p(1, '</Target>')
+	end
+end)
+
 local function WriteDocumentationFileXml(_premake, _cfg)
 	if _cfg.project.name == 'CitiMonoSystemDrawingStub' then
 		_premake.w(('<AssemblyOriginatorKeyFile>%s</AssemblyOriginatorKeyFile>'):format(
@@ -263,8 +284,11 @@ end)
 		csversion '7.3'
 
 		files { "client/clrcore/*.cs", "client/clrcore/Math/*.cs" }
-
+		
+		files { "../vendor/ben-demystifier/src/Ben.Demystifier/**.cs" }
+		
 		if _OPTIONS['game'] ~= 'server' then
+			defines { 'USE_HYPERDRIVE' }
 			files { "client/clrcore/External/*.cs" }
 		else
 			files { "client/clrcore/Server/*.cs" }
@@ -277,7 +301,21 @@ end)
 			
 		end
 
-		links { "System.dll", "Microsoft.CSharp.dll", "System.Core.dll", "../data/client/citizen/clr2/lib/mono/4.5/MsgPack.dll" }
+		links {
+			"System.dll",
+			"Microsoft.CSharp.dll",
+			"System.Core.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/System.Reflection.Metadata.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/System.Collections.Immutable.dll",
+			"../data/client/citizen/clr2/lib/mono/4.5/MsgPack.dll"
+		}
+
+		if os.istarget('linux') then
+			links {
+				"/usr/lib/mono/4.5/Facades/System.Runtime.dll",
+				"/usr/lib/mono/4.5/Facades/System.IO.dll"
+			}
+		end
 
 		buildoptions '/debug:portable /langversion:7.3'
 

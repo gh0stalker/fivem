@@ -8,6 +8,9 @@
 #include <NetAddress.h>
 #include <NetBuffer.h>
 
+#include <ClientRegistry.h>
+#include <ServerInstanceBase.h>
+
 #include <enet/enet.h>
 
 namespace fx
@@ -133,6 +136,8 @@ namespace fx
 #ifdef _DEBUG
 			//enet_peer_timeout(peer, 86400 * 1000, 86400 * 1000, 86400 * 1000);
 #endif
+
+			enet_peer_timeout(peer, ENET_PEER_TIMEOUT_LIMIT, ENET_PEER_TIMEOUT_MINIMUM, 10000);
 		}
 
 	private:
@@ -148,6 +153,8 @@ namespace fx
 		{
 			static ConsoleCommand cmd("force_enet_disconnect", [this](int peerIdx)
 			{
+				peerIdx = m_server->GetInstance()->GetComponent<fx::ClientRegistry>()->GetClientByNetID(peerIdx)->GetPeer();
+
 				auto peer = m_peerHandles.left.find(peerIdx);
 
 				if (peer != m_peerHandles.left.end())
@@ -303,7 +310,7 @@ namespace fx
 		{
 			// create an ENet host
 			ENetAddress addr = GetENetAddress(address);
-			ENetHost* host = enet_host_create(&addr, 64, 2, 0, 0);
+			ENetHost* host = enet_host_create(&addr, 256, 2, 0, 0);
 
 			// ensure the host exists
 			if (!host)

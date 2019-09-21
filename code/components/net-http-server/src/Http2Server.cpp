@@ -93,6 +93,7 @@ public:
 		}
 
 		nghttp2_submit_response(m_session, m_stream, nv.data(), nv.size(), &provider);
+		nghttp2_session_send(m_session);
 
 		m_sentHeaders = true;
 	}
@@ -126,13 +127,13 @@ public:
 	{
 		if (m_request.GetRef() && !m_ended)
 		{
-			auto& cancelHandler = m_request->GetCancelHandler();
+			auto cancelHandler = m_request->GetCancelHandler();
 
 			if (cancelHandler)
 			{
-				cancelHandler();
+				(*cancelHandler)();
 
-				m_request->SetCancelHandler(std::function<void()>());
+				m_request->SetCancelHandler();
 			}
 		}
 
@@ -285,6 +286,10 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 						{
 							headerList.insert(header);
 						}
+						else if (header.first == ":authority")
+						{
+							headerList.emplace("host", header.second);
+						}
 					}
 
 					fwRefContainer<HttpRequest> request = new HttpRequest(2, 0, req->headers[":method"], req->headers[":path"], headerList, req->connection->stream->GetPeerAddress().ToString());
@@ -318,11 +323,11 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 					if (req->httpReq.GetRef())
 					{
 						auto handler = req->httpReq->GetDataHandler();
-						req->httpReq->SetDataHandler({});
+						req->httpReq->SetDataHandler();
 
 						if (handler)
 						{
-							handler(req->body);
+							(*handler)(req->body);
 						}
 					}
 				}
@@ -337,6 +342,13 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 		uint32_t error_code, void *user_data)
 	{
 		auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, stream_id));
+
+		auto resp = req->httpResp.GetRef();
+
+		if (resp)
+		{
+			((net::Http2Response*)resp)->Cancel();
+		}
 
 		req->connection->streams.erase(req);
 		delete req;

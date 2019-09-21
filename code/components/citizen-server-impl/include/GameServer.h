@@ -41,9 +41,13 @@ namespace fx
 
 		std::string GetVariable(const std::string& key);
 
-		void DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const fmt::ArgList& args);
+		void DropClientv(const std::shared_ptr<Client>& client, const std::string& reason, fmt::printf_args args);
 
-		FMT_VARIADIC(void, DropClient, const std::shared_ptr<Client>&, const std::string&);
+		template<typename... TArgs>
+		inline void DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const TArgs&... args)
+		{
+			DropClientv(client, reason, fmt::make_printf_args(args...));
+		}
 
 		void ForceHeartbeat();
 
@@ -89,7 +93,7 @@ namespace fx
 				threadId = std::this_thread::get_id();
 			}
 
-			void Add(const std::function<void()>& fn);
+			void Add(const std::function<void()>& fn, bool force = false);
 
 			void Run();
 
@@ -134,9 +138,9 @@ namespace fx
 			std::weak_ptr<std::unique_ptr<UvHandleContainer<uv_async_t>>> m_async;
 		};
 
-		inline void InternalAddMainThreadCb(const std::function<void()>& fn)
+		inline void InternalAddMainThreadCb(const std::function<void()>& fn, bool force = false)
 		{
-			m_mainThreadCallbacks->Add(fn);
+			m_mainThreadCallbacks->Add(fn, force);
 		}
 
 		inline void InternalAddNetThreadCb(const std::function<void()>& fn)

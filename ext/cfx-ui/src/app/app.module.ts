@@ -37,6 +37,7 @@ import {DirectConnectComponent} from './servers/direct/direct-connect.component'
 import {ServersService} from './servers/servers.service';
 import {TweetService} from './home/tweet.service';
 import {TrackingService} from './tracking.service';
+import {SettingsService} from './settings.service';
 
 import {GameService, CfxGameService, DummyGameService} from './game.service';
 import {DiscourseService} from './discourse.service';
@@ -45,15 +46,22 @@ import {ColorizePipe} from './colorize.pipe';
 import {EscapePipe} from './escape.pipe';
 import { LocalStorage } from './local-storage';
 
+import { Languages } from './languages';
+
+const localePrefix = (environment.web) ? 'https://servers.fivem.net/' : './';
+
 const l10nConfig: L10nConfig = {
 	locale: {
-		languages: [
-			{ code: 'en', dir: 'ltr' }
-		],
+		languages: Languages.toList(),
 		language: 'en'
 	},
 	translation: {
-		providers: [] // see AppModule constructor
+		//providers: [] // see AppModule constructor
+					  // broke on Angular 8, here again
+		providers: [
+			{ type: ProviderType.Fallback, prefix: localePrefix + 'assets/languages/locale-en', fallbackLanguage: [] },
+			{ type: ProviderType.Static, prefix: localePrefix + 'assets/languages/locale-' }
+		]
 	}
 };
 
@@ -120,19 +128,21 @@ export function metaFactory(): MetaLoader {
 		{
 			provide: LocalStorage,
 			useFactory: (localStorageFactory)
-		}
+		},
+		SettingsService
 	],
 	bootstrap:    [
 		AppComponent
 	]
 })
 export class AppModule {
-	constructor(public l10nLoader: L10nLoader, @Inject(L10N_CONFIG) private configuration: L10nConfigRef) {
-		const localePrefix = (environment.web) ? 'https://servers.fivem.net/' : './';
+	constructor(public l10nLoader: L10nLoader/*, @Inject(L10N_CONFIG) private configuration: L10nConfigRef*/) {
+		/*const localePrefix = (environment.web) ? 'https://servers.fivem.net/' : './';
 
 		this.configuration.translation.providers = [
-			{ type: ProviderType.Static, prefix: localePrefix + 'assets/locale-' }
-		];
+			{ type: ProviderType.Fallback, prefix: localePrefix + 'assets/languages/locale-en', fallbackLanguage: [] },
+			{ type: ProviderType.Static, prefix: localePrefix + 'assets/languages/locale-' }
+		];*/
 
 		this.l10nLoader.load();
 	}

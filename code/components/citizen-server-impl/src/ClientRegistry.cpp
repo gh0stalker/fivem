@@ -6,6 +6,9 @@
 
 #include <msgpack.hpp>
 
+#include <ResourceManagerImpl.h>
+#include <ResourceEventComponent.h>
+
 extern std::shared_ptr<ConVar<bool>> g_oneSyncVar;
 
 namespace fx
@@ -34,9 +37,22 @@ namespace fx
 
 		client->OnAssignPeer.Connect([this, weakClient]()
 		{
-			m_clientsByPeer[weakClient.lock()->GetPeer()] = weakClient;
+			auto client = weakClient.lock();
+
+			if (!client)
+			{
+				return;
+			}
+
+			m_clientsByPeer[client->GetPeer()] = weakClient;
 
 			if (!g_oneSyncVar->GetValue())
+			{
+				return;
+			}
+
+			// reconnecting clients will assign a peer again, but should *not* be assigned a new slot ID
+			if (client->GetSlotId() != -1)
 			{
 				return;
 			}
@@ -51,7 +67,7 @@ namespace fx
 
 				if (m_clientsBySlotId[slot].expired())
 				{
-					weakClient.lock()->SetSlotId(slot);
+					client->SetSlotId(slot);
 
 					m_clientsBySlotId[slot] = weakClient;
 
@@ -82,6 +98,9 @@ namespace fx
 
 	void ClientRegistry::HandleConnectedClient(const std::shared_ptr<Client>& client)
 	{
+		auto eventManager = m_instance->GetComponent<fx::ResourceManager>()->GetComponent<fx::ResourceEventManagerComponent>();
+		eventManager->TriggerEvent2("playerJoining", { fmt::sprintf("net:%d", client->GetNetId()) });
+
 		// for name handling, send player state
 		fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
 

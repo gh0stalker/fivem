@@ -268,4 +268,199 @@ static InitFunction initFunction([]()
 	{
 		context.SetResult(HashString(context.GetArgument<const char*>(0)));
 	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_RADIO_STATION_INDEX", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["radioStation"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_LIGHTS_STATE", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		if (context.GetArgumentCount() > 2)
+		{
+			*context.GetArgument<int*>(1) = entity->GetData("lightsOn", 0);
+			*context.GetArgument<int*>(2) = entity->GetData("highbeamsOn", 0);
+		}
+
+		return 1;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_IS_VEHICLE_ENGINE_RUNNING", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["isEngineOn"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("IS_VEHICLE_ENGINE_STARTING", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["isEngineStarting"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_HANDBRAKE", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["handbrake"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_HEADLIGHTS_COLOUR", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		int headlightsColour = 0;
+
+		int unk8 = entity->GetData("unk8", 0);
+		int defaultHeadlights = entity->GetData("defaultHeadlights", 0);
+		
+		if (unk8 == 0 && defaultHeadlights == 0)
+		{
+			headlightsColour = entity->GetData("headlightsColour", 0);
+		}
+
+		return headlightsColour;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("IS_VEHICLE_SIREN_ON", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		int sirenOn = 0;
+		int unk8 = entity->GetData("unk8", 0);
+
+		if (unk8 == 0)
+		{
+			sirenOn = entity->GetData("sirenOn", 0);
+		}
+
+		return sirenOn;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_DOOR_STATUS", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		int doorStatus = 0;
+		int unk8 = entity->GetData("unk8", 0);
+
+		if (unk8 == 0 && context.GetArgumentCount() > 1)
+		{
+			int unk15 = entity->GetData("unk15", 0);
+
+			if (unk15 != 0)
+			{
+				int doorsOpen = entity->GetData("doorsOpen", 0);
+
+				if (doorsOpen != 0)
+				{
+					doorStatus = entity->GetData("doorPosition" + context.GetArgument<int>(1), 0);
+				}
+			}
+		}
+
+		return doorStatus;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_DOOR_LOCK_STATUS", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		uint8_t lockStatus = 0;
+		int unk8 = entity->GetData("unk8", 0);
+
+		if (unk8 == 0)
+		{
+			int unk15 = entity->GetData("unk15", 0);
+
+			if (unk15 != 0)
+			{
+				lockStatus = entity->GetData("lockStatus", 0);
+			}
+		}
+
+		return lockStatus;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_DOORS_LOCKED_FOR_PLAYER", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		int lockedForPlayer = 0;
+		int hasLock = entity->GetData("hasLock", 0);
+
+		if (hasLock != 0)
+		{
+			int lockedPlayers = entity->GetData("lockedPlayers", 0);
+
+			if (lockedPlayers == -1) // ALL
+			{
+				lockedForPlayer = true;
+			}
+		}
+
+		return lockedForPlayer;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_ENGINE_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["engineHealth"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_PETROL_TANK_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["petrolTankHealth"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("IS_VEHICLE_TYRE_BURST", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		bool tyreBurst = false;
+		bool wheelsFine = entity->GetData("tyresFine", true);
+
+		if (!wheelsFine && context.GetArgumentCount() > 1)
+		{
+			int tyreID = context.GetArgument<int>(1);
+			bool completely = context.GetArgument<bool>(2);
+
+			int tyreStatus = entity->GetData("tyreStatus" + tyreID, 0);
+
+			if (completely && tyreStatus == 2 || !completely && tyreStatus == 1)
+			{
+				tyreBurst = true;
+			}
+		}
+
+		return tyreBurst;
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_VEHICLE_BODY_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["bodyHealth"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_PED_MAX_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["maxHealth"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_PED_ARMOUR", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["armour"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_PED_CAUSE_OF_DEATH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		return entity->data["causeOfDeath"];
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_ENTITY_MAX_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		switch (entity->type)
+		{
+		case fx::sync::NetObjEntityType::Player:
+			return entity->GetData("maxHealth", 0);
+		case fx::sync::NetObjEntityType::Ped:
+			return entity->GetData("maxHealth", 0);
+		default:
+			return 0;
+		}
+	}));
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_ENTITY_HEALTH", makeEntityFunction([](fx::ScriptContext& context, const std::shared_ptr<fx::sync::SyncEntityState>& entity)
+	{
+		switch (entity->type)
+		{
+		case fx::sync::NetObjEntityType::Player:
+			return entity->GetData("health", 0);
+		case fx::sync::NetObjEntityType::Ped:
+			return entity->GetData("health", 0);
+		default:
+			return 0;
+		}
+	}));
 });

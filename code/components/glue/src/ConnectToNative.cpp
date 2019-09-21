@@ -20,13 +20,15 @@
 #include <sstream>
 #include "KnownFolders.h"
 #include <ShlObj.h>
+#include <Shellapi.h>
+#include <HttpClient.h>
 
 #include <json.hpp>
 
 #include <CfxState.h>
 #include <HostSharedData.h>
 
-#include <network/uri.hpp>
+#include <skyr/url.hpp>
 
 #include <se/Security.h>
 
@@ -138,18 +140,9 @@ static void ConnectTo(const std::string& hostnameStr)
 
 	g_connected = true;
 
-	auto npa = net::PeerAddress::FromString(hostnameStr);
+	nui::PostFrameMessage("mpMenu", R"({ "type": "connecting" })");
 
-	if (npa)
-	{
-		nui::PostFrameMessage("mpMenu", R"({ "type": "connecting" })");
-
-		netLibrary->ConnectToServer(npa.get());
-	}
-	else
-	{
-		trace("Could not resolve %s.\n", hostnameStr);
-	}
+	netLibrary->ConnectToServer(hostnameStr);
 }
 
 static std::string g_pendingAuthPayload;
@@ -168,8 +161,17 @@ static void HandleAuthPayload(const std::string& payloadStr)
 	}
 }
 
+#include <LegitimacyAPI.h>
+
+static std::string g_discourseClientId;
+static std::string g_discourseUserToken;
+
+static std::string g_cardConnectionToken;
+
 static InitFunction initFunction([] ()
 {
+	static std::function<void()> g_onYesCallback;
+
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* lib)
 	{
 		netLibrary = lib;
@@ -208,10 +210,29 @@ static InitFunction initFunction([] ()
 			}
 		});
 
+		netLibrary->OnConnectionCardPresent.Connect([](const std::string& card, const std::string& token)
+		{
+			g_cardConnectionToken = token;
+
+			rapidjson::Document document;
+			document.SetObject();
+			document.AddMember("card", rapidjson::Value(card.c_str(), card.size(), document.GetAllocator()), document.GetAllocator());
+
+			rapidjson::StringBuffer sbuffer;
+			rapidjson::Writer<rapidjson::StringBuffer> writer(sbuffer);
+
+			document.Accept(writer);
+
+			if (nui::HasMainUI())
+			{
+				nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectCard", "data": %s })", sbuffer.GetString()));
+			}
+		});
+
 		static std::function<void()> finishConnectCb;
 		static bool disconnected;
 
-		netLibrary->OnInterceptConnection.Connect([](const net::PeerAddress& peer, const std::function<void()>& cb)
+		netLibrary->OnInterceptConnection.Connect([](const std::string& url, const std::function<void()>& cb)
 		{
 			if (Instance<ICoreGameInit>::Get()->GetGameLoaded())
 			{
@@ -249,6 +270,66 @@ static InitFunction initFunction([] ()
 				disconnected = true;
 			}
 		}, 5000);
+
+		lib->AddReliableHandler("msgPaymentRequest", [](const char* buf, size_t len)
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(std::string(buf, len));
+
+				se::ScopedPrincipal scope(se::Principal{ "system.console" });
+				console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->SetValue("0");
+				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "warningmessage", "PURCHASE REQUEST", fmt::sprintf("The server is requesting a purchase of %s for %s.", json.value("sku_name", ""), json.value("sku_price", "")), "Do you want to purchase this item?", "20" });
+
+				g_onYesCallback = [json]()
+				{
+					std::map<std::string, std::string> postMap;
+					postMap["data"] = json.value<std::string>("data", "");
+					postMap["sig"] = json.value<std::string>("sig", "");
+					postMap["clientId"] = g_discourseClientId;
+					postMap["userToken"] = g_discourseUserToken;
+
+					Instance<HttpClient>::Get()->DoPostRequest("https://keymaster.fivem.net/api/paymentAssign", postMap, [](bool success, const char* data, size_t length)
+					{
+						if (success)
+						{
+							auto res = nlohmann::json::parse(std::string(data, length));
+							auto url = res.value("url", "");
+
+							if (!url.empty())
+							{
+								if (url.find("http://") == 0 || url.find("https://") == 0)
+								{
+									ShellExecute(nullptr, L"open", ToWide(url).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+								}
+							}
+						}
+					});
+				};
+			}
+			catch (const std::exception& e)
+			{
+
+			}
+		}, true);
+	});
+
+	OnMainGameFrame.Connect([]()
+	{
+		if (g_onYesCallback)
+		{
+			int result = atoi(console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("warningMessageResult")->GetValue().c_str());
+
+			if (result != 0)
+			{
+				if (result == 4)
+				{
+					g_onYesCallback();
+				}
+
+				g_onYesCallback = {};
+			}
+		}
 	});
 
 	OnKillNetwork.Connect([](const char*)
@@ -375,6 +456,48 @@ static InitFunction initFunction([] ()
 				TerminateProcess(GetCurrentProcess(), 0);
 			});
 		}
+		else if (!_wcsicmp(type, L"setDiscourseIdentity"))
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(ToNarrow(arg));
+
+				g_discourseUserToken = json.value<std::string>("token", "");
+				g_discourseClientId = json.value<std::string>("clientId", "");
+
+				Instance<::HttpClient>::Get()->DoPostRequest(
+					"https://lambda.fivem.net/api/validate/discourse",
+					{
+						{ "entitlementId", ros::GetEntitlementSource() },
+						{ "authToken", g_discourseUserToken },
+						{ "clientId", g_discourseClientId },
+					},
+					[](bool, const char*, size_t)
+				{
+
+				});
+			}
+			catch (const std::exception& e)
+			{
+				trace("failed to set discourse identity: %s\n", e.what());
+			}
+		}
+		else if (!_wcsicmp(type, L"submitCardResponse"))
+		{
+			try
+			{
+				auto json = nlohmann::json::parse(ToNarrow(arg));
+
+				if (!g_cardConnectionToken.empty())
+				{
+					netLibrary->SubmitCardResponse(json["data"].dump(), g_cardConnectionToken);
+				}
+			}
+			catch (const std::exception& e)
+			{
+				trace("failed to set card response: %s\n", e.what());
+			}
+		}
 	});
 
 	OnGameFrame.Connect([]()
@@ -444,6 +567,14 @@ static void ProtocolRegister()
 	CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\FiveM.ProtocolHandler\\shell\\open\\command", &key));
 	CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
 	CHECK_STATUS(RegCloseKey(key));
+
+	if (!IsWindows8Point1OrGreater())
+	{
+		// these are for compatibility on downlevel Windows systems
+		CHECK_STATUS(RegCreateKey(HKEY_CURRENT_USER, L"SOFTWARE\\Classes\\fivem\\shell\\open\\command", &key));
+		CHECK_STATUS(RegSetValueExW(key, NULL, 0, REG_SZ, (BYTE*)command, (wcslen(command) * sizeof(wchar_t)) + 2));
+		CHECK_STATUS(RegCloseKey(key));
+	}
 }
 
 void Component_RunPreInit()
@@ -467,25 +598,24 @@ void Component_RunPreInit()
 
 		if (arg.find("fivem:") == 0)
 		{
-			std::error_code ec;
-			network::uri parsed = network::make_uri(arg, ec);
+			auto parsed = skyr::make_url(arg);
 
-			if (!static_cast<bool>(ec))
+			if (parsed)
 			{
-				if (!parsed.host().empty())
+				if (!parsed->host().empty())
 				{
-					if (parsed.host().to_string() == "connect")
+					if (parsed->host() == "connect")
 					{
-						if (!parsed.path().empty())
+						if (!parsed->pathname().empty())
 						{
-							connectHost = parsed.path().substr(1).to_string();
+							connectHost = parsed->pathname().substr(1);
 						}
 					}
-					else if (parsed.host().to_string() == "accept-auth")
+					else if (parsed->host() == "accept-auth")
 					{
-						if (!parsed.query().empty())
+						if (!parsed->search().empty())
 						{
-							authPayload = parsed.query().to_string();
+							authPayload = parsed->search().substr(1);
 						}
 					}
 				}

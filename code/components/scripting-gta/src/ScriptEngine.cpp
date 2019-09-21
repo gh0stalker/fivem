@@ -40,10 +40,33 @@ static inline void CallHandler(const THandler& rageHandler, uint64_t nativeIdent
 #endif
 }
 
+extern "C" void DLL_EXPORT WrapNativeInvoke(rage::scrEngine::NativeHandler handler, rage::scrNativeCallContext* context)
+{
+	static void* exceptionAddress;
+
+	__try
+	{
+		handler(context);
+	}
+	__except (exceptionAddress = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress, EXCEPTION_EXECUTE_HANDLER)
+	{
+		trace("Error executing native handler %016llx at address %p.\n", (uintptr_t)handler, exceptionAddress);
+	}
+}
+
+static std::unordered_map<uint64_t, fx::TNativeHandler> g_registeredHandlers;
+
 namespace fx
 {
 	boost::optional<TNativeHandler> ScriptEngine::GetNativeHandler(uint64_t nativeIdentifier)
 	{
+		auto it = g_registeredHandlers.find(nativeIdentifier);
+
+		if (it != g_registeredHandlers.end())
+		{
+			return it->second;
+		}
+
 		auto rageHandler = rage::scrEngine::GetNativeHandler(nativeIdentifier);
 
 		if (rageHandler == nullptr)
@@ -103,6 +126,8 @@ namespace fx
 
 	void ScriptEngine::RegisterNativeHandler(uint64_t nativeIdentifier, TNativeHandler function)
 	{
+		g_registeredHandlers[nativeIdentifier] = function;
+
 #ifdef _M_AMD64
 		TNativeHandler* handler = new TNativeHandler(function);
 

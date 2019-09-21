@@ -73,9 +73,9 @@ static int g_playerListCount;
 static CNetGamePlayer* g_playerListRemote[256];
 static int g_playerListCountRemote;
 
-static CNetGamePlayer*(*g_origGetPlayerByIndex)(int);
+static CNetGamePlayer*(*g_origGetPlayerByIndex)(uint8_t);
 
-static CNetGamePlayer* GetPlayerByIndex(int index)
+static CNetGamePlayer* __fastcall GetPlayerByIndex(uint8_t index)
 {
 	if (!icgi->OneSyncEnabled)
 	{
@@ -185,6 +185,14 @@ namespace sync
 {
 	void TempHackMakePhysicalPlayer(uint16_t clientId, int idx = -1)
 	{
+		auto npPool = rage::GetPoolBase("CNonPhysicalPlayerData");
+
+		// probably shutting down the network subsystem
+		if (!npPool)
+		{
+			return;
+		}
+
 		void* fakeInAddr = calloc(256, 1);
 		void* fakeFakeData = calloc(256, 1);
 
@@ -201,7 +209,7 @@ namespace sync
 		//void* nonphys = calloc(256, 1);
 
 		// this has to come from the pool directly as the game will expect to free it
-		void* nonPhys = rage::PoolAllocate(rage::GetPoolBase("CNonPhysicalPlayerData"));
+		void* nonPhys = rage::PoolAllocate(npPool);
 		((void(*)(void*))hook::get_adjusted(0x1410A4024))(nonPhys); // ctor
 
 		// 1493
@@ -253,9 +261,28 @@ void HandleClientInfo(const NetLibraryClientInfo& info)
 	}
 }
 
+static hook::cdecl_stub<void* (CNetGamePlayer*)> getPlayerPedForNetPlayer([]()
+{
+	return hook::get_call(hook::get_pattern("84 C0 74 1C 48 8B CF E8 ? ? ? ? 48 8B D8", 7));
+});
+
+rage::netObject* GetLocalPlayerPedNetObject()
+{
+	auto ped = getPlayerPedForNetPlayer(g_playerMgr->localPlayer);
+
+	if (ped)
+	{
+		auto netObj = *(rage::netObject * *)((char*)ped + 208);
+
+		return netObj;
+	}
+
+	return nullptr;
+}
+
 void HandleCliehtDrop(const NetLibraryClientInfo& info)
 {
-	if (info.netId != g_netLibrary->GetServerNetID())
+	if (info.netId != g_netLibrary->GetServerNetID() && info.slotId != g_netLibrary->GetServerSlotID())
 	{
 		trace("Processing removal for player %d (%s)\n", info.slotId, info.name);
 
@@ -281,25 +308,36 @@ void HandleCliehtDrop(const NetLibraryClientInfo& info)
 		// 1365
 		// 1493
 		// 1604
-		uint16_t objectId;
-		auto ped = ((void*(*)(void*, uint16_t*, CNetGamePlayer*))hook::get_adjusted(0x141022B20))(nullptr, &objectId, player);
+		uint16_t objectId = 0;
+		//auto ped = ((void*(*)(void*, uint16_t*, CNetGamePlayer*))hook::get_adjusted(0x141022B20))(nullptr, &objectId, player);
+		auto ped = getPlayerPedForNetPlayer(player);
+
+		if (ped)
+		{
+			auto netObj = *(rage::netObject**)((char*)ped + 208);
+
+			if (netObj)
+			{
+				objectId = netObj->objectId;
+			}
+		}
 
 		trace("reassigning ped: %016llx %d\n", (uintptr_t)ped, objectId);
 
 		if (ped)
 		{
-			TheClones->DeleteObjectId(objectId);
+			TheClones->DeleteObjectId(objectId, true);
 
 			trace("deleted object id\n");
 
 			// 1604
-			((void(*)(void*, uint16_t, CNetGamePlayer*))hook::get_adjusted(0x141008D14))(ped, objectId, player);
+			//((void(*)(void*, uint16_t, CNetGamePlayer*))hook::get_adjusted(0x141008D14))(ped, objectId, player);
 
 			trace("success! reassigned the ped!\n");
 		}
 
 		// TEMP: properly handle order so that we don't have to fake out the game
-		g_playersByNetId[info.netId] = reinterpret_cast<CNetGamePlayer*>(g_tempRemotePlayer);
+		g_playersByNetId[info.netId] = nullptr;
 		g_netIdsByPlayer[player] = -1;
 
 		// TODO: actually leave the player including playerinfo
@@ -346,7 +384,7 @@ void HandleCliehtDrop(const NetLibraryClientInfo& info)
 
 static CNetGamePlayer*(*g_origGetOwnerNetPlayer)(rage::netObject*);
 
-static CNetGamePlayer* netObject__GetPlayerOwner(rage::netObject* object)
+CNetGamePlayer* netObject__GetPlayerOwner(rage::netObject* object)
 {
 	if (!icgi->OneSyncEnabled)
 	{
@@ -835,9 +873,9 @@ void ObjectManager_End(rage::netObjectMgr* objectMgr)
 				objectMgr->UnregisterNetworkObject(object, 0, true, true);
 			};
 
-			for (int i = 0; i < 65; i++)
+			for (int i = 0; i < 256; i++)
 			{
-				objectMgr->ForAllNetObjects(i, objectCb);
+				CloneObjectMgr->ForAllNetObjects(i, objectCb, true);
 			}
 
 			auto listCopy = TheClones->GetObjectList();
@@ -932,11 +970,6 @@ static float VectorDistance(const float* point1, const float* point2)
 	return sqrtf((xd * xd) + (yd * yd) + (zd * zd));
 }
 
-static hook::cdecl_stub<void*(CNetGamePlayer*)> getPlayerPedForNetPlayer([]()
-{
-	return hook::get_call(hook::get_pattern("84 C0 74 1C 48 8B CF E8 ? ? ? ? 48 8B D8", 7));
-});
-
 static hook::cdecl_stub<float*(float*, CNetGamePlayer*, void*, bool)> getNetPlayerRelevancePosition([]()
 {
 	return hook::get_pattern("45 33 FF 48 85 C0 0F 84 5B 01 00 00", -0x34);
@@ -962,7 +995,7 @@ static int GetPlayersNearPoint(const float* point, float range, CNetGamePlayer* 
 
 		if (getPlayerPedForNetPlayer(player))
 		{
-			float vectorPos[4];
+			alignas(16) float vectorPos[4];
 
 			if (range >= 100000000.0f || VectorDistance(point, getNetPlayerRelevancePosition(vectorPos, player, nullptr, unkVal)) < range)
 			{
@@ -976,8 +1009,8 @@ static int GetPlayersNearPoint(const float* point, float range, CNetGamePlayer* 
 	{
 		std::sort(tempArray, tempArray + idx, [point](CNetGamePlayer* a1, CNetGamePlayer* a2)
 		{
-			float vectorPos1[4];
-			float vectorPos2[4];
+			alignas(16) float vectorPos1[4];
+			alignas(16) float vectorPos2[4];
 
 			float d1 = VectorDistance(point, getNetPlayerRelevancePosition(vectorPos1, a1, nullptr, false));
 			float d2 = VectorDistance(point, getNetPlayerRelevancePosition(vectorPos2, a2, nullptr, false));
@@ -1005,9 +1038,97 @@ static void VoiceChatMgr_EstimateBandwidth(void* mgr)
 	g_origVoiceChatMgr_EstimateBandwidth(mgr);
 }
 
+static void(*g_origCPedGameStateDataNode__access)(void*, void*);
+
+namespace sync
+{
+	extern net::Buffer g_cloneMsgPacket;
+	extern std::vector<uint8_t> g_cloneMsgData;
+}
+
+static void CPedGameStateDataNode__access(char* dataNode, void* accessor)
+{
+	g_origCPedGameStateDataNode__access(dataNode, accessor);
+
+	// not needed right now
+	return;
+
+	// 1604
+
+	// if on mount/mount ID is set
+	if (*(uint16_t*)(dataNode + 310) && icgi->OneSyncEnabled)
+	{
+		auto extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info.bin");
+
+		auto f = _wfopen(extraDumpPath.c_str(), L"wb");
+
+		if (f)
+		{
+			fwrite(sync::g_cloneMsgPacket.GetData().data(), 1, sync::g_cloneMsgPacket.GetData().size(), f);
+			fclose(f);
+		}
+
+		extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info2.bin");
+
+		f = _wfopen(extraDumpPath.c_str(), L"wb");
+
+		if (f)
+		{
+			fwrite(sync::g_cloneMsgData.data(), 1, sync::g_cloneMsgData.size(), f);
+			fclose(f);
+		}
+
+		FatalError("CPedGameStateDataNode: tried to read a mount ID, this is wrong, please click 'save information' below and post the file in https://forum.fivem.net/t/318260 to help us resolve this issue.");
+	}
+}
+
+static void(*g_origManageHostMigration)(void*);
+
+static void ManageHostMigrationStub(void* a1)
+{
+	if (!icgi->OneSyncEnabled)
+	{
+		g_origManageHostMigration(a1);
+	}
+}
+
+static void(*g_origUnkBubbleWrap)();
+
+static void UnkBubbleWrap()
+{
+	if (!icgi->OneSyncEnabled)
+	{
+		g_origUnkBubbleWrap();
+	}
+}
+
 static HookFunction hookFunction([]()
 {
+	// 1604
 	g_playerMgr = (rage::netPlayerMgrBase*)hook::get_adjusted(0x142875710);
+
+	// net damage array, size 32*4
+	uint32_t* damageArrayReplacement = (uint32_t*)hook::AllocateStubMemory(256 * sizeof(uint32_t));
+	memset(damageArrayReplacement, 0, 256 * sizeof(uint32_t));
+
+	{
+		std::initializer_list<std::tuple<std::string_view, int>> bits = {
+			{ "74 30 3C 20 73 0D 48 8D 0D", 9 },
+			{ "0F 85 9F 00 00 00 48 85 FF", 0x12 },
+			{ "80 F9 FF 74 2F 48 8D 15", 8 },
+			{ "80 BF 90 00 00 00 FF 74 21 48 8D", 12 }
+		};
+
+		for (const auto& bit : bits)
+		{
+			auto location = hook::get_pattern<int32_t>(std::get<0>(bit), std::get<1>(bit));
+
+			*location = (intptr_t)damageArrayReplacement - (intptr_t)location - 4;
+		}
+
+		// 128
+		hook::put<uint8_t>(hook::get_pattern("74 30 3C 20 73 0D 48 8D 0D", 3), 0x80);
+	}
 
 	// temp dbg
 	//hook::put<uint16_t>(hook::get_pattern("0F 84 80 00 00 00 49 8B 07 49 8B CF FF 50 20"), 0xE990);
@@ -1017,14 +1138,21 @@ static HookFunction hookFunction([]()
 	//hook::jump(0x140A19640, NetLogStub_DoLog);
 
 	// netobjmgr count, temp dbg
-	hook::put<uint8_t>(hook::get_pattern("48 8D 05 ? ? ? ? BE 1F 00 00 00 48 8B F9", 8), 64);
+	hook::put<uint8_t>(hook::get_pattern("48 8D 05 ? ? ? ? BE 1F 00 00 00 48 8B F9", 8), 128);
 
 	// 1604, netobjmgr alloc size, temp dbg
-	hook::put<uint32_t>(0x14101CF4F, 32712 + 4096);
+	hook::put<uint32_t>(0x14101CF4F, 32712 + 8192);
 
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("4C 8B F1 41 BD 05", -0x22), PassObjectControlStub, (void**)&g_origPassObjectControl);
 	MH_CreateHook(hook::get_pattern("8A 41 49 4C 8B F2 48 8B", -0x10), SetOwnerStub, (void**)&g_origSetOwner);
+
+	// scriptHandlerMgr::ManageHostMigration, has fixed 32 player array and isn't needed* for 1s
+	MH_CreateHook(hook::get_pattern("01 4F 60 81 7F 60 D0 07 00 00 0F 8E", -0x47), ManageHostMigrationStub, (void**)&g_origManageHostMigration);
+
+	// 1604, some bubble stuff
+	//hook::return_function(0x14104D148);
+	MH_CreateHook(hook::get_pattern("33 F6 33 DB 33 ED 0F 28 80", -0x3A), UnkBubbleWrap, (void**)&g_origUnkBubbleWrap);
 
 	MH_CreateHook(hook::get_pattern("0F 29 70 C8 0F 28 F1 33 DB 45", -0x1C), GetPlayersNearPoint, (void**)&g_origGetPlayersNearPoint);
 
@@ -1113,6 +1241,9 @@ static HookFunction hookFunction([]()
 
 	// disable voice chat bandwidth estimation for 1s (it will overwrite some memory)
 	MH_CreateHook(hook::get_pattern("40 8A 72 2D 40 80 FE FF 0F 84", -0x46), VoiceChatMgr_EstimateBandwidth, (void**)&g_origVoiceChatMgr_EstimateBandwidth);
+
+	// crash logging for invalid mount indices
+	MH_CreateHook(hook::get_pattern("48 8B FA 48 8D 91 44 01 00 00 48 8B F1", -0x16), CPedGameStateDataNode__access, (void**)&g_origCPedGameStateDataNode__access);
 
 	// getnetplayerped 32 cap
 	hook::nop(hook::get_pattern("83 F9 1F 77 26 E8", 3), 2);
@@ -1247,6 +1378,14 @@ namespace rage
 
 		virtual bool Equals(const netGameEvent* event) = 0;
 
+		virtual bool NotEquals(const netGameEvent* event) = 0;
+
+		virtual bool MustPersist() = 0;
+
+		virtual bool MustPersistWhenOutOfScope() = 0;
+
+		virtual bool HasTimedOut() = 0;
+
 	public:
 		uint16_t eventId;
 
@@ -1366,17 +1505,24 @@ static void EventMgr_AddEvent(void* eventMgr, rage::netGameEvent* ev)
 	++eventHeader;
 }
 
+static atPoolBase** g_netGameEventPool;
+
 static void EventManager_Update()
 {
+	if (!*g_netGameEventPool)
+	{
+		return;
+	}
+
 	for (auto& eventPair : g_events)
 	{
 		auto [ev, time] = eventPair.second;
 
 		if (ev)
 		{
-			auto expiryDuration = (ev->requiresReply) ? 3s : 200ms;
+			auto expiryDuration = 5s;
 
-			if ((msec() - time) > expiryDuration)
+			if (ev->HasTimedOut() || (msec() - time) > expiryDuration)
 			{
 				delete ev;
 
@@ -1451,7 +1597,12 @@ static void HandleNetGameEvent(const char* idata, size_t len)
 		if (eventMgr)
 		{
 			auto eventHandlerList = (TEventHandlerFn*)(eventMgr + 0x3AB80);
-			eventHandlerList[eventType](&rlBuffer, player, g_playerMgr->localPlayer, eventHeader, 0, 0);
+			auto eh = eventHandlerList[eventType];
+			
+			if (eh && (uintptr_t)eh >= hook::get_adjusted(0x140000000) && (uintptr_t)eh < hook::get_adjusted(0x146000000))
+			{
+				eh(&rlBuffer, player, g_playerMgr->localPlayer, eventHeader, 0, 0);
+			}
 		}
 
 		player->physicalPlayerIndex = lastIndex;
@@ -1583,6 +1734,11 @@ static HookFunction hookFunctionEv([]()
 	MH_CreateHook(hook::get_pattern("85 DB 74 78 44 8B F3 48", -0x30), GetFireApplicability, (void**)&g_origGetFireApplicability);
 
 	MH_EnableHook(MH_ALL_HOOKS);
+
+	{
+		auto location = hook::get_pattern("44 8B 40 20 8B 40 10 41 C1 E0 02 41 C1 F8 02 41 2B C0 0F 85", -7);
+		g_netGameEventPool = hook::get_address<decltype(g_netGameEventPool)>(location);
+	}
 });
 
 #include <nutsnbolts.h>
@@ -1646,6 +1802,8 @@ static bool ReadDataNodeStub(void* node, uint32_t flags, void* mA0, rage::datBit
 	{
 		g_netObjectNodeMapping[g_curNetObject->objectId][node] = { 0, rage::netInterface_queryFunctions::GetInstance()->GetTimestamp() };
 	}
+
+	return didRead;
 }
 
 static bool WriteDataNodeStub(void* node, uint32_t flags, void* mA0, rage::netObject* object, rage::datBitBuffer* buffer, int time, void* playerObj, char playerId, void* unk)
@@ -1721,6 +1879,34 @@ static void ManuallyDirtyNodeStub(void* node, void* object)
 	DirtyNode(object, node);
 }
 
+static void(*g_orig_netSyncDataNode_ForceSend)(void* node, int actFlag1, int actFlag2, rage::netObject* object);
+
+static void netSyncDataNode_ForceSendStub(void* node, int actFlag1, int actFlag2, rage::netObject* object)
+{
+	if (!icgi->OneSyncEnabled)
+	{
+		g_orig_netSyncDataNode_ForceSend(node, actFlag1, actFlag2, object);
+		return;
+	}
+
+	// maybe needs to read act flags?
+	DirtyNode(object, node);
+}
+
+static void(*g_orig_netSyncDataNode_ForceSendToPlayer)(void* node, int player, int actFlag1, int actFlag2, rage::netObject* object);
+
+static void netSyncDataNode_ForceSendToPlayerStub(void* node, int player, int actFlag1, int actFlag2, rage::netObject* object)
+{
+	if (!icgi->OneSyncEnabled)
+	{
+		g_orig_netSyncDataNode_ForceSendToPlayer(node, player, actFlag1, actFlag2, object);
+		return;
+	}
+
+	// maybe needs to read act flags?
+	DirtyNode(object, node);
+}
+
 static void(*g_origCallSkip)(void* a1, void* a2, void* a3, void* a4, void* a5);
 
 static void SkipCopyIf1s(void* a1, void* a2, void* a3, void* a4, void* a5)
@@ -1753,6 +1939,10 @@ static HookFunction hookFunction2([]()
 		}
 
 		MH_CreateHook(hook::get_pattern("48 83 79 48 00 48 8B D9 74 19", -6), ManuallyDirtyNodeStub, (void**)&g_origManuallyDirtyNode);
+
+		MH_CreateHook(hook::get_pattern("85 51 28 0F 84 E4 00 00 00 33 DB", -0x24), netSyncDataNode_ForceSendStub, (void**)&g_orig_netSyncDataNode_ForceSend);
+
+		MH_CreateHook(hook::get_pattern("44 85 41 28 74 73 83 79 30 00", -0x1F), netSyncDataNode_ForceSendToPlayerStub, (void**)&g_orig_netSyncDataNode_ForceSendToPlayer);
 
 		MH_EnableHook(MH_ALL_HOOKS);
 	}
@@ -2129,6 +2319,11 @@ static InitFunction initFunction([]()
 
 		EventManager_Update();
 		TheClones->Update();
+	});
+
+	OnKillNetwork.Connect([](const char*)
+	{
+		g_events.clear();
 	});
 
 	OnKillNetworkDone.Connect([]()

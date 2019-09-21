@@ -67,14 +67,14 @@ static void RenderDrawListInternal(DrawList* drawList)
 
 			PushDrawBlitImShader();
 
-			BeginImVertices(3, cmd.ElemCount);
+			rage::grcBegin(3, cmd.ElemCount);
 
 			for (int i = 0; i < cmd.ElemCount; i++)
 			{
 				auto& vertex = drawList->VtxBuffer.Data[drawList->IdxBuffer.Data[i + idxOff]];
 				auto color = vertex.col;
 
-				AddImVertex(vertex.pos.x, vertex.pos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
+				rage::grcVertex(vertex.pos.x, vertex.pos.y, 0.0f, 0.0f, 0.0f, -1.0f, color, vertex.uv.x, vertex.uv.y);
 			}
 
 			idxOff += cmd.ElemCount;
@@ -88,7 +88,7 @@ static void RenderDrawListInternal(DrawList* drawList)
 
 			GetD3D11DeviceContext()->RSSetScissorRects(1, &scissorRect);
 
-			DrawImVertices();
+			rage::grcEnd();
 
 			PopDrawBlitImShader();
 		}
@@ -195,6 +195,11 @@ static InitFunction initFunction([] ()
 	io.KeyMap[ImGuiKey_Y] = 'Y';
 	io.KeyMap[ImGuiKey_Z] = 'Z';
 
+	io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+	io.ConfigDockingWithShift = true;
+	io.ConfigWindowsResizeFromEdges = true;
+
+	io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
 
 	static std::string imguiIni = ToNarrow(MakeRelativeCitPath(L"citizen/imgui.ini"));
 	io.IniFilename = const_cast<char*>(imguiIni.c_str());

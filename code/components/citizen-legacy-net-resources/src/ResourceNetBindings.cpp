@@ -8,6 +8,7 @@
 #include <StdInc.h>
 #include <ResourceManager.h>
 #include <ResourceEventComponent.h>
+#include <EventReassemblyComponent.h>
 
 #include <ScriptEngine.h>
 
@@ -22,7 +23,8 @@
 
 #include <boost/algorithm/string.hpp>
 
-#include <network/uri.hpp>
+#include <skyr/percent_encode.hpp>
+#include <skyr/url.hpp>
 
 #include <CoreConsole.h>
 
@@ -32,10 +34,10 @@
 
 #include <ResourceGameLifetimeEvents.h>
 
+#include <tbb/concurrent_queue.h>
+
 #include <pplawait.h>
 #include <experimental/resumable>
-
-#include <cpr/util.h>
 
 static NetAddress g_netAddress;
 
@@ -43,14 +45,13 @@ static std::set<std::string> g_resourceStartRequestSet;
 
 static std::string CrackResourceName(const std::string& uri)
 {
-	std::error_code ec;
-	network::uri parsed = network::make_uri(uri, ec);
+	auto parsed = skyr::make_url(uri);
 
-	if (!static_cast<bool>(ec))
+	if (parsed)
 	{
-		if (!parsed.host().empty())
+		if (!parsed->host().empty())
 		{
-			return parsed.host().to_string();
+			return parsed->host();
 		}
 	}
 
@@ -119,21 +120,52 @@ static pplx::task<std::vector<std::tuple<fwRefContainer<fx::Resource>, std::stri
 	return list;
 }
 
+static NetLibrary* g_netLibrary;
+
+static class : public fx::EventReassemblySink
+{
+	virtual void SendPacket(int target, std::string_view packet) override
+	{
+		g_netLibrary->SendUnreliableCommand("msgReassembledEvent", packet.data(), packet.size());
+	}
+} g_eventSink;
+
 static InitFunction initFunction([] ()
 {
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* manager)
+	{
+		manager->SetComponent(fx::EventReassemblyComponent::Create());
+
+		manager->GetComponent<fx::EventReassemblyComponent>()->SetSink(&g_eventSink);
+	});
+
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* netLibrary)
 	{
-		static std::recursive_mutex executeNextGameFrameMutex;
-		static std::vector<std::function<void()>> executeNextGameFrame;
+		g_netLibrary = netLibrary;
 
-		auto urlEncodeWrap = [](const std::string& str)
+		static tbb::concurrent_queue<std::function<void()>> executeNextGameFrame;
+
+		auto urlEncodeWrap = [](const std::string& base, const std::string& str)
 		{
 			if (Instance<ICoreGameInit>::Get()->NetProtoVersion >= 0x201902111010)
 			{
-				return cpr::util::urlEncode(str);
+				auto baseUrl = skyr::make_url(base);
+
+				if (baseUrl)
+				{
+					std::string strCopy(str);
+					boost::algorithm::replace_all(strCopy, "+", "%2B");
+
+					auto url = skyr::make_url(strCopy, *baseUrl);
+
+					if (url)
+					{
+						return url->href();
+					}
+				}
 			}
 
-			return str;
+			return base + str;
 		};
 
 		auto updateResources = [=] (const std::string& updateList, const std::function<void()>& doneCb)
@@ -177,7 +209,7 @@ static InitFunction initFunction([] ()
 			std::string addressAddress = address.GetAddress();
 			uint32_t addressPort = address.GetPort();
 
-			httpClient->DoPostRequest(fmt::sprintf("http://%s:%d/client", address.GetAddress(), address.GetPort()), httpClient->BuildPostString(postMap), options, [=] (bool result, const char* data, size_t size)
+			httpClient->DoPostRequest(fmt::sprintf("%sclient", netLibrary->GetCurrentServerUrl()), httpClient->BuildPostString(postMap), options, [=] (bool result, const char* data, size_t size)
 			{
 				// keep a reference to the HTTP client
 				auto httpClientRef = httpClient;
@@ -272,6 +304,9 @@ static InitFunction initFunction([] ()
 							baseUrl = (*it)["fileServer"].GetString();
 						}
 
+						boost::algorithm::replace_all(baseUrl, "http://%s/", netLibrary->GetCurrentServerUrl());
+						boost::algorithm::replace_all(baseUrl, "https://%s/", netLibrary->GetCurrentServerUrl());
+
 						// define the resource in the mounter
 						std::string resourceName = resource["name"].GetString();
 
@@ -302,7 +337,7 @@ static InitFunction initFunction([] ()
 						}
 
 						// ok
-						std::string resourceBaseUrl = va("%s/%s/", va(baseUrl.c_str(), serverHost.c_str()), resourceName.c_str());
+						std::string resourceBaseUrl = fmt::sprintf("%s/%s/", baseUrl, resourceName);
 
 						mounter->RemoveResourceEntries(resourceName);
 
@@ -311,7 +346,7 @@ static InitFunction initFunction([] ()
 						{
 							fwString filename = i->name.GetString();
 
-							mounter->AddResourceEntry(resourceName, filename, i->value.GetString(), resourceBaseUrl + urlEncodeWrap(filename));
+							mounter->AddResourceEntry(resourceName, filename, i->value.GetString(), urlEncodeWrap(resourceBaseUrl, filename));
 						}
 
 						if (resource.HasMember("streamFiles"))
@@ -350,7 +385,7 @@ static InitFunction initFunction([] ()
 									continue;
 								}
 
-								mounter->AddResourceEntry(resourceName, filename, hash, resourceBaseUrl + urlEncodeWrap(filename), size, {
+								mounter->AddResourceEntry(resourceName, filename, hash, urlEncodeWrap(resourceBaseUrl, filename), size, {
 									{ "rscVersion", std::to_string(entry.rscVersion) },
 									{ "rscPagesPhysical", std::to_string(entry.rscPagesPhysical) },
 									{ "rscPagesVirtual", std::to_string(entry.rscPagesVirtual) },
@@ -390,7 +425,7 @@ static InitFunction initFunction([] ()
 								GlobalError("Couldn't load resource %s. :(", std::get<std::string>(resourceData));
 							}
 
-							executeNextGameFrame.push_back([]
+							executeNextGameFrame.push([]
 							{
 								fx::OnUnlockStreaming();
 							});
@@ -407,8 +442,7 @@ static InitFunction initFunction([] ()
 						{
 							std::string resourceName = resource->GetName();
 
-							std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-							executeNextGameFrame.push_back([=]()
+							executeNextGameFrame.push([=]()
 							{
 								if (!resource->Start())
 								{
@@ -420,14 +454,13 @@ static InitFunction initFunction([] ()
 
 					// mark DownloadsComplete on the next frame so all resources will have started
 					{
-						std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-						executeNextGameFrame.push_back([=]()
+						executeNextGameFrame.push([=]()
 						{
 							netLibrary->DownloadsComplete();
 						});
 					}
 
-					executeNextGameFrame.push_back([]
+					executeNextGameFrame.push([]
 					{
 						fx::OnUnlockStreaming();
 					});
@@ -451,8 +484,10 @@ static InitFunction initFunction([] ()
 				{
 					g_resourceStartRequestSet.erase(resource);
 
-					std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-					executeNextGameFrame.push_back(**updateResource);
+					if (**updateResource)
+					{
+						executeNextGameFrame.push(**updateResource);
+					}
 				});
 			}
 		});
@@ -468,13 +503,16 @@ static InitFunction initFunction([] ()
 			updateResources("", []()
 			{
 			});
+
+			// reinit the reassembler
+			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+			reassembler->UnregisterTarget(0);
+			reassembler->RegisterTarget(0);
 		});
 
 		netLibrary->OnConnectionError.Connect([](const char* error)
 		{
-			std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-
-			executeNextGameFrame.push_back([]()
+			executeNextGameFrame.push([]()
 			{
 				fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
 				resourceManager->ResetResources();
@@ -483,15 +521,25 @@ static InitFunction initFunction([] ()
 
 		OnGameFrame.Connect([] ()
 		{
-			std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
+			std::function<void()> func;
 
-			for (auto& func : executeNextGameFrame)
+			while (executeNextGameFrame.try_pop(func))
 			{
-				func();
+				if (func)
+				{
+					func();
+				}
 			}
 
-			executeNextGameFrame.clear();
+			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+			reassembler->NetworkTick();
 		});
+
+		netLibrary->AddReliableHandler("msgReassembledEvent", [](const char* buf, size_t len)
+		{
+			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+			reassembler->HandlePacket(0, std::string_view{ buf, len });
+		}, true);
 
 		netLibrary->AddReliableHandler("msgNetEvent", [] (const char* buf, size_t len)
 		{
@@ -575,8 +623,7 @@ static InitFunction initFunction([] ()
 				g_resourceUpdateQueue.push(resourceName);
 
 				{
-					std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-					executeNextGameFrame.push_back(**updateResource);
+					executeNextGameFrame.push(**updateResource);
 				}
 			}
 		});
@@ -599,12 +646,22 @@ static InitFunction initFunction([] ()
 			netLibrary->SendReliableCommand("msgServerEvent", buffer.GetBuffer(), buffer.GetCurLength());
 		});
 
+		fx::ScriptEngine::RegisterNativeHandler("TRIGGER_LATENT_SERVER_EVENT_INTERNAL", [=](fx::ScriptContext& context)
+		{
+			std::string eventName = context.GetArgument<const char*>(0);
+			size_t payloadSize = context.GetArgument<uint32_t>(2);
+
+			std::string_view eventPayload = std::string_view(context.GetArgument<const char*>(1), payloadSize);
+
+			int bps = context.GetArgument<int>(3);
+
+			auto reassembler = Instance<fx::ResourceManager>::Get()->GetComponent<fx::EventReassemblyComponent>();
+			reassembler->TriggerEvent(0, eventName, eventPayload, bps);
+		});
 
 		netLibrary->OnFinalizeDisconnect.Connect([=](NetAddress)
 		{
-			std::unique_lock<std::recursive_mutex> lock(executeNextGameFrameMutex);
-
-			executeNextGameFrame.push_back([]()
+			executeNextGameFrame.push([]()
 			{
 				Instance<fx::ResourceManager>::Get()->ForAllResources([](fwRefContainer<fx::Resource> resource)
 				{

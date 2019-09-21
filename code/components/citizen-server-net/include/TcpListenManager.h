@@ -17,7 +17,11 @@ namespace fx
 
 		std::vector<fwRefContainer<net::MultiplexTcpServer>> m_multiplexServers;
 
+		std::vector<fwRefContainer<net::TcpServer>> m_externalServers;
+
 		std::shared_ptr<ConsoleCommand> m_addEndpointCommand;
+
+		int m_primaryPort;
 
 	public:
 		TcpListenManager();
@@ -26,9 +30,16 @@ namespace fx
 
 		void AddEndpoint(const std::string& endPoint);
 
+		virtual void AddExternalServer(const fwRefContainer<net::TcpServer>& server);
+
 		inline fwRefContainer<net::TcpServerManager> GetTcpStack()
 		{
 			return m_tcpStack;
+		}
+
+		inline int GetPrimaryPort()
+		{
+			return m_primaryPort;
 		}
 
 		virtual void AttachToObject(ServerInstanceBase* instance) override;

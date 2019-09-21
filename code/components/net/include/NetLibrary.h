@@ -157,6 +157,8 @@ private:
 
 	net::PeerAddress m_currentServerPeer;
 
+	std::string m_currentServerUrl;
+
 	std::string m_token;
 
 	uint32_t m_lastConnect;
@@ -184,6 +186,8 @@ private:
 	HANDLE m_receiveEvent;
 
 	concurrency::concurrent_queue<std::function<void()>> m_mainFrameQueue;
+
+	std::function<void(const std::string&, const std::string&)> m_cardResponseHandler;
 
 private:
 	typedef std::function<void(const char* buf, size_t len)> ReliableHandlerType;
@@ -224,7 +228,7 @@ public:
 
 	virtual void RunFrame() override;
 
-	virtual void ConnectToServer(const net::PeerAddress& address);
+	virtual void ConnectToServer(const std::string& rootUrl);
 
 	virtual void Disconnect(const char* reason) override;
 
@@ -235,6 +239,8 @@ public:
 	virtual void RoutePacket(const char* buffer, size_t length, uint16_t netID) override;
 
 	virtual void SendReliableCommand(const char* type, const char* buffer, size_t length) override;
+
+	void SendUnreliableCommand(const char* type, const char* buffer, size_t length);
 
 	void RunMainFrame();
 
@@ -269,6 +275,8 @@ public:
 
 	void CancelDeferredConnection();
 
+	void SubmitCardResponse(const std::string& dataJson, const std::string& token);
+
 	uint64_t GetGUID();
 
 	void SendNetEvent(const std::string& eventName, const std::string& argsSerialized, int target);
@@ -290,6 +298,11 @@ public:
 	inline virtual net::PeerAddress GetCurrentPeer()
 	{
 		return m_currentServerPeer;
+	}
+
+	inline virtual const std::string& GetCurrentServerUrl() override
+	{
+		return m_currentServerUrl;
 	}
 
 	inline int GetServerProtocol() override
@@ -338,6 +351,10 @@ public:
 
 	fwEvent<const char*> OnConnectionError;
 
+	// a1: adaptive card JSON
+	// a2: connection token
+	fwEvent<const std::string&, const std::string&> OnConnectionCardPresent;
+
 	// a1: status message
 	// a2: current progress
 	// a3: total progress
@@ -354,10 +371,10 @@ public:
 	// this won't like more than one interception attempt, however
 	// a1: connection address
 	// a2: continuation callback
-	fwEvent<const net::PeerAddress&, const std::function<void()>&> OnInterceptConnection;
+	fwEvent<const std::string&, const std::function<void()>&> OnInterceptConnection;
 
 	// same as the other routine, except it's for authentication
-	fwEvent<const net::PeerAddress&, const std::function<void(bool success, const std::map<std::string, std::string>& additionalPostData)>&> OnInterceptConnectionForAuth;
+	fwEvent<const std::string&, const std::function<void(bool success, const std::map<std::string, std::string>& additionalPostData)>&> OnInterceptConnectionForAuth;
 
 	// event to intercept server events for debugging
 	// a1: event name

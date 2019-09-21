@@ -1,5 +1,6 @@
-import { Component, OnInit, OnChanges, Input, NgZone, Inject, PLATFORM_ID } from '@angular/core';
-import { Server, PinConfig } from '../server';
+import { Component, OnInit, OnChanges, Input, NgZone, Inject, PLATFORM_ID, ChangeDetectorRef,
+    ChangeDetectionStrategy, ElementRef, ViewChild, AfterViewInit } from '@angular/core';
+import { Server, PinConfigCached } from '../server';
 import { ServersListHeadingColumn } from './servers-list-header.component';
 import { ServerFilterContainer } from './server-filter.component';
 import { Subject } from 'rxjs/Subject';
@@ -8,15 +9,18 @@ import { LocalStorage } from '../../local-storage';
 
 import { isPlatformBrowser } from '@angular/common';
 
+import { getCanonicalLocale } from './utils';
+
 import 'rxjs/add/operator/throttleTime';
 
 @Component({
     moduleId: module.id,
     selector: 'servers-list',
     templateUrl: 'servers-list.component.html',
-    styleUrls: ['servers-list.component.scss']
+    styleUrls: ['servers-list.component.scss'],
+    changeDetection: ChangeDetectionStrategy.OnPush
 })
-export class ServersListComponent implements OnInit, OnChanges {
+export class ServersListComponent implements OnInit, OnChanges, AfterViewInit {
     @Input()
     private servers: Server[];
 
@@ -24,9 +28,17 @@ export class ServersListComponent implements OnInit, OnChanges {
     private filters: ServerFilterContainer;
 
     @Input()
-    private pinConfig: PinConfig;
+    private pinConfig: PinConfigCached;
+
+    private lastFilters: ServerFilterContainer;
 
     private subscriptions: { [addr: string]: any } = {};
+
+    private lastLength: number;
+
+    @ViewChild('list', { static: false }) private list: ElementRef;
+
+    private interactingUntil = 0;
 
     sortOrder: string[];
 
@@ -35,7 +47,8 @@ export class ServersListComponent implements OnInit, OnChanges {
     localServers: Server[];
     sortedServers: Server[];
 
-    constructor(private zone: NgZone, @Inject(LocalStorage) private localStorage: any, @Inject(PLATFORM_ID) private platformId: any) {
+    constructor(private zone: NgZone, @Inject(LocalStorage) private localStorage: any, @Inject(PLATFORM_ID) private platformId: any,
+        public changeDetectorRef: ChangeDetectorRef) {
         this.servers = [];
 
         this.columns = [
@@ -81,7 +94,17 @@ export class ServersListComponent implements OnInit, OnChanges {
         zone.runOutsideAngular(() => {
             setInterval(() => {
                 if (changed) {
+                    if (this.interactingUntil >= new Date().getTime()) {
+                        return;
+                    }
+
                     changed = false;
+
+                    for (const server of (this.servers || [])) {
+                        if (!this.subscriptions[server.address]) {
+                            this.subscriptions[server.address] = server.onChanged.subscribe(a => this.changeSubject.next());
+                        }
+                    }
 
                     zone.run(() => {
                         this.sortAndFilterServers();
@@ -100,7 +123,7 @@ export class ServersListComponent implements OnInit, OnChanges {
             return false;
         }
 
-        return (this.pinConfig.pinnedServers.indexOf(server.address) >= 0)
+        return this.pinConfig.pinnedServers.has(server.address);
     }
 
     isPremium(server: Server) {
@@ -113,6 +136,11 @@ export class ServersListComponent implements OnInit, OnChanges {
         }
 
         return server.data.vars.premium;
+    }
+
+    // to prevent auto-filtering while scrolling (to make scrolling feel smoother)
+    updateInteraction() {
+        this.interactingUntil = new Date().getTime() + 500;
     }
 
     private static quoteRe(text: string) {
@@ -213,7 +241,9 @@ export class ServersListComponent implements OnInit, OnChanges {
         const filters = filterList.filters;
 
         const hiddenByTags = (server: Server) => {
-            if (filterList.tags) {
+            const tagListEntries = (filterList.tags) ? Object.entries(filterList.tags.tagList) : [];
+
+            if (tagListEntries.length > 0) {
                 const tags =
                     (server && server.data && server.data.vars && server.data.vars.tags) ?
                         (<string>server.data.vars.tags)
@@ -225,7 +255,7 @@ export class ServersListComponent implements OnInit, OnChanges {
 
                 const tagSet = new Set<string>(tags);
 
-                for (const [ tag, active ] of Object.entries(filterList.tags.tagList)) {
+                for (const [ tag, active ] of tagListEntries) {
                     if (active) {
                         if (!tagSet.has(tag)) {
                             return true;
@@ -241,13 +271,40 @@ export class ServersListComponent implements OnInit, OnChanges {
             return false;
         };
 
+        const hiddenByLocales = (server: Server) => {
+            const localeListEntries = (filterList.tags) ? Object.entries(filterList.tags.localeList) : [];
+
+            let matchesLocales = true;
+
+            if (localeListEntries.length > 0) {
+                const sl = (server && server.data && server.data.vars && server.data.vars.locale
+                    && getCanonicalLocale(server.data.vars.locale));
+
+                matchesLocales = false;
+
+                for (const [ locale, active ] of localeListEntries) {
+                    if (active) {
+                        if (sl === locale) {
+                            matchesLocales = true;
+                        }
+                    } else {
+                        if (sl === locale) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            return !matchesLocales;
+        };
+
         return (server) => {
             if (!nameMatchCallback(server)) {
                 return false;
             }
 
             if (server.currentPlayers === 0 && filters.hideEmpty) {
-                if (!this.isPinned(server) || !this.pinConfig.pinIfEmpty) {
+                if (!this.isPinned(server) || !this.pinConfig.data.pinIfEmpty) {
                     return false;
                 }
             }
@@ -266,12 +323,18 @@ export class ServersListComponent implements OnInit, OnChanges {
                 }
             }
 
+            if (filterList.tags.localeList) {
+                if (hiddenByLocales(server)) {
+                    return false;
+                }
+            }
+
             return true;
         }
     }
 
     sortAndFilterServers() {
-        const servers = (this.servers || []).concat().filter(this.getFilter(this.filters));
+        const servers = (this.servers || []).filter(this.getFilter(this.filters));
 
         const sortChain = (a: Server, b: Server, ...stack: ((a: Server, b: Server) => number)[]) => {
             for (const entry of stack) {
@@ -311,26 +374,30 @@ export class ServersListComponent implements OnInit, OnChanges {
             }
         };
 
+        const sortList = [
+            (a: Server, b: Server) => {
+                const aPinned = this.isPinned(a);
+                const bPinned = this.isPinned(b);
+
+                if (aPinned === bPinned) {
+                    return 0;
+                } else if (aPinned && !bPinned) {
+                    return -1;
+                } else if (!aPinned && bPinned) {
+                    return 1;
+                }
+            },
+            sortSortable(this.sortOrder),
+            sortSortable(['upvotePower', '-']),
+            sortSortable(['ping', '+']),
+            sortSortable(['name', '+'])
+        ];
+
         servers.sort((a, b) => {
             return sortChain(
                 a,
                 b,
-                (a: Server, b: Server) => {
-                    const aPinned = this.isPinned(a);
-                    const bPinned = this.isPinned(b);
-
-                    if (aPinned === bPinned) {
-                        return 0;
-                    } else if (aPinned && !bPinned) {
-                        return -1;
-                    } else if (!aPinned && bPinned) {
-                        return 1;
-                    }
-                },
-                sortSortable(this.sortOrder),
-                sortSortable(['upvotePower', '-']),
-                sortSortable(['ping', '+']),
-                sortSortable(['name', '+'])
+                ...sortList
             );
         });
 
@@ -352,19 +419,35 @@ export class ServersListComponent implements OnInit, OnChanges {
         this.sortAndFilterServers();
     }
 
-    ngOnInit() { }
+    ngOnInit() {
+    }
+
+    ngAfterViewInit() {
+        const element = this.list.nativeElement as HTMLElement;
+
+        this.zone.runOutsideAngular(() => {
+            element.addEventListener('wheel', (e) => {
+                this.updateInteraction();
+            });
+        });
+    }
 
     changeSubject: Subject<void> = new Subject<void>();
     changeObservable = this.changeSubject.asObservable();
 
     ngOnChanges() {
-        for (const server of (this.servers || [])) {
-            if (!this.subscriptions[server.address]) {
-                this.subscriptions[server.address] = server.onChanged.subscribe(a => this.changeSubject.next());
-            }
+        if (this.servers.length !== this.lastLength) {
+            this.changeSubject.next();
+            this.lastLength = this.servers.length;
         }
 
-        //this.sortAndFilterServers();
-        this.changeSubject.next();
+        if (this.filters !== this.lastFilters) {
+            this.sortAndFilterServers();
+            this.lastFilters = this.filters;
+        }
+    }
+
+    svTrack(index: number, serverRow: Server) {
+        return serverRow.address;
     }
 }

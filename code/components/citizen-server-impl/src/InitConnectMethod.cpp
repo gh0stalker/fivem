@@ -301,28 +301,36 @@ static InitFunction initFunction([]()
 					return;
 				}
 
-				if (!VerifyTicket(guid, ticketIt->second))
+				try
 				{
-					sendError("FiveM ticket authorization failed.");
+					if (!VerifyTicket(guid, ticketIt->second))
+					{
+						sendError("FiveM ticket authorization failed.");
+						return;
+					}
+
+					auto optionalTicket = VerifyTicketEx(ticketIt->second);
+
+					if (!optionalTicket)
+					{
+						sendError("FiveM ticket authorization failed. (2)");
+						return;
+					}
+
+					ticketData = *optionalTicket;
+				}
+				catch (const std::exception& e)
+				{
+					sendError(fmt::sprintf("Parsing error while verifying FiveM ticket. %s", e.what()));
 					return;
 				}
-
-				auto optionalTicket = VerifyTicketEx(ticketIt->second);
-
-				if (!optionalTicket)
-				{
-					sendError("FiveM ticket authorization failed. (2)");
-					return;
-				}
-
-				ticketData = *optionalTicket;
 			}
 
 			std::string token = boost::uuids::to_string(boost::uuids::basic_random_generator<boost::random_device>()());
 
 			json data = json::object();
 			data["protocol"] = 5;
-			data["bitVersion"] = 0x201903031957;
+			data["bitVersion"] = 0x201905310838;
 			data["sH"] = shVar->GetValue();
 			data["enhancedHostSupport"] = ehVar->GetValue() && !g_oneSyncVar->GetValue();
 			data["onesync"] = g_oneSyncVar->GetValue();
@@ -332,6 +340,7 @@ static InitFunction initFunction([]()
 			auto gameServer = instance->GetComponent<fx::GameServer>();
 
 			data["netlibVersion"] = gameServer->GetNetLibVersion();
+			data["maxClients"] = atoi(gameServer->GetVariable("sv_maxclients").c_str());
 
 			{
 				auto oldClient = clientRegistry->GetClientByGuid(guid);
@@ -449,6 +458,16 @@ static InitFunction initFunction([]()
 					if (ref1)
 					{
 						(*ref1)(json::object({ { "defer", true }, { "message", message }, { "deferVersion", 2 } }));
+					}
+				});
+
+				(*deferrals)->SetCardCallback([deferrals, cbRef, token](const std::string& card)
+				{
+					auto ref1 = *cbRef;
+
+					if (ref1)
+					{
+						(*ref1)(json::object({ { "defer", true }, { "card", card }, { "token", token }, { "deferVersion", 2 } }));
 					}
 				});
 
@@ -570,6 +589,42 @@ static InitFunction initFunction([]()
 			});
 
 			(**runOneIdentifier)(it);
+		});
+
+		instance->GetComponent<fx::ClientMethodRegistry>()->AddHandler("submitCard", [=](const std::map<std::string, std::string>& postMap, const fwRefContainer<net::HttpRequest>& request, const std::function<void(const json&)>& cb)
+		{
+			auto dataIt = postMap.find("data");
+			auto tokenIt = postMap.find("token");
+
+			if (dataIt == postMap.end() || tokenIt == postMap.end())
+			{
+				cb(json::object({ {"error", "fields missing"} }));
+				return;
+			}
+
+			auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
+			auto client = clientRegistry->GetClientByConnectionToken(tokenIt->second);
+
+			if (!client)
+			{
+				cb(json::object({ {"error", "no client"} }));
+				return;
+			}
+
+			auto deferralRef = client->GetData("deferralPtr");
+
+			if (deferralRef.has_value())
+			{
+				auto deferralPtr = std::any_cast<std::weak_ptr<fx::ClientDeferral>>(deferralRef);
+				auto deferrals = deferralPtr.lock();
+
+				if (deferrals)
+				{
+					deferrals->HandleCardResponse(dataIt->second);
+				}
+			}
+
+			cb(json::object({ { "result", "ok" } }));
 		});
 	}, 50);
 });

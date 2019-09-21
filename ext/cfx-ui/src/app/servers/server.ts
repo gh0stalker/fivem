@@ -107,7 +107,7 @@ export class Server {
 
             this.iconUri = `data:image/svg+xml,${encodeURIComponent(svg)}`;
         } else {
-            this.iconUri = `https://runtime.fivem.net/servers/icon/${address}/${object.iconVersion}.png`;
+            this.iconUri = `https://servers-live.fivem.net/servers/icon/${address}/${object.iconVersion}.png`;
         }
     }
 }
@@ -128,4 +128,19 @@ export class PinConfig {
     pinIfEmpty = false;
 
     pinnedServers: string[] = [];
+}
+
+export class PinConfigCached {
+    public data: PinConfig;
+    public pinnedServers: Set<string>;
+
+    constructor(pinConfig: PinConfig) {
+        if (pinConfig) {
+            this.data = pinConfig;
+        } else {
+            this.data = new PinConfig();
+        }
+
+        this.pinnedServers = new Set<string>(this.data.pinnedServers);
+    }
 }

@@ -22,6 +22,8 @@ static MappingFunctionType g_mappingFunction;
 
 static NTSTATUS(*g_origLoadDll)(const wchar_t*, uint32_t*, UNICODE_STRING*, HANDLE*);
 
+static bool g_d3dx11;
+
 static std::wstring MapRedirectedFilename(const wchar_t* origFileName)
 {
 	if (wcsstr(origFileName, L"autosignin.dat") != nullptr)
@@ -29,9 +31,29 @@ static std::wstring MapRedirectedFilename(const wchar_t* origFileName)
 		return MakeRelativeCitPath(L"cache\\game\\autosignin.dat");
 	}
 
+	if (wcsstr(origFileName, L"signintransfer.dat") != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\signintransfer.dat");
+	}
+
+	if (wcsstr(origFileName, L"d3dx11_43.dll") != nullptr || wcsstr(origFileName, L"D3DX11_43") && !g_d3dx11)
+	{
+		return MakeRelativeCitPath(L"bin\\d3dcompiler_43.dll");
+	}
+
+	if (wcsstr(origFileName, L"Social Club\\Profiles") != nullptr)
+	{
+		return MakeRelativeCitPath(L"cache\\game\\ros_profiles") + &wcsstr(origFileName, L"Social Club\\Profiles")[20];
+	}
+
 	if (wcsstr(origFileName, L"version.txt") != nullptr)
 	{
 		return MakeRelativeCitPath(L"cache\\game\\version_orig.txt");
+	}
+
+	if (wcsstr(origFileName, L"PlayGTAV.exe") != nullptr)
+	{
+		return MakeRelativeCitPath(L"nodontfuckingplaygtav.exe");
 	}
 
 	wchar_t* fileName = g_mappingFunction(origFileName, malloc);
@@ -68,7 +90,22 @@ static bool IsMappedFilename(const std::wstring& fileName)
 		return true;
 	}
 
-	if (fileName.find(L"version.txt") != std::string::npos)
+	if (fileName.find(L"signintransfer.dat") != std::string::npos)
+	{
+		return true;
+	}
+
+	if (wcsstr(fileName.c_str(), L"d3dx11_43.dll") != nullptr || wcsstr(fileName.c_str(), L"D3DX11_43") && !g_d3dx11)
+	{
+		return true;
+	}
+
+	if (wcsstr(fileName.c_str(), L"Social Club\\Profiles") != nullptr)
+	{
+		return true;
+	}
+
+	if (wcsstr(fileName.c_str(), L"PlayGTAV.exe") != nullptr)
 	{
 		return true;
 	}
@@ -123,8 +160,11 @@ NTSTATUS NTAPI LdrLoadDllStub(const wchar_t* fileName, uint32_t* flags, UNICODE_
 		moduleNameStr.find(L"nvspcap") != std::string::npos ||
 		// Proxifier, causes LoopbackTcpServer crashes
 		moduleNameStr.find(L"PrxerNsp.dll") != std::string::npos ||
+		moduleNameStr.find(L"PrxerDrv.dll") != std::string::npos ||
 		// Ad Muncher, causes LoopbackTcpServer to crash
-		moduleNameStr.find(L"am64-34121.dll") != std::string::npos
+		moduleNameStr.find(L"am64-34121.dll") != std::string::npos ||
+		// VulkanRT loader, we don't use Vulkan, CEF does (to 'collect info'), and this crashes a lot of Vulkan drivers
+		moduleNameStr.find(L"vulkan-1.dll") != std::string::npos
 	)
 	{
 		return 0xC0000135;
@@ -483,6 +523,17 @@ VOID CALLBACK LdrDllNotification(
 extern "C" DLL_EXPORT void CoreSetMappingFunction(MappingFunctionType function)
 {
 	DisableToolHelpScope scope;
+
+	{
+		HMODULE dx = LoadLibraryW(L"d3dx11_43.dll");
+
+		if (dx)
+		{
+			FreeLibrary(dx);
+
+			g_d3dx11 = true;
+		}
+	}
 
 	g_mappingFunction = function;
 	g_tlsHandle = TlsAlloc();

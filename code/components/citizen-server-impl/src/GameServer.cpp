@@ -20,6 +20,8 @@
 #include <UvLoopManager.h>
 #include <UvTcpServer.h> // for UvCallback
 
+#include <MonoThreadAttachment.h>
+
 #include <protocol/reqrep0/req.h>
 #include <protocol/reqrep0/rep.h>
 
@@ -576,9 +578,9 @@ namespace fx
 		m_deferCallbacks.insert({ cbIdx.fetch_add(1), { m_serverTime + inMsec, fn } });
 	}
 
-	void GameServer::CallbackListBase::Add(const std::function<void()>& fn)
+	void GameServer::CallbackListBase::Add(const std::function<void()>& fn, bool force)
 	{
-		if (threadId == std::this_thread::get_id())
+		if (threadId == std::this_thread::get_id() && !force)
 		{
 			fn();
 			return;
@@ -666,7 +668,7 @@ namespace fx
 					outMsg.Write(0x53FFFA3F);
 					outMsg.Write(0);
 
-					client->SendPacket(0, outMsg, NetPacketType_Reliable);
+					client->SendPacket(0, outMsg, NetPacketType_Unreliable);
 				}
 
 				// time out the client if needed
@@ -719,9 +721,9 @@ namespace fx
 		OnTick();
 	}
 
-	void GameServer::DropClient(const std::shared_ptr<Client>& client, const std::string& reason, const fmt::ArgList& args)
+	void GameServer::DropClientv(const std::shared_ptr<Client>& client, const std::string& reason, fmt::printf_args args)
 	{
-		std::string realReason = fmt::sprintf(reason, args);
+		std::string realReason = fmt::vsprintf(reason, args);
 
 		if (reason.empty())
 		{
@@ -736,6 +738,9 @@ namespace fx
 
 		// force a hearbeat
 		ForceHeartbeat();
+
+		// ensure mono thread attachment (if this was a worker thread)
+		MonoEnsureThreadAttached();
 
 		// trigger a event signaling the player's drop
 		m_instance
@@ -768,7 +773,7 @@ namespace fx
 			// for name handling, send player state
 			fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
 
-			// send every player information about the joining client
+			// send every player information about the dropping client
 			events->TriggerClientEvent("onPlayerDropped", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
 		}
 
@@ -1214,9 +1219,9 @@ DECLARE_INSTANCE_TYPE(fx::ServerDecorators::HostVoteCount);
 #include <decorators/WithProcessTick.h>
 #include <decorators/WithPacketHandler.h>
 
-void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn)
+void gscomms_execute_callback_on_main_thread(const std::function<void()>& fn, bool force)
 {
-	g_gameServer->InternalAddMainThreadCb(fn);
+	g_gameServer->InternalAddMainThreadCb(fn, force);
 }
 
 void gscomms_execute_callback_on_net_thread(const std::function<void()>& fn)

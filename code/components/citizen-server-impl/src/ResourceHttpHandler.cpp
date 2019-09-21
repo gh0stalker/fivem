@@ -13,6 +13,9 @@
 
 #include <optional>
 
+#include <json.hpp>
+#include <cfx_version.h>
+
 #include <MonoThreadAttachment.h>
 
 // HTTP handler
@@ -61,8 +64,9 @@ private:
 		std::string path;
 
 		fx::ResourceCallbackComponent::CallbackRef setDataHandler;
+		fx::ResourceCallbackComponent::CallbackRef setCancelHandler;
 
-		MSGPACK_DEFINE_MAP(headers, method, address, path, setDataHandler);
+		MSGPACK_DEFINE_MAP(headers, method, address, path, setDataHandler, setCancelHandler);
 	};
 
 	struct ResponseWrap
@@ -102,6 +106,26 @@ public:
 			requestWrap.method = request->GetRequestMethod();
 			requestWrap.address = request->GetRemoteAddress();
 			requestWrap.path = "/" + localPath;
+
+			requestWrap.setCancelHandler = cbComponent->CreateCallback([=](const msgpack::unpacked& unpacked)
+			{
+				auto args = unpacked.get().as<std::vector<msgpack::object>>();
+
+				auto callback = args[0];
+
+				if (callback.type == msgpack::type::EXT)
+				{
+					if (callback.via.ext.type() == 10 || callback.via.ext.type() == 11)
+					{
+						fx::FunctionRef functionRef{ std::string{callback.via.ext.data(), callback.via.ext.size} };
+
+						request->SetCancelHandler(make_shared_function([this, functionRef = std::move(functionRef)]()
+						{
+							m_resource->GetManager()->CallReference<void>(functionRef.GetRef());
+						}));
+					}
+				}
+			});
 
 			requestWrap.setDataHandler = cbComponent->CreateCallback([=](const msgpack::unpacked& unpacked)
 			{
@@ -166,6 +190,11 @@ public:
 					}
 
 					response->SetStatusCode(state[0].as<int>());
+				}
+
+				if (request->GetHttpVersion() != std::pair<int, int>{ 1, 0 })
+				{
+					response->WriteHead(response->GetStatusCode());
 				}
 			});
 
@@ -266,5 +295,30 @@ static InitFunction initFunction([]()
 				resource->GetComponent<ResourceHttpComponent>()->SetHandlerRef(context.GetArgument<const char*>(0));
 			}
 		}
+	});
+
+	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
+	{
+		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/", [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
+		{
+			auto resource = instance->GetComponent<fx::ResourceManager>()->GetResource("webadmin");
+
+			if (resource.GetRef() && resource->GetState() == fx::ResourceState::Started)
+			{
+				response->SetStatusCode(302);
+				response->SetHeader("Location", "/webadmin/");
+
+				response->End("Redirecting...");
+				return;
+			}
+
+			auto data = nlohmann::json::object(
+				{
+					{ "version", "FXServer-" GIT_DESCRIPTION }
+				}
+			);
+
+			response->End(data.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
+		});
 	});
 });

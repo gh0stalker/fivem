@@ -15,6 +15,10 @@
 #include <SteamComponentAPI.h>
 #include <LegitimacyAPI.h>
 #include <IteratorView.h>
+#include <optional>
+#include <random>
+#include <skyr/url.hpp>
+#include <ResumeComponent.h>
 
 #include <json.hpp>
 
@@ -475,6 +479,11 @@ void NetLibrary::SendReliableCommand(const char* type, const char* buffer, size_
 	m_impl->SendReliableCommand(HashRageString(type), buffer, length);
 }
 
+void NetLibrary::SendUnreliableCommand(const char* type, const char* buffer, size_t length)
+{
+	m_impl->SendUnreliableCommand(HashRageString(type), buffer, length);
+}
+
 static std::string g_disconnectReason;
 
 static std::mutex g_netFrameMutex;
@@ -706,8 +715,72 @@ struct GetAuthSessionTicketResponse_t
 	int m_eResult;
 };
 
-void NetLibrary::ConnectToServer(const net::PeerAddress& address)
+static std::optional<std::string> ResolveUrl(const std::string& rootUrl)
 {
+	try
+	{
+		auto uri = skyr::make_url(rootUrl);
+
+		if (uri && !uri->protocol().empty())
+		{
+			if (uri->protocol() == "fivem:")
+			{
+				// this whatwg url spec is very 'special' and doesn't allow you to ever make a new url and set protocol to any 'special' scheme
+				// such as 'http' or 'https' or 'file'
+				// and compared to cpp-uri the uri_builder was removed too
+				// so we do super verbose making a record
+
+				skyr::url_record record;
+				record.scheme = "https";
+
+				skyr::url newUri{ std::move(record) };
+				newUri.set_port(uri->port().empty() ? atoi(uri->port().c_str()) : 30120);
+				newUri.set_pathname("/");
+
+				*uri = newUri;
+			}
+
+			if (uri->protocol() == "http:" || uri->protocol() == "https:")
+			{
+				return uri->href();
+			}
+		}
+	}
+	catch (const std::exception& e)
+	{
+		
+	}
+
+	auto peerAddress = net::PeerAddress::FromString(rootUrl);
+	
+	if (peerAddress)
+	{
+		// same as above, we need a record
+		skyr::url_record record;
+		record.scheme = "http";
+
+		skyr::url newUri{ std::move(record) };
+		newUri.set_host(peerAddress->ToString());
+		newUri.set_pathname("/");
+
+		return newUri.href();
+	}
+
+	return {};
+}
+
+void NetLibrary::ConnectToServer(const std::string& rootUrl)
+{
+	auto urlRef = ResolveUrl(rootUrl);
+
+	if (!urlRef)
+	{
+		OnConnectionError(va("Couldn't resolve URL %s.", rootUrl));
+		return;
+	}
+
+	auto url = *urlRef;
+
 	if (m_connectionState != CS_IDLE)
 	{
 		Disconnect("Connecting to another server.");
@@ -752,11 +825,10 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 		}
 	} es(this);
 
-	m_currentServer = NetAddress(address.GetSocketAddress());
-	m_currentServerPeer = address;
 	m_connectionState = CS_INITING;
+	m_currentServerUrl = url;
 
-	AddCrashometry("last_server", "%s", address.ToString());
+	AddCrashometry("last_server_url", "%s", url);
 
 	if (m_impl)
 	{
@@ -799,13 +871,13 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 			// TODO: add UI output
 			m_connectionState = CS_IDLE;
 
-			OnConnectionError(va("Failed handshake to server %s:%d%s%s.", m_currentServer.GetAddress(), m_currentServer.GetPort(), connData.length() > 0 ? " - " : "", connData));
+			OnConnectionError(va("Failed handshake to server %s%s%s.", url, connData.length() > 0 ? " - " : "", connData));
 
 			return;
 		}
 		else if (!isLegacyDeferral && !Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 		{
-			OnConnectionError(va("Failed handshake to server %s:%d - it closed the connection while deferring.", m_currentServer.GetAddress(), m_currentServer.GetPort()));
+			OnConnectionError(va("Failed handshake to server %s - it closed the connection while deferring.", url));
 		}
 	};
 
@@ -836,7 +908,14 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 				if (node["deferVersion"].IsDefined())
 				{
 					// new deferral system
-					OnConnectionProgress(node["message"].as<std::string>(), 133, 133);
+					if (node["message"].IsDefined())
+					{
+						OnConnectionProgress(node["message"].as<std::string>(), 133, 133);
+					}
+					else if (node["card"].IsDefined())
+					{
+						OnConnectionCardPresent(node["card"].as<std::string>(), node["token"].as<std::string>());
+					}
 
 					return true;
 				}
@@ -852,7 +931,7 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 
 				HttpRequestOptions options;
 				options.streamingCallback = handleAuthResultData;
-				m_handshakeRequest = m_httpClient->DoPostRequest(fmt::sprintf("http://%s/client", address.ToString()), m_httpClient->BuildPostString(newMap), options, handleAuthResult);
+				m_handshakeRequest = m_httpClient->DoPostRequest(fmt::sprintf("%sclient", url), m_httpClient->BuildPostString(newMap), options, handleAuthResult);
 
 				return true;
 			}
@@ -879,6 +958,47 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 				Instance<ICoreGameInit>::Get()->ShAllowed = node["sH"].as<bool>(true);
 			}
 
+			// gather endpoints
+			std::vector<std::string> endpoints;
+
+			if (node["endpoints"].IsDefined())
+			{
+				for (const auto& endpoint : node["endpoints"])
+				{
+					endpoints.push_back(endpoint.as<std::string>());
+				}
+			}
+			else
+			{
+				auto uri = skyr::make_url(url);
+				std::string endpoint;
+			
+				if (!uri->port().empty())
+				{
+					endpoint = fmt::sprintf("%s:%d", uri->hostname(), uri->port<int>());
+				}
+				else
+				{
+					endpoint = uri->hostname();
+				}
+
+				endpoints.push_back(endpoint);
+			}
+
+			// select an endpoint
+			static std::random_device rand;
+			static std::mt19937 rng(rand());
+			std::uniform_int_distribution<> values(0, endpoints.size() - 1);
+
+			const auto& endpoint = endpoints[values(rng)];
+			auto address = *net::PeerAddress::FromString(endpoint);
+			auto oldAddress = NetAddress(address.GetSocketAddress());
+
+			m_currentServer = oldAddress;
+			m_currentServerPeer = address;
+
+			AddCrashometry("last_server", "%s", address.ToString());
+
 			m_httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/policy/shdisable?server=%s_%d", address.GetHost(), address.GetPort()), [=](bool success, const char* data, size_t length)
 			{
 				if (success)
@@ -890,9 +1010,41 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 				}
 			});
 
+			m_httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/blacklist/%s_%d", address.GetHost(), address.GetPort()), [=](bool success, const char* data, size_t length)
+			{
+				if (success)
+				{
+					FatalError("This server has been blocked from the FiveM platform. Stated reason: %sIf you manage this server and you feel this is not justified, please contact your Technical Account Manager.", std::string(data, length));
+				}
+			});
+
+			m_httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/blacklist/%s", address.GetHost()), [=](bool success, const char* data, size_t length)
+			{
+				if (success)
+				{
+					FatalError("This server has been blocked from the FiveM platform. Stated reason: %sIf you manage this server and you feel this is not justified, please contact your Technical Account Manager.", std::string(data, length));
+				}
+			});
+
 			Instance<ICoreGameInit>::Get()->EnhancedHostSupport = (node["enhancedHostSupport"].IsDefined() && node["enhancedHostSupport"].as<bool>(false));
 			Instance<ICoreGameInit>::Get()->OneSyncEnabled = (node["onesync"].IsDefined() && node["onesync"].as<bool>(false));
 			Instance<ICoreGameInit>::Get()->NetProtoVersion = (node["bitVersion"].IsDefined() ? node["bitVersion"].as<uint64_t>(0) : 0);
+
+			std::string onesyncType = "onesync";
+			auto maxClients = (node["maxClients"].IsDefined()) ? node["maxClients"].as<int>() : 64;
+
+			if (maxClients <= 32)
+			{
+				onesyncType = "";
+			}
+			else if (maxClients <= 64)
+			{
+				onesyncType = "onesync";
+			}
+			else if (maxClients <= 128)
+			{
+				onesyncType = "onesync_plus";
+			}
 
 			AddCrashometry("onesync_enabled", (Instance<ICoreGameInit>::Get()->OneSyncEnabled) ? "true" : "false");
 
@@ -905,11 +1057,11 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 				steam->SetConnectValue(fmt::sprintf("+connect %s:%d", m_currentServer.GetAddress(), m_currentServer.GetPort()));
 			}
 
-			if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+			if (Instance<ICoreGameInit>::Get()->OneSyncEnabled && !onesyncType.empty())
 			{
-				auto oneSyncFailure = [this]()
+				auto oneSyncFailure = [this, onesyncType]()
 				{
-					OnConnectionError("OneSync is not whitelisted for this server, or requesting whitelist status failed. You'll have to wait a little while longer!");
+					OnConnectionError(va("OneSync (policy type %s) is not whitelisted for this server, or requesting whitelist status failed. You'll have to wait a little while longer!", onesyncType));
 					m_connectionState = CS_IDLE;
 				};
 
@@ -918,7 +1070,7 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 					m_connectionState = CS_INITRECEIVED;
 				};
 
-				m_httpClient->DoGetRequest(fmt::sprintf("http://%s:%d/info.json", address.GetHost(), address.GetPort()), [=](bool success, const char* data, size_t size)
+				m_httpClient->DoGetRequest(fmt::sprintf("%sinfo.json", url), [=](bool success, const char* data, size_t size)
 				{
 					using json = nlohmann::json;
 
@@ -934,7 +1086,7 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 
 								if (!val.empty())
 								{
-									m_httpClient->DoGetRequest(fmt::sprintf("https://policy-live.fivem.net/api/policy/%s/onesync", val), [=](bool success, const char* data, size_t size)
+									m_httpClient->DoGetRequest(fmt::sprintf("https://policy-live.fivem.net/api/policy/%s/%s", val, onesyncType), [=](bool success, const char* data, size_t size)
 									{
 										if (success)
 										{
@@ -1002,24 +1154,22 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 		HttpRequestOptions options;
 		options.streamingCallback = handleAuthResultData;
 
-		m_handshakeRequest = m_httpClient->DoPostRequest(fmt::sprintf("http://%s/client", address.ToString()), m_httpClient->BuildPostString(postMap), options, handleAuthResult);
+		m_handshakeRequest = m_httpClient->DoPostRequest(fmt::sprintf("%sclient", url), m_httpClient->BuildPostString(postMap), options, handleAuthResult);
 	};
 
-	m_httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/blacklist/%s_%d", address.GetHost(), address.GetPort()), [=](bool success, const char* data, size_t length)
+	m_cardResponseHandler = [this, url](const std::string& cardData, const std::string& token)
 	{
-		if (success)
+		auto handleCardResult = [](bool result, const char* connDataStr, size_t size)
 		{
-			FatalError("This server has been blocked from the FiveM platform. Stated reason: %sIf you manage this server and you feel this is not justified, please contact your Technical Account Manager.", std::string(data, length));
-		}
-	});
+			// TODO: response handling
+		};
 
-	m_httpClient->DoGetRequest(fmt::sprintf("https://runtime.fivem.net/blacklist/%s", address.GetHost()), [=](bool success, const char* data, size_t length)
-	{
-		if (success)
-		{
-			FatalError("This server has been blocked from the FiveM platform. Stated reason: %sIf you manage this server and you feel this is not justified, please contact your Technical Account Manager.", std::string(data, length));
-		}
-	});
+		m_handshakeRequest = m_httpClient->DoPostRequest(fmt::sprintf("%sclient", url), m_httpClient->BuildPostString({
+			{ "method", "submitCard" },
+			{ "data", cardData },
+			{ "token", token }
+		}), handleCardResult);
+	};
 
 	auto continueRequest = [=]()
 	{
@@ -1089,9 +1239,9 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 		}
 	};
 
-	auto initiateRequest = [this, address, continueRequest]()
+	auto initiateRequest = [this, url, continueRequest]()
 	{
-		if (OnInterceptConnectionForAuth(address, [this, continueRequest](bool success, const std::map<std::string, std::string>& additionalPostData)
+		if (OnInterceptConnectionForAuth(url, [this, continueRequest](bool success, const std::map<std::string, std::string>& additionalPostData)
 		{
 			if (success)
 			{
@@ -1112,9 +1262,19 @@ void NetLibrary::ConnectToServer(const net::PeerAddress& address)
 		}
 	};
 
-	if (OnInterceptConnection(address, initiateRequest))
+	if (OnInterceptConnection(url, initiateRequest))
 	{
 		initiateRequest();
+	}
+}
+
+void NetLibrary::SubmitCardResponse(const std::string& dataJson, const std::string& token)
+{
+	auto responseHandler = m_cardResponseHandler;
+
+	if (responseHandler)
+	{
+		responseHandler(dataJson, token);
 	}
 }
 
@@ -1342,6 +1502,15 @@ NetLibrary* NetLibrary::Create()
 	});
 
 	OnNetLibraryCreate(lib);
+
+	OnAbnormalTermination.Connect([lib](void* reason)
+	{
+		if (lib->GetConnectionState() != NetLibrary::CS_IDLE)
+		{
+			lib->Disconnect((const char*)reason);
+			lib->FinalizeDisconnect();
+		}
+	});
 
 	return lib;
 }

@@ -15,6 +15,7 @@
 namespace fx
 {
 	TcpListenManager::TcpListenManager()
+		: m_primaryPort(0)
 	{
 		Initialize();
 	}
@@ -33,6 +34,12 @@ namespace fx
 		// if a peer address is set
 		if (peerAddress.is_initialized())
 		{
+			// if the primary port isn't set, set it
+			if (m_primaryPort == 0)
+			{
+				m_primaryPort = peerAddress->GetPort();
+			}
+
 			// create a multiplexable TCP server and bind it
 			fwRefContainer<net::MultiplexTcpBindServer> server = new net::MultiplexTcpBindServer(m_tcpStack);
 			server->Bind(peerAddress.get());
@@ -43,6 +50,20 @@ namespace fx
 			// trigger event
 			OnInitializeMultiplexServer(server);
 		}
+	}
+
+	void TcpListenManager::AddExternalServer(const fwRefContainer<net::TcpServer>& server)
+	{
+		// attach and create a multiplex
+		fwRefContainer<net::MultiplexTcpServer> multiplex = new net::MultiplexTcpServer();
+		multiplex->AttachToServer(server);
+
+		// store the server
+		m_externalServers.push_back(server);
+		m_multiplexServers.push_back(multiplex);
+
+		// set up the multiplex
+		OnInitializeMultiplexServer(multiplex);
 	}
 
 	void TcpListenManager::AttachToObject(ServerInstanceBase* instance)

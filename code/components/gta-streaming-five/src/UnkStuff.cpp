@@ -585,6 +585,18 @@ static void CompTrace()
 	hook::call(hook::get_pattern("B9 48 93 55 15 E8", 5), errorBit.GetCode());
 }
 
+static void* (*g_origSMPACreate)(void* a1, void* a2, size_t size, void* a4, bool a5);
+
+static void* SMPACreateStub(void* a1, void* a2, size_t size, void* a4, bool a5)
+{
+       if (size == 0xD00000)
+       {
+               size = 0x1200000;
+       }
+
+       return g_origSMPACreate(a1, a2, size, a4, a5);
+}
+
 static HookFunction hookFunction([]()
 {
 #if 0
@@ -618,6 +630,11 @@ static HookFunction hookFunction([]()
 	hook::put<uint8_t>(hook::pattern("F6 05 ? ? ? ? ? 74 08 84 C0 0F 84").count(1).get(0).get<void>(0x18), 0xEB);
 #endif
 
+	// 1604 (ported from 1737): increase rline allocator size using a hook (as Arxan)
+	MH_Initialize();
+	MH_CreateHook((void*)0x14127385C, SMPACreateStub, (void**)&g_origSMPACreate);
+	MH_EnableHook(MH_ALL_HOOKS);
+
 	if (!CfxIsSinglePlayer())
 	{
 		// population zone selection for network games
@@ -633,7 +650,7 @@ static HookFunction hookFunction([]()
 		// additional netgame checks for scenarios
 		hook::nop(hook::get_pattern("B2 04 75 65 80 7B 39", 2), 2);
 		hook::put<uint8_t>(hook::get_pattern("74 24 84 D2 74 20 8B 83", 4), 0xEB);
-		hook::nop(hook::get_pattern("84 D2 75 41 8B 83", 2), 2);
+		hook::put<uint8_t>(hook::get_pattern("84 D2 75 41 8B 83", 0x5F), 0xEB);
 		//hook::put<uint8_t>(hook::get_pattern("40 B6 01 74 52 F3 0F 10 01", 3), 0xEB); // this skips a world grid check, might be bad!
 
 		// another scenario cluster network game check
@@ -648,6 +665,10 @@ static HookFunction hookFunction([]()
 
 		// scenario point network game check
 		hook::put<uint8_t>(hook::get_pattern("74 0D 3C 02 0F 94 C0 38 05", 0), 0xEB);
+
+		// netgame checks for vehicle fuel tank leaking
+		hook::nop(hook::get_pattern("48 83 65 7F 00 0F 29 45 27 48 8D 45 77", -0xE3), 7);
+		hook::nop(hook::get_call(hook::get_pattern<char>("40 53 48 83 EC 20 48 8B D9 E8 ? ? ? ? 84 C0 74 32 8A 83 D8", 9)) + 0x19, 2);
 	}
 
 	// increase the heap size for allocator 0

@@ -84,6 +84,7 @@ struct dlState
 	CURLM* curl;
 	
 	bool isDownloading;
+	bool error;
 
 	std::queue<std::shared_ptr<download_t>> downloadQueue;
 	std::vector<std::shared_ptr<download_t>> currentDownloads;
@@ -203,8 +204,6 @@ void DL_UpdateGlobalProgress(size_t thisSize)
 
 	double percentage = ((double)(dls.doneTotalBytes / 1000) / (dls.totalBytes / 1000)) * 100.0;
 
-	UI_UpdateText(0, L"Updating " PRODUCT_NAME L"...");
-
 	UI_UpdateText(1, va(L"Downloaded %.2f/%.2f MB (%.0f%%, %.1f MB/s)", (dls.doneTotalBytes / 1000) / 1000.f, ((dls.totalBytes / 1000) / 1000.f), percentage, dls.bytesPerSecond / (double)1000000));
 
 	UI_UpdateProgress(percentage);
@@ -242,7 +241,7 @@ size_t DL_WriteToFile(void *ptr, size_t size, size_t nmemb, download_t* download
 			if (ret != LZMA_OK && ret != LZMA_STREAM_END)
 			{
 				MessageBoxA(NULL, va("LZMA decoding error %i in %s.", ret, download->file), "Error", MB_OK | MB_ICONSTOP);
-				ExitProcess(1);
+				return 0;
 			}
 
 			if (download->writeToMemory)
@@ -302,11 +301,11 @@ static int DL_CurlDebug(CURL *handle,
 	return 0;
 }
 
-void DL_ProcessDownload()
+bool DL_ProcessDownload()
 {
 	if (!dls.currentDownloads.size())
 	{
-		return;
+		return true;
 	}
 
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
@@ -368,8 +367,7 @@ void DL_ProcessDownload()
 					dls.isDownloading = false;
 					MessageBox(NULL, va(L"Unable to open %s for writing.", converter.from_bytes(opath).c_str()), L"Error", MB_OK | MB_ICONSTOP);
 
-					ExitProcess(1);
-					return;
+					return false;
 				}
 
 				download->fp[0] = fp;
@@ -460,7 +458,7 @@ void DL_ProcessDownload()
 						dls.isDownloading = false;
 						MessageBox(NULL, va(L"Unable to open %s for writing. Windows error code %d was returned.", tmpPathWide, errNo), L"Error", MB_OK | MB_ICONSTOP);
 
-						ExitProcess(1);
+						return false;
 					}
 
 					std::string str = download->memoryStream.str();
@@ -477,12 +475,12 @@ void DL_ProcessDownload()
 								L"Unable to write to %s. Windows error code %d was returned.%s",
 								tmpPathWide,
 								errNo,
-								(errNo == ERROR_VIRUS_INFECTED) ? "\nThis is usually caused by anti-malware software. Please report this issue to your anti-malware software vendor." : ""
+								(errNo == ERROR_VIRUS_INFECTED) ? L"\nThis is usually caused by anti-malware software. Please report this issue to your anti-malware software vendor." : L""
 							),
 							L"Error",
 							MB_OK | MB_ICONSTOP);
 
-						ExitProcess(1);
+						return false;
 					}
 
 					CloseHandle(hFile);
@@ -502,7 +500,7 @@ void DL_ProcessDownload()
 						{
 							MessageBoxA(NULL, va("Deleting old %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
 
-							ExitProcess(1);
+							return false;
 						}
 					}
 
@@ -511,7 +509,7 @@ void DL_ProcessDownload()
 						MessageBoxA(NULL, va("Moving of %s failed (err = %d) - make sure you don't have any existing FiveM processes running", download->url, GetLastError()), "Error", MB_OK | MB_ICONSTOP);
 						DeleteFile(tmpPathWide.c_str());
 
-						ExitProcess(1);
+						return false;
 					}
 
 					dls.completedDownloads++;
@@ -523,12 +521,14 @@ void DL_ProcessDownload()
 					_wunlink(tmpPathWide.c_str());
 					MessageBoxA(NULL, va("Downloading of %s failed with CURLcode %d - %s%s", download->url, (int)code, download->curlError, (code == CURLE_WRITE_ERROR) ? "\nAre you sure you have enough disk space on all drives?" : ""), "Error", MB_OK | MB_ICONSTOP);
 
-					ExitProcess(1);
+					return false;
 				}
 			}
 		}
 
 	} while (info != NULL);
+
+	return true;
 }
 
 bool DL_Process()
@@ -550,7 +550,13 @@ bool DL_Process()
 
 	if (!dls.currentDownloads.empty())
 	{
-		DL_ProcessDownload();
+		if (!DL_ProcessDownload())
+		{
+			dls.isDownloading = false;
+			dls.error = true;
+
+			return true;
+		}
 	}
 	
 	if (dls.downloadQueue.size() > 0)
@@ -661,6 +667,11 @@ bool DL_RunLoop()
 		{
 			return false;
 		}
+	}
+
+	if (dls.error)
+	{
+		return false;
 	}
 
 	return true;

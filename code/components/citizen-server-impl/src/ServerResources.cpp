@@ -14,11 +14,13 @@
 
 #include <VFSManager.h>
 
-#include <network/uri.hpp>
+#include <skyr/url.hpp>
+#include <skyr/percent_encode.hpp>
 
 #include <PrintListener.h>
 
 #include <ResourceStreamComponent.h>
+#include <EventReassemblyComponent.h>
 
 class LocalResourceMounter : public fx::ResourceMounter
 {
@@ -36,28 +38,25 @@ public:
 
 	virtual pplx::task<fwRefContainer<fx::Resource>> LoadResource(const std::string& uri) override
 	{
-		std::error_code ec;
-		auto uriParsed = network::make_uri(uri, ec);
+		auto uriParsed = skyr::make_url(uri);
 
 		fwRefContainer<fx::Resource> resource;
 
-		if (!ec)
+		if (uriParsed)
 		{
-			auto pathRef = uriParsed.path();
-			auto fragRef = uriParsed.fragment();
+			auto pathRef = uriParsed->pathname();
+			auto fragRef = uriParsed->hash().substr(1);
 
 			if (!pathRef.empty() && !fragRef.empty())
 			{
-				std::vector<char> path;
 #ifdef _WIN32
-				std::string pr = pathRef.substr(1).to_string();
+				std::string pr = pathRef.substr(1);
 #else
-				std::string pr = pathRef.to_string();
+				std::string pr = pathRef;
 #endif
-				network::uri::decode(pr.begin(), pr.end(), std::back_inserter(path));
 
-				resource = m_manager->CreateResource(fragRef.to_string());
-				resource->LoadFrom(std::string(path.begin(), path.begin() + path.size()));
+				resource = m_manager->CreateResource(fragRef);
+				resource->LoadFrom(*skyr::percent_decode(pr));
 			}
 		}
 
@@ -97,14 +96,18 @@ static void HandleServerEvent(fx::ServerInstanceBase* instance, const std::share
 	);
 }
 
+static std::shared_ptr<ConVar<std::string>> g_citizenDir;
+
 static void ScanResources(fx::ServerInstanceBase* instance)
 {
 	auto resMan = instance->GetComponent<fx::ResourceManager>();
 
 	std::string resourceRoot(instance->GetRootPath() + "/resources/");
+	std::string systemResourceRoot(g_citizenDir->GetValue() + "/system_resources/");
 
 	std::queue<std::string> pathsToIterate;
 	pathsToIterate.push(resourceRoot);
+	pathsToIterate.push(systemResourceRoot);
 
 	std::vector<pplx::task<fwRefContainer<fx::Resource>>> tasks;
 
@@ -150,12 +153,14 @@ static void ScanResources(fx::ServerInstanceBase* instance)
 						{
 							trace("Found new resource %s in %s\n", findData.name, resPath);
 
-							tasks.push_back(resMan->AddResource(network::uri_builder{}
-								.scheme("file")
-								.host("")
-								.path(resPath)
-								.fragment(findData.name)
-								.uri().string()));
+							skyr::url_record record;
+							record.scheme = "file";
+
+							skyr::url url{ std::move(record) };
+							url.set_pathname(*skyr::percent_encode(resPath, skyr::encode_set::path));
+							url.set_hash(*skyr::percent_encode(findData.name, skyr::encode_set::fragment));
+
+							tasks.push_back(resMan->AddResource(url.href()));
 						}
 					}
 				}
@@ -173,6 +178,27 @@ static void ScanResources(fx::ServerInstanceBase* instance)
 		->TriggerEvent2("onResourceListRefresh", {});
 }
 
+static class : public fx::EventReassemblySink
+{
+public:
+	virtual void SendPacket(int target, std::string_view packet) override
+	{
+		auto client = instance->GetComponent<fx::ClientRegistry>()->GetClientByNetID(target);
+
+		if (client)
+		{
+			net::Buffer outPacket;
+			outPacket.Write(HashRageString("msgReassembledEvent"));
+			outPacket.Write(packet.data(), packet.size());
+
+			client->SendPacket(1, outPacket);
+		}
+	}
+
+public:
+	fx::ServerInstanceBase* instance;
+} g_reassemblySink;
+
 static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
@@ -183,6 +209,44 @@ static InitFunction initFunction([]()
 		fwRefContainer<fx::ResourceManager> resman = instance->GetComponent<fx::ResourceManager>();
 		resman->SetComponent(new fx::ServerInstanceBaseRef(instance));
 		resman->SetComponent(instance->GetComponent<console::Context>());
+		resman->SetComponent(fx::EventReassemblyComponent::Create());
+
+		// TODO: not instanceable
+		auto rac = resman->GetComponent<fx::EventReassemblyComponent>();
+
+		instance
+			->GetComponent<fx::GameServer>()
+			->GetComponent<fx::HandlerMapComponent>()
+			->Add(HashRageString("msgReassembledEvent"), [rac](const std::shared_ptr<fx::Client>& client, net::Buffer& buffer)
+			{
+				rac->HandlePacket(client->GetNetId(), std::string_view{ (char*)(buffer.GetBuffer() + buffer.GetCurOffset()), buffer.GetRemainingBytes() });
+			});
+
+		g_reassemblySink.instance = instance;
+		rac->SetSink(&g_reassemblySink);
+
+		instance->GetComponent<fx::ClientRegistry>()->OnClientCreated.Connect([rac](fx::Client* client)
+		{
+			client->OnAssignNetId.Connect([rac, client]()
+			{
+				if (client->GetNetId() < 0xFFFF)
+				{
+					rac->RegisterTarget(client->GetNetId());
+
+					client->OnDrop.Connect([rac, client]()
+					{
+						rac->UnregisterTarget(client->GetNetId());
+					});
+				}
+			});
+		});
+
+		instance->GetComponent<fx::GameServer>()->OnNetworkTick.Connect([rac]()
+		{
+			rac->NetworkTick();
+		});
+
+		
 
 		resman->AddMounter(new LocalResourceMounter(resman.GetRef()));
 
@@ -240,7 +304,7 @@ static InitFunction initFunction([]()
 		});
 
 		{
-			static auto citizenDir = instance->AddVariable<std::string>("citizen_dir", ConVar_None, "");
+			g_citizenDir = instance->AddVariable<std::string>("citizen_dir", ConVar_None, "");
 
 			// create cache directory if needed
 			auto device = vfs::GetDevice(instance->GetRootPath());
@@ -254,7 +318,7 @@ static InitFunction initFunction([]()
 				device->CreateDirectory(cacheDir + "files/");
 			}
 
-			vfs::Mount(new vfs::RelativeDevice(citizenDir->GetValue() + "/"), "citizen:/");
+			vfs::Mount(new vfs::RelativeDevice(g_citizenDir->GetValue() + "/"), "citizen:/");
 			vfs::Mount(new vfs::RelativeDevice(cacheDir), "cache:/");
 		}
 
@@ -509,6 +573,25 @@ static InitFunction initFunction2([]()
 		instance->GetComponent<fx::ServerEventComponent>()->TriggerClientEvent(eventName, data, dataLen, targetSrc);
 	});
 
+	fx::ScriptEngine::RegisterNativeHandler("TRIGGER_LATENT_CLIENT_EVENT_INTERNAL", [](fx::ScriptContext& context)
+	{
+		std::string_view eventName = context.CheckArgument<const char*>(0);
+		auto targetSrcIdx = context.CheckArgument<const char*>(1);
+
+		const void* data = context.GetArgument<const void*>(2);
+		uint32_t dataLen = context.GetArgument<uint32_t>(3);
+
+		int bps = context.GetArgument<int>(4);
+
+		// get the current resource manager
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+
+		// get the owning server instance
+		auto rac = resourceManager->GetComponent<fx::EventReassemblyComponent>();
+
+		rac->TriggerEvent(std::stoi(targetSrcIdx), eventName, std::string_view{ reinterpret_cast<const char*>(data), dataLen }, bps);
+	});
+
 	fx::ScriptEngine::RegisterNativeHandler("START_RESOURCE", [](fx::ScriptContext& context)
 	{
 		auto resourceManager = fx::ResourceManager::GetCurrent();
@@ -537,6 +620,21 @@ static InitFunction initFunction2([]()
 		}
 
 		context.SetResult(success);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SCHEDULE_RESOURCE_TICK", [](fx::ScriptContext& context)
+	{
+		auto resourceManager = fx::ResourceManager::GetCurrent();
+		fwRefContainer<fx::Resource> resource = resourceManager->GetResource(context.CheckArgument<const char*>(0));
+
+		gscomms_execute_callback_on_main_thread([resource]()
+		{
+			if (resource.GetRef())
+			{
+				resource->GetManager()->MakeCurrent();
+				resource->Tick();
+			}
+		}, true);
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("REGISTER_RESOURCE_ASSET", [](fx::ScriptContext& context)

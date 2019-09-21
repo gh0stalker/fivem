@@ -7,8 +7,22 @@
 
 #include <sysAllocator.h>
 
+#include <nutsnbolts.h>
+
+#include <fiDevice.h>
+
+#include <CoreConsole.h>
+
+#include <NetLibrary.h>
+
 namespace rage
 {
+	class audWaveSlot
+	{
+	public:
+		static audWaveSlot* FindWaveSlot(uint32_t hash);
+	};
+
 	class audSound
 	{
 	public:
@@ -24,7 +38,7 @@ namespace rage
 
 		virtual void m_28() = 0;
 
-		void PrepareAndPlay(void* a1, bool a2, int a3, bool a4);
+		void PrepareAndPlay(audWaveSlot* waveSlot, bool a2, int a3, bool a4);
 
 		void StopAndForget(void* a1);
 	};
@@ -39,7 +53,7 @@ namespace rage
 		return hook::get_pattern("74 24 45 0F B6 41 62", -0x10);
 	});
 
-	void audSound::PrepareAndPlay(void* a1, bool a2, int a3, bool a4)
+	void audSound::PrepareAndPlay(audWaveSlot* a1, bool a2, int a3, bool a4)
 	{
 		_audSound_PrepareAndPlay(this, a1, a2, a3, a4);
 	}
@@ -156,6 +170,8 @@ namespace rage
 
 		void SetCategory(rage::audCategory* category);
 
+		void SetVolume(float volume);
+
 	private:
 		uint8_t m_pad[0xB0];
 	};
@@ -163,6 +179,11 @@ namespace rage
 	void audSoundInitParams::SetCategory(rage::audCategory* category)
 	{
 		*(audCategory**)(&m_pad[88]) = category;
+	}
+
+	void audSoundInitParams::SetVolume(float volume)
+	{
+		*(float*)(&m_pad[48]) = volume;
 	}
 
 	static hook::cdecl_stub<void(rage::audSoundInitParams*)> _audSoundInitParams_ctor([]()
@@ -218,6 +239,26 @@ namespace rage
 
 		g_categoryMgr = hook::get_address<audCategoryManager*>(hook::get_pattern("48 8B CB BA EA 75 96 D5 E8", -4));
 	});
+
+	static hook::cdecl_stub<audWaveSlot*(uint32_t)> _findWaveSlot([]()
+	{
+		return hook::get_call(hook::get_pattern("B9 A1 C7 05 92 E8", 5));
+	});
+
+	audWaveSlot* audWaveSlot::FindWaveSlot(uint32_t hash)
+	{
+		return _findWaveSlot(hash);
+	}
+
+	static hook::cdecl_stub<float(float)> _linearToDb([]()
+	{
+		return hook::get_pattern("8B 4C 24 08 8B C1 81 E1 FF FF 7F 00", -0x14);
+	});
+
+	float GetDbForLinear(float x)
+	{
+		return _linearToDb(x);
+	}
 }
 
 static hook::cdecl_stub<void()> _updateAudioThread([]()
@@ -390,13 +431,94 @@ std::shared_ptr<nui::IAudioStream> RageAudioSink::CreateAudioStream(const nui::A
 
 static RageAudioSink g_audioSink;
 
+DLL_IMPORT void ForceMountDataFile(const std::pair<std::string, std::string>& dataFile);
+
+static uint32_t* g_preferenceArray;
+
+enum AudioPrefs
+{
+	PREF_SFX_VOLUME = 7,
+	PREF_MUSIC_VOLUME = 8,
+	PREF_MUSIC_VOLUME_IN_MP = 0x25,
+};
+
+static HookFunction hookFunction([]()
+{
+	g_preferenceArray = hook::get_address<uint32_t*>(hook::get_pattern("48 8D 15 ? ? ? ? 8D 43 01 83 F8 02 77 2D", 3));
+});
+
 static InitFunction initFunction([]()
 {
 	rage::OnInitFunctionInvoked.Connect([](rage::InitFunctionType type, const rage::InitFunctionData& data)
 	{
-		if (type == rage::InitFunctionType::INIT_CORE && data.funcHash == 0xE6D408DF)
+		if (type == rage::InitFunctionType::INIT_CORE && data.funcHash == /*0xE6D408DF*/0xF0F5A94D)
 		{
-			audioRunning = true;
+			rage::fiPackfile* xm18 = new rage::fiPackfile();
+			if (xm18->OpenPackfile("dlcpacks:/mpchristmas2018/dlc.rpf", true, 3, false))
+			{
+				xm18->Mount("xm18:/");
+
+				ForceMountDataFile({ "AUDIO_SOUNDDATA", "xm18:/x64/audio/dlcAWXM2018_sounds.dat" });
+				ForceMountDataFile({ "AUDIO_WAVEPACK", "xm18:/x64/audio/sfx/dlc_AWXM2018" });
+
+				audioRunning = true;
+			}
+		}
+	});
+
+	static NetLibrary* netLibrary;
+
+	NetLibrary::OnNetLibraryCreate.Connect([](NetLibrary* lib)
+	{
+		netLibrary = lib;
+	});
+
+	OnGameFrame.Connect([]()
+	{
+		static ConVar<bool> arenaWarVariable("ui_disableMusicTheme", ConVar_Archive, false);
+		static ConVar<bool> arenaWarVariableForce("ui_forceMusicTheme", ConVar_Archive, false);
+		static ConVar<std::string> musicThemeVariable("ui_selectMusic", ConVar_Archive, "dlc_awxm2018_theme_5_stems");
+		static std::string lastSong = musicThemeVariable.GetValue();
+
+		static rage::audSound* g_sound;
+
+		if (audioRunning)
+		{
+			bool active = nui::HasMainUI() && (!netLibrary || netLibrary->GetConnectionState() == NetLibrary::CS_IDLE) && !arenaWarVariable.GetValue();
+
+			if (arenaWarVariableForce.GetValue())
+			{
+				active = true;
+			}
+
+			if (active && !g_sound)
+			{
+				rage::audSoundInitParams initValues;
+
+				float volume = rage::GetDbForLinear(std::min(std::min({ g_preferenceArray[PREF_MUSIC_VOLUME], g_preferenceArray[PREF_MUSIC_VOLUME_IN_MP], g_preferenceArray[PREF_SFX_VOLUME] }) / 10.0f, 0.75f));
+				initValues.SetVolume(volume);
+
+				rage::g_frontendAudioEntity->CreateSound_PersistentReference(HashString(musicThemeVariable.GetValue().c_str()), (rage::audSound**)&g_sound, initValues);
+
+				if (g_sound)
+				{
+					g_sound->PrepareAndPlay(rage::audWaveSlot::FindWaveSlot(HashString("interactive_music_1")), true, -1, false);
+					_updateAudioThread();
+				}
+				else
+				{
+					musicThemeVariable.GetHelper()->SetValue("dlc_awxm2018_theme_5_stems");
+				}
+			}
+			else if ((g_sound && !active) || musicThemeVariable.GetValue() != lastSong)
+			{
+				g_sound->StopAndForget(nullptr);
+				g_sound = nullptr;
+
+				_updateAudioThread();
+
+				lastSong = musicThemeVariable.GetValue();
+			}
 		}
 	});
 

@@ -26,6 +26,8 @@ namespace WRL = Microsoft::WRL;
 fwEvent<> OnGrcCreateDevice;
 fwEvent<> OnPostFrontendRender;
 
+static bool g_overrideVsync;
+
 static void(*g_origCreateCB)(const char*);
 
 static void InvokeCreateCB(const char* arg)
@@ -68,8 +70,23 @@ static bool g_disableRendering;
 
 void MakeDummyDevice(ID3D11Device** device, ID3D11DeviceContext** context, const DXGI_SWAP_CHAIN_DESC* desc, IDXGISwapChain** swapChain);
 
+fwEvent<IDXGIFactory2*, ID3D11Device*, HWND, DXGI_SWAP_CHAIN_DESC1*, DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGISwapChain1**> OnTryCreateSwapChain;
+
 static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, _In_reads_opt_(FeatureLevels) CONST D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, _In_opt_ CONST DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, _Out_opt_ IDXGISwapChain** ppSwapChain, _Out_opt_ ID3D11Device** ppDevice, _Out_opt_ D3D_FEATURE_LEVEL* pFeatureLevel, _Out_opt_ ID3D11DeviceContext** ppImmediateContext)
 {
+	auto uiExitEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIExit");
+	auto uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIDone");
+
+	if (uiExitEvent)
+	{
+		SetEvent(uiExitEvent);
+	}
+
+	if (uiDoneEvent)
+	{
+		WaitForSingleObject(uiDoneEvent, INFINITE);
+	}
+
 	if (g_disableRendering)
 	{
 		*pFeatureLevel = D3D_FEATURE_LEVEL_11_0;
@@ -133,7 +150,12 @@ static HRESULT CreateD3D11DeviceWrap(_In_opt_ IDXGIAdapter* pAdapter, D3D_DRIVER
 		fsDesc.ScanlineOrdering = pSwapChainDesc->BufferDesc.ScanlineOrdering;
 		fsDesc.Windowed = pSwapChainDesc->Windowed;
 
-		dxgiFactory->CreateSwapChainForHwnd(*ppDevice, pSwapChainDesc->OutputWindow, &scDesc1, &fsDesc, nullptr, &swapChain1);
+		OnTryCreateSwapChain(dxgiFactory.Get(), *ppDevice, pSwapChainDesc->OutputWindow, &scDesc1, &fsDesc, &swapChain1);
+
+		if (!swapChain1)
+		{
+			dxgiFactory->CreateSwapChainForHwnd(*ppDevice, pSwapChainDesc->OutputWindow, &scDesc1, &fsDesc, nullptr, &swapChain1);
+		}
 
 		swapChain1->QueryInterface(__uuidof(IDXGISwapChain), (void**)ppSwapChain);
 	}
@@ -516,7 +538,7 @@ void CaptureBufferOutput()
 		D3D11_TEXTURE2D_DESC texDesc = { 0 };
 		texDesc.Width = resDesc.Width;
 		texDesc.Height = resDesc.Height;
-		texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 		texDesc.MipLevels = 1;
 		texDesc.ArraySize = 1;
 		texDesc.SampleDesc.Count = 1;
@@ -705,6 +727,11 @@ void CaptureBufferOutput()
 
 void D3DPresent(int syncInterval, int flags)
 {
+	if (g_overrideVsync)
+	{
+		syncInterval = 1;
+	}
+
 	if (syncInterval == 0)
 	{
 		BOOL fullscreen;
@@ -805,6 +832,11 @@ void RemoveTextureOverride(rage::grcTexture* orig)
 	AcquireSRWLockExclusive(&g_textureOverridesLock);
 	g_textureOverrides.erase(orig);
 	ReleaseSRWLockExclusive(&g_textureOverridesLock);
+}
+
+void GfxForceVsync(bool enabled)
+{
+	g_overrideVsync = enabled;
 }
 
 static HookFunction hookFunction([] ()

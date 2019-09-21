@@ -23,7 +23,9 @@
 
 #include <optional>
 
+#include <CfxState.h>
 #include <CfxSubProcess.h>
+#include <HostSharedData.h>
 
 #include <citversion.h>
 
@@ -420,6 +422,29 @@ static DWORD RemoteExceptionFunc(LPVOID objectPtr)
 	}
 }
 
+static DWORD BeforeTerminateHandler(LPVOID arg)
+{
+	__try
+	{
+		auto coreRt = GetModuleHandleW(L"CoreRT.dll");
+
+		if (coreRt)
+		{
+			auto func = (void(*)(void*))GetProcAddress(coreRt, "CoreOnProcessAbnormalTermination");
+
+			if (func)
+			{
+				func(arg);
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+	}
+
+	return 0;
+}
+
 // c/p from ros-patches:five
 // #TODO: factor out sanely
 
@@ -522,6 +547,20 @@ static void GatherCrashInformation()
 
 			if (err == MZ_OK)
 			{
+				auto extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info.bin");
+
+				if (GetFileAttributesW(extraDumpPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+				{
+					mz_zip_writer_add_path(writer, ToNarrow(extraDumpPath).c_str(), nullptr, false, false);
+				}
+
+				extraDumpPath = MakeRelativeCitPath(L"cache\\extra_dump_info2.bin");
+
+				if (GetFileAttributesW(extraDumpPath.c_str()) != INVALID_FILE_ATTRIBUTES)
+				{
+					mz_zip_writer_add_path(writer, ToNarrow(extraDumpPath).c_str(), nullptr, false, false);
+				}
+
 				success = true;
 			}
 		}
@@ -620,13 +659,65 @@ bool LoadOwnershipTicket()
 	return false;
 }
 
+// copied here so that we don't have to rebuild Shared (and HostSharedData does not support custom names)
+struct MDSharedTickCount
+{
+	struct Data
+	{
+		uint64_t tickCount;
+
+		Data()
+		{
+			tickCount = GetTickCount64();
+		}
+	};
+
+	MDSharedTickCount()
+	{
+		m_data = &m_fakeData;
+
+		bool initTime = true;
+		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Data), L"CFX_SharedTickCount");
+
+		if (m_fileMapping != nullptr)
+		{
+			if (GetLastError() == ERROR_ALREADY_EXISTS)
+			{
+				initTime = false;
+			}
+
+			m_data = (Data*)MapViewOfFile(m_fileMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Data));
+
+			if (initTime)
+			{
+				m_data = new(m_data) Data();
+			}
+		}
+	}
+
+	inline Data& operator*()
+	{
+		return *m_data;
+	}
+
+	inline Data* operator->()
+	{
+		return m_data;
+	}
+
+private:
+	HANDLE m_fileMapping;
+	Data* m_data;
+
+	Data m_fakeData;
+};
 
 void InitializeDumpServer(int inheritedHandle, int parentPid)
 {
 	static bool g_running = true;
 
 	HANDLE inheritedHandleBit = (HANDLE)inheritedHandle;
-	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE, FALSE, parentPid);
+	static HANDLE parentProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE, FALSE, parentPid);
 
 	CrashGenerationServer::OnClientConnectedCallback connectCallback = [] (void*, const ClientInfo* info)
 	{
@@ -815,7 +906,23 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		}
 
 		parameters[L"ProductName"] = L"FiveM";
-		parameters[L"Version"] = va(L"1.3.0.%d", BASE_EXE_VERSION);
+
+		FILE* f = _wfopen(MakeRelativeCitPath(L"citizen/version.txt").c_str(), L"r");
+
+		if (f)
+		{
+			char ver[128];
+
+			fgets(ver, sizeof(ver), f);
+			fclose(f);
+
+			parameters[L"Version"] = va(L"1.3.0.%d", atoi(ver));
+		}
+		else
+		{
+			parameters[L"Version"] = va(L"1.3.0.%d", BASE_EXE_VERSION);
+		}
+
 		parameters[L"BuildID"] = L"20170101";
 		parameters[L"UserID"] = ToWide(g_entitlementSource);
 
@@ -829,11 +936,17 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 
 		parameters[L"AdditionalData"] = GetAdditionalData();
 
+		{
+			static MDSharedTickCount tickCount;
+			parameters[L"StartTime"] = fmt::sprintf(L"%lld", _time64(nullptr) - ((GetTickCount64() - tickCount->tickCount) / 1000));
+		}
+
 		std::wstring responseBody;
 		int responseCode;
 
 		std::map<std::wstring, std::wstring> files;
 		files[L"upload_file_minidump"] = *filePath;
+		files[L"upload_file_log"] = MakeRelativeCitPath(L"CitizenFX.log");
 
 		// avoid libcef.dll subprocess crashes terminating the entire job
 		bool shouldTerminate = true;
@@ -852,11 +965,6 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 				shouldTerminate = false;
 				shouldUpload = false;
 			}
-		}
-
-		if (shouldTerminate)
-		{
-			TerminateProcess(parentProcess, -2);
 		}
 
 		static std::wstring windowTitle = PRODUCT_NAME L" Error";
@@ -909,6 +1017,49 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		if (!crashHash.empty())
 		{
 			content += fmt::sprintf(L"\n\nLegacy crash hash: %s", HashCrash(crashHash));
+		}
+
+		if (shouldTerminate)
+		{
+			std::thread([]()
+			{
+				static HostSharedData<CfxState> hostData("CfxInitState");
+				HANDLE gameProcess = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION, FALSE, hostData->gamePid);
+
+				if (!gameProcess)
+				{
+					gameProcess = parentProcess;
+				}
+
+				if (gameProcess)
+				{
+					std::string friendlyReason = ToNarrow(HashCrash(crashHash) + L" (" + UnblameCrash(crashHash) + L")");
+
+					if (!exType.empty())
+					{
+						friendlyReason = "Unhandled exception: " + exType;
+					}
+
+					friendlyReason = "Game crashed: " + friendlyReason;
+
+					LPVOID memPtr = VirtualAllocEx(gameProcess, NULL, friendlyReason.size() + 1, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+
+					if (memPtr)
+					{
+						WriteProcessMemory(gameProcess, memPtr, friendlyReason.data(), friendlyReason.size() + 1, NULL);
+					}
+
+					HANDLE hThread = CreateRemoteThread(gameProcess, NULL, 0, BeforeTerminateHandler, memPtr, 0, NULL);
+
+					if (hThread)
+					{
+						WaitForSingleObject(hThread, 7500);
+						CloseHandle(hThread);
+					}
+				}
+
+				TerminateProcess(parentProcess, -2);
+			}).detach();
 		}
 
 		static std::optional<std::wstring> crashId;
@@ -1060,6 +1211,9 @@ void InitializeDumpServer(int inheritedHandle, int parentPid)
 		{
 			saveThread.join();
 		}
+
+		_wunlink(MakeRelativeCitPath(L"cache\\extra_dump_info.bin").c_str());
+		_wunlink(MakeRelativeCitPath(L"cache\\extra_dump_info2.bin").c_str());
 	};
 
 	CrashGenerationServer::OnClientExitedCallback exitCallback = [] (void*, const ClientInfo* info)

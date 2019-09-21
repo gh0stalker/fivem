@@ -36,6 +36,9 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 
+#include <VFSManager.h>
+#include <VFSZipFile.h>
+
 void FinalizeInitNUI();
 
 struct GameRenderData
@@ -122,9 +125,23 @@ static void glTexParameterfHook(GLenum target, GLenum pname, GLfloat param)
 		};
 
 		EGLConfig configs;
-		EGLint numConfigs;
+		EGLint numConfigs = 0;
 
-		_eglGetConfigs(m_display, &configs, 1, &numConfigs);
+		EGLint config_attributes[] =
+		{
+			EGL_RED_SIZE,			8,
+			EGL_GREEN_SIZE,			8,
+			EGL_BLUE_SIZE,			8,
+			EGL_ALPHA_SIZE,			8,
+			EGL_NONE,				EGL_NONE,
+		};
+
+		_eglChooseConfig(m_display, config_attributes, &configs, 1, &numConfigs);
+
+		if (numConfigs == 0)
+		{
+			_eglGetConfigs(m_display, &configs, 1, &numConfigs);
+		}
 
 		EGLSurface pbuffer = _eglCreatePbufferFromClientBuffer(
 			m_display,
@@ -311,4 +328,19 @@ void FinalizeInitNUI()
 			g_shouldCreateRootWindow = false;
 		}
 	});
+
+	rage::fiDevice::OnInitialMount.Connect([]()
+	{
+		auto zips = { "citizen:/ui.zip", "citizen:/ui-big.zip" };
+
+		for (auto zip : zips)
+		{
+			fwRefContainer<vfs::ZipFile> file = new vfs::ZipFile();
+
+			if (file->OpenArchive(zip))
+			{
+				vfs::Mount(file, "citizen:/ui/");
+			}
+		}
+	}, 100);
 }

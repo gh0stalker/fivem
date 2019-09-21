@@ -1,4 +1,4 @@
-import { Component, Input, ViewChild } from '@angular/core';
+import { Component, Input, ViewChild, ChangeDetectionStrategy } from '@angular/core';
 import { Router } from '@angular/router';
 
 import { Server } from '../server';
@@ -10,7 +10,8 @@ import { DiscourseService, BoostData } from 'app/discourse.service';
     moduleId: module.id,
     selector: 'servers-list-item',
     templateUrl: 'servers-list-item.component.html',
-    styleUrls: ['servers-list-item.component.scss']
+    styleUrls: ['servers-list-item.component.scss'],
+    changeDetection: ChangeDetectionStrategy.OnPush
 })
 
 export class ServersListItemComponent {
@@ -72,16 +73,7 @@ export class ServersListItemComponent {
     addBoost() {
         if (!this.discourseService.currentUser) {
             this.gameService.invokeInformational(
-                'You need to have a linked FiveM account with an active Patreon subscription in order to BOOST™ a server.'
-            );
-
-            return;
-        }
-
-        if (!this.discourseService.currentUser.isPremium) {
-            this.gameService.invokeInformational(
-                'You need to have an active Patreon "Element Club" subscription in order to BOOST™ a server. ' +
-                'Please get one to be able to support this server!'
+                'You need to have a linked FiveM account in order to BOOST™ a server.'
             );
 
             return;
@@ -98,7 +90,7 @@ export class ServersListItemComponent {
         this.discourseService.externalCall('https://servers-frontend.fivem.net/api/upvote/', 'POST', {
             address: this.server.address
         }).then((response) => {
-            if (response.data) {
+            if (response.data.success) {
                 if (!this.discourseService.currentBoost) {
                     this.discourseService.currentBoost = new BoostData();
                 }
@@ -107,7 +99,12 @@ export class ServersListItemComponent {
                 this.discourseService.currentBoost.server = this.server;
 
                 this.gameService.invokeInformational(
-                    'Your BOOST™ is now assigned to this server! Thanks for helping the server go higher.'
+                    `Your BOOST™ is now assigned to this server (with an admirable strength of ${response.data.power})! `
+                    + 'Thanks for helping the server go higher.'
+                );
+            } else if (response.data.error) {
+                this.gameService.invokeError(
+                    response.data.error
                 );
             } else {
                 this.gameService.invokeError(

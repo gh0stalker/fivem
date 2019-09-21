@@ -23,7 +23,7 @@
 extern "C" BOOL WINAPI _CRT_INIT(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpReserved);
 
 void InitializeDummies();
-void EnsureGamePath();
+std::optional<int> EnsureGamePath();
 
 bool InitializeExceptionHandler();
 
@@ -38,6 +38,9 @@ extern "C" int wmainCRTStartup();
 void DoPreLaunchTasks();
 void NVSP_DisableOnStartup();
 bool ExecutablePreload_Init();
+
+HANDLE g_uiDoneEvent;
+HANDLE g_uiExitEvent;
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine, int nCmdShow)
 {
@@ -57,12 +60,43 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 
+#if 0
+	// TEST
+	auto tenner = UI_InitTen();
+
+	UI_DoCreation();
+
+	while (!UI_IsCanceled())
+	{
+		HANDLE h = GetCurrentThread();
+		MsgWaitForMultipleObjects(1, &h, FALSE, 50, QS_ALLEVENTS);
+		
+		MSG msg;
+		while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+		{
+			TranslateMessage(&msg);
+			DispatchMessage(&msg);
+		}
+
+		UI_UpdateText(0, va(L"%d", GetTickCount()));
+		UI_UpdateText(1, va(L"%x", GetTickCount()));
+
+		UI_UpdateProgress(50.0);
+	}
+
+	UI_DoDestruction();
+
+	tenner = {};
+
+	ExitProcess(0);
+#endif
+
 	// delete any old .exe.new file
 	_unlink("CitizenFX.exe.new");
 
 	// path environment appending of our primary directories
 	static wchar_t pathBuf[32768];
-	GetEnvironmentVariable(L"PATH", pathBuf, sizeof(pathBuf));
+	GetEnvironmentVariable(L"PATH", pathBuf, std::size(pathBuf));
 
 	std::wstring newPath = MakeRelativeCitPath(L"bin") + L";" + MakeRelativeCitPath(L"") + L";" + std::wstring(pathBuf);
 
@@ -150,6 +184,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	if (!devMode)
 	{
 		devMode = !initState->IsMasterProcess();
+	}
+
+	// init tenUI
+	std::unique_ptr<TenUIBase> tui;
+
+	if (initState->IsMasterProcess())
+	{
+		tui = UI_InitTen();
 	}
 
 	if (!devMode)
@@ -251,7 +293,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	}
 
 	// make sure the game path exists
-	EnsureGamePath();
+	if (auto gamePathExit = EnsureGamePath(); gamePathExit)
+	{
+		return *gamePathExit;
+	}
 
 	if (addDllDirectory)
 	{
@@ -396,6 +441,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 	// ensure game cache is up-to-date, and obtain redirection metadata from the game cache
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 	auto redirectionData = UpdateGameCache();
+
+	if (redirectionData.empty())
+	{
+		return 0;
+	}
+
 	g_redirectionData = redirectionData;
 
 	gameExecutable = converter.from_bytes(redirectionData["GTA5.exe"]);
@@ -431,6 +482,57 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 		}
 	}
 #endif
+
+	tui = {};
+
+	g_uiExitEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIExit");
+	g_uiDoneEvent = CreateEvent(NULL, FALSE, FALSE, L"CitizenFX_PreUIDone");
+
+	if (initState->IsMasterProcess() && !toolMode)
+	{
+		std::thread([/*tui = std::move(tui)*/]() mutable
+		{
+			{
+				//auto tuiTen = std::move(tui);
+				auto tuiTen = UI_InitTen();
+
+				// say hi
+				UI_DoCreation(false);
+
+				auto st = GetTickCount64();
+				UI_UpdateText(0, L"Starting FiveM...");
+				UI_UpdateText(1, L"We're getting there.");
+
+				while (GetTickCount64() < (st + 3500))
+				{
+					HANDLE hs[] =
+					{
+						g_uiExitEvent
+					};
+
+					auto res = MsgWaitForMultipleObjects(std::size(hs), hs, FALSE, 50, QS_ALLEVENTS);
+
+					if (res == WAIT_OBJECT_0)
+					{
+						break;
+					}
+
+					MSG msg;
+					while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+					{
+						TranslateMessage(&msg);
+						DispatchMessage(&msg);
+					}
+
+					UI_UpdateProgress((GetTickCount64() - st) / 35.0);
+				}
+
+				UI_DoDestruction();
+			}
+
+			SetEvent(g_uiDoneEvent);
+		}).detach();
+	}
 
 	if (!toolMode)
 	{
