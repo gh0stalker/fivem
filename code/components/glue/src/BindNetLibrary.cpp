@@ -20,14 +20,15 @@
 #include <CoreConsole.h>
 #include <se/Security.h>
 
-#ifdef GTA_FIVE
 static InitFunction initFunction([] ()
 {
 	seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.internal" }, se::Object{ "builtin" }, se::AccessType::Allow);
 
+	static NetLibrary* netLibrary;
+
 	NetLibrary::OnNetLibraryCreate.Connect([] (NetLibrary* library)
 	{
-		static NetLibrary* netLibrary = library;
+		netLibrary = library;
 		static std::string netLibWarningMessage;
 		static std::mutex netLibWarningMessageLock;
 
@@ -60,7 +61,7 @@ static InitFunction initFunction([] ()
 
 				if (!gameInit->GetGameLoaded())
 				{
-					trace("Triggering LoadGameFirstLaunch()\n");
+					trace("^2Network connected, triggering initial game load...\n");
 
 					gameInit->LoadGameFirstLaunch([]()
 					{
@@ -72,7 +73,7 @@ static InitFunction initFunction([] ()
 				}
 				else
 				{
-					trace("Triggering ReloadGame()\n");
+					trace("^2Network connected, triggering game reload...\n");
 
 					gameInit->ReloadGame();
 				}
@@ -92,13 +93,34 @@ static InitFunction initFunction([] ()
 			Instance<ICoreGameInit>::Get()->ClearVariable("localMode");
 		});
 
+		static std::vector<std::string> convarsCreatedByServer;
+		static std::vector<std::string> convarsModifiedByServer;
+
 		OnKillNetworkDone.Connect([=]()
 		{
-			library->FinalizeDisconnect();
+			library->Disconnect();
 
-			console::GetDefaultContext()->GetVariableManager()->RemoveVariablesWithFlag(ConVar_Replicated);
+			// Remove ConVars created by the server
+			for (const std::string& convarName : convarsCreatedByServer)
+			{
+				console::GetDefaultContext()->GetVariableManager()->Unregister(convarName);
+			}
+
+			// Revert values modified by server back to their old values
+			for (const std::string& convarName : convarsModifiedByServer)
+			{
+				auto convar = console::GetDefaultContext()->GetVariableManager()->FindEntryRaw(convarName);
+				if (convar)
+				{
+					console::GetDefaultContext()->GetVariableManager()->RemoveEntryFlags(convarName, ConVar_Replicated);
+					convar->SetValue(convar->GetOfflineValue());
+				}
+			}
+			convarsCreatedByServer.clear();
+			convarsModifiedByServer.clear();
 		});
 
+		// Process ConVar values sent from the server
 		library->AddReliableHandler("msgConVars", [](const char* buf, size_t len)
 		{
 			auto unpacked = msgpack::unpack(buf, len);
@@ -107,9 +129,22 @@ static InitFunction initFunction([] ()
 			se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
 			se::ScopedPrincipal principalScopeInternal(se::Principal{ "system.internal" });
 
-			// set variable
 			for (const auto& conVar : conVars)
 			{
+				auto convar = console::GetDefaultContext()->GetVariableManager()->FindEntryRaw(conVar.first);
+				if (convar)
+				{
+					// If the value is not already from the server
+					if (!(console::GetDefaultContext()->GetVariableManager()->GetEntryFlags(conVar.first) & ConVar_Replicated))
+					{
+						convar->SaveOfflineValue();	
+					}
+					convarsModifiedByServer.push_back(conVar.first);
+				}
+				else
+				{
+					convarsCreatedByServer.push_back(conVar.first);
+				}
 				console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "setr", conVar.first, conVar.second });
 			}
 		}, true);
@@ -119,12 +154,16 @@ static InitFunction initFunction([] ()
 	{
 		nui::SetMainUI(false);
 
+		auto context = (netLibrary->GetConnectionState() != NetLibrary::CS_IDLE) ? ("server_" + netLibrary->GetTargetContext()) : "";
+		nui::SwitchContext(context);
 		nui::DestroyFrame("mpMenu");
 	});
 
+	// #TODOLIBERTY: ?
+#ifndef GTA_NY
 	OnFirstLoadCompleted.Connect([] ()
 	{
 		g_gameInit.SetGameLoaded();
 	});
-});
 #endif
+});

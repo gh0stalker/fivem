@@ -1,6 +1,8 @@
 #include <StdInc.h>
 #include <ClientRegistry.h>
 
+#include <GameServer.h>
+
 #include <ServerInstanceBase.h>
 #include <ServerEventComponent.h>
 
@@ -9,28 +11,79 @@
 #include <ResourceManagerImpl.h>
 #include <ResourceEventComponent.h>
 
-extern std::shared_ptr<ConVar<bool>> g_oneSyncVar;
+#if defined(ssize_t) && defined(_WIN32)
+#undef ssize_t
+#endif
+
+#ifndef FOLLY_NO_CONFIG
+#define FOLLY_NO_CONFIG
+#endif
+
+#include <folly/SharedMutex.h>
 
 namespace fx
 {
-	ClientRegistry::ClientRegistry()
-		: m_hostNetId(-1), m_curNetId(1), m_clientsBySlotId(MAX_CLIENTS + 1)
+	struct FarLockImpl : FarLock::ImplBase
+	{
+		virtual bool TryLock() override
+		{
+			return mutex.try_lock();
+		}
+		virtual void LockShared() override
+		{
+			return mutex.lock_shared();
+		}
+		virtual void Lock() override
+		{
+			return mutex.lock();
+		}
+		virtual void Unlock() override
+		{
+			return mutex.unlock();
+		}
+		virtual void UnlockShared() override
+		{
+			return mutex.unlock_shared();
+		}
+
+		folly::SharedMutex mutex;
+	};
+
+	FarLock::FarLock()
+		: impl(std::make_unique<FarLockImpl>())
 	{
 
 	}
 
-	std::shared_ptr<Client> ClientRegistry::MakeClient(const std::string& guid)
+	FarLock::~FarLock()
 	{
-		auto client = std::make_shared<Client>(guid);
+	
+	}
+
+	ClientRegistry::ClientRegistry()
+		: m_hostNetId(-1), m_curNetId(1), m_instance(nullptr)
+	{
+		if (fx::IsBigMode())
+		{
+			m_clientsBySlotId.resize(MAX_CLIENTS);
+		}
+		else
+		{
+			m_clientsBySlotId.resize(129);
+		}
+	}
+
+	fx::ClientSharedPtr ClientRegistry::MakeClient(const std::string& guid)
+	{
+		fx::ClientSharedPtr client = fx::ClientSharedPtr::Construct(guid);
+		fx::ClientWeakPtr weakClient(client);
 
 		{
-			std::unique_lock<std::shared_mutex> lock(m_clientsMutex);
-			m_clients[guid] = client;
+			std::unique_lock writeHolder(m_clientMutex);
+			m_clients.emplace(guid, client);
 		}
-
-		std::weak_ptr<Client> weakClient(client);
-
-		client->OnAssignNetId.Connect([=]()
+		
+		client->OnAssignNetId.Connect([this, weakClient]()
 		{
 			m_clientsByNetId[weakClient.lock()->GetNetId()] = weakClient;
 		});
@@ -46,7 +99,7 @@ namespace fx
 
 			m_clientsByPeer[client->GetPeer()] = weakClient;
 
-			if (!g_oneSyncVar->GetValue())
+			if (!IsOneSync())
 			{
 				return;
 			}
@@ -57,6 +110,7 @@ namespace fx
 				return;
 			}
 
+			std::lock_guard clientGuard(m_clientSlotMutex);
 			for (int slot = m_clientsBySlotId.size() - 1; slot >= 0; slot--)
 			{
 				// 31 is a special case
@@ -65,71 +119,125 @@ namespace fx
 					continue;
 				}
 
-				if (m_clientsBySlotId[slot].expired())
+				if (!m_clientsBySlotId[slot])
 				{
 					client->SetSlotId(slot);
-
 					m_clientsBySlotId[slot] = weakClient;
-
 					break;
 				}
 			}
 		});
 
-		client->OnAssignTcpEndPoint.Connect([=]()
+		client->OnAssignTcpEndPoint.Connect([this, weakClient]()
 		{
 			m_clientsByTcpEndPoint[weakClient.lock()->GetTcpEndPoint()] = weakClient;
 		});
 
-		client->OnAssignConnectionToken.Connect([=]()
+		client->OnAssignConnectionToken.Connect([this, weakClient]()
 		{
-			m_clientsByConnectionToken[weakClient.lock()->GetConnectionToken()] = weakClient;
+			auto client = weakClient.lock();
+
+			if (client)
+			{
+				m_clientsByConnectionToken[client->GetConnectionToken()] = weakClient;
+				m_clientsByConnectionTokenHash[HashString(client->GetConnectionToken().c_str())] = weakClient;
+			}
 		});
 
-		OnClientCreated(client.get());
+		OnClientCreated(client);
 
 		return client;
 	}
 
-	void ClientRegistry::HandleConnectingClient(const std::shared_ptr<Client>& client)
+	void ClientRegistry::HandleConnectingClient(const fx::ClientSharedPtr& client)
 	{
-		client->SetNetId(m_curNetId.fetch_add(1));
+		std::unique_lock _(m_curNetIdMutex);
+
+		auto incrementId = [this]()
+		{
+			m_curNetId++;
+
+			// 0xFFFF is a sentinel value for 'invalid' ID
+			// 0 is not a valid ID
+			if (m_curNetId == 0xFFFF)
+			{
+				m_curNetId = 1;
+			}
+		};
+
+		// in case of overflow, ensure no client is currently using said ID
+		while (m_clientsByNetId[m_curNetId].lock())
+		{
+			incrementId();
+		}
+
+		client->SetNetId(m_curNetId);
+		incrementId();
 	}
 
-	void ClientRegistry::HandleConnectedClient(const std::shared_ptr<Client>& client)
+	void ClientRegistry::HandleConnectedClient(const fx::ClientSharedPtr& client, uint32_t oldNetID)
 	{
 		auto eventManager = m_instance->GetComponent<fx::ResourceManager>()->GetComponent<fx::ResourceEventManagerComponent>();
-		eventManager->TriggerEvent2("playerJoining", { fmt::sprintf("net:%d", client->GetNetId()) });
 
-		// for name handling, send player state
-		fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
 
-		// send every player information about the joining client
-		events->TriggerClientEvent("onPlayerJoining", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
+		/*NETEV playerJoining SERVER
+		/#*
+		 * A server-side event that is triggered when a player has a finally-assigned NetID.
+		 *
+		 * @param source - The player's NetID (a number in Lua/JS), **not a real argument, use [FromSource] or source**.
+		 * @param oldID - The original TempID for the connecting player, as specified during playerConnecting.
+		 #/
+		declare function playerJoining(source: string, oldID: string): void;
+		*/
+		eventManager->TriggerEvent2("playerJoining", { fmt::sprintf("internal-net:%d", client->GetNetId()) }, fmt::sprintf("%d", oldNetID));
 
-		// send the JOINING CLIENT information about EVERY OTHER CLIENT
-		std::string target = fmt::sprintf("%d", client->GetNetId());
-
-		ForAllClients([&](const std::shared_ptr<fx::Client>& otherClient)
+		// user code may lead to a drop event being sent here
+		if (client->IsDropping())
 		{
-			events->TriggerClientEvent("onPlayerJoining", target, otherClient->GetNetId(), otherClient->GetName(), otherClient->GetSlotId());
-		});
+			return;
+		}
+
+		if (!fx::IsBigMode())
+		{
+			// for name handling, send player state
+			fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
+
+			// send every player information about the joining client
+			events->TriggerClientEvent("onPlayerJoining", std::optional<std::string_view>(), client->GetNetId(), client->GetName(), client->GetSlotId());
+
+			// send the JOINING CLIENT information about EVERY OTHER CLIENT
+			std::string target = fmt::sprintf("%d", client->GetNetId());
+
+			ForAllClients([&](const fx::ClientSharedPtr& otherClient)
+			{
+				events->TriggerClientEvent("onPlayerJoining", target, otherClient->GetNetId(), otherClient->GetName(), otherClient->GetSlotId());
+			});
+		}
+		else
+		{
+			fwRefContainer<ServerEventComponent> events = m_instance->GetComponent<ServerEventComponent>();
+
+			std::string target = fmt::sprintf("%d", client->GetNetId());
+			uint32_t bigModeSlot = (m_instance->GetComponent<fx::GameServer>()->GetGameName() == fx::GameName::GTA5) ? 128 : 16;
+
+			events->TriggerClientEvent("onPlayerJoining", target, client->GetNetId(), client->GetName(), bigModeSlot);
+		}
 
 		// trigger connection handlers
 		OnConnectedClient(client.get());
 	}
 
-	std::shared_ptr<fx::Client> ClientRegistry::GetHost()
+	fx::ClientSharedPtr ClientRegistry::GetHost()
 	{
-		if (m_hostNetId == -1)
+		if (m_hostNetId == 0xFFFF)
 		{
-			return nullptr;
+			return fx::ClientSharedPtr{};
 		}
 
 		return GetClientByNetID(m_hostNetId);
 	}
 
-	void ClientRegistry::SetHost(const std::shared_ptr<Client>& client)
+	void ClientRegistry::SetHost(const fx::ClientSharedPtr& client)
 	{
 		if (!client)
 		{
@@ -137,7 +245,7 @@ namespace fx
 		}
 		else
 		{
-			if (!g_oneSyncVar->GetValue())
+			if (!IsOneSync())
 			{
 				m_hostNetId = client->GetNetId();
 			}

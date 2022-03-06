@@ -9,11 +9,12 @@
 #include <VFSRagePackfile.h>
 
 #include <VFSManager.h>
+#include <VFSError.h>
 
 namespace vfs
 {
 	RagePackfile::RagePackfile()
-		: m_parentHandle(InvalidHandle)
+	: m_parentHandle(InvalidHandle), m_handles(128)
 	{
 
 	}
@@ -30,11 +31,21 @@ namespace vfs
 
 	bool RagePackfile::OpenArchive(const std::string& archivePath)
 	{
+		return OpenArchive(archivePath, nullptr);
+	}
+
+	bool RagePackfile::OpenArchive(const std::string& archivePath, std::string* errorState)
+	{
 		// get the containing device, and early out if we don't have one
 		fwRefContainer<Device> parentDevice = vfs::GetDevice(archivePath);
 
 		if (!parentDevice.GetRef())
 		{
+			if (errorState)
+			{
+				*errorState = "Couldn't get vfs::Device";
+			}
+
 			return false;
 		}
 
@@ -44,6 +55,13 @@ namespace vfs
 		// early out if invalid, again
 		if (m_parentHandle == InvalidHandle)
 		{
+			auto error = vfs::GetLastError(m_parentDevice);
+
+			if (errorState)
+			{
+				*errorState = fmt::sprintf("Couldn't open file: %s");
+			}
+
 			return false;
 		}
 
@@ -52,15 +70,39 @@ namespace vfs
 
 		if (m_parentDevice->ReadBulk(m_parentHandle, m_parentPtr, &m_header, sizeof(m_header)) != sizeof(m_header))
 		{
-			trace("%s: ReadBulk of header failed\n", __func__);
+			auto error = vfs::GetLastError(m_parentDevice);
+
+			trace("%s: ReadBulk of header failed: %s\n", __func__, error);
+
+			if (errorState)
+			{
+				*errorState = fmt::sprintf("ReadBulk of header failed: %s", error);
+			}
 
 			return false;
 		}
 
 		// verify if the header magic is, in fact, RPF2 and it's non-encrypted
-		if (m_header.magic != 0x32465052 || m_header.cryptoFlag != 0)
+		if (m_header.magic != 0x32465052)
+		{
+			trace("%s: invalid magic (not RPF2)\n", __func__);
+
+			if (errorState)
+			{
+				*errorState = "Invalid magic";
+			}
+
+			return false;
+		}
+		
+		if (m_header.cryptoFlag != 0)
 		{
 			trace("%s: only non-encrypted RPF2 is supported\n", __func__);
+
+			if (errorState)
+			{
+				*errorState = "Found encrypted RPF2";
+			}
 
 			return false;
 		}
@@ -184,22 +226,30 @@ namespace vfs
 
 	RagePackfile::HandleData* RagePackfile::AllocateHandle(THandle* outHandle)
 	{
-		for (int i = 0; i < _countof(m_handles); i++)
 		{
-			if (!m_handles[i].valid)
-			{
-				*outHandle = i;
+			std::shared_lock _(m_handlesMutex);
 
-				return &m_handles[i];
+			for (int i = 0; i < m_handles.size(); i++)
+			{
+				if (!m_handles[i].valid)
+				{
+					*outHandle = i;
+
+					return &m_handles[i];
+				}
 			}
 		}
 
-		return nullptr;
+		std::unique_lock _(m_handlesMutex);
+		m_handles.push_back({});
+
+		*outHandle = m_handles.size() - 1;
+		return &m_handles[m_handles.size() - 1];
 	}
 
 	RagePackfile::HandleData* RagePackfile::GetHandle(THandle inHandle)
 	{
-		if (inHandle >= 0 && inHandle < _countof(m_handles))
+		if (inHandle >= 0 && inHandle < m_handles.size())
 		{
 			if (m_handles[inHandle].valid)
 			{
@@ -341,6 +391,14 @@ namespace vfs
 	}
 
 	size_t RagePackfile::GetLength(THandle handle)
+	{
+		return GetLengthForHandle(handle);
+	}
+
+#ifdef _MSC_VER
+	__declspec(noinline)
+#endif
+	size_t RagePackfile::GetLengthForHandle(THandle handle)
 	{
 		auto handleData = GetHandle(handle);
 

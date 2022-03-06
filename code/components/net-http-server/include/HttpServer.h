@@ -12,17 +12,29 @@
 #include <forward_list>
 #include <shared_mutex>
 
+#include <EASTL/fixed_map.h>
+#include <EASTL/fixed_string.h>
+
+#include <optional>
+
 namespace net
 {
-struct HeaderComparator : std::binary_function<std::string, std::string, bool>
+struct HeaderComparator
 {
-	bool operator()(const std::string& left, const std::string& right) const
+	using is_transparent = void;
+
+	template<typename TString, typename TOtherString>
+	bool operator()(const TString& left, const TOtherString& right) const
 	{
-		return _stricmp(left.c_str(), right.c_str()) < 0;
+		return std::lexicographical_compare(left.begin(), left.end(), right.begin(), right.end(), [](char a, char b)
+		{
+			return ToLower(a) < ToLower(b);
+		});
 	}
 };
 
-typedef std::multimap<std::string, std::string, HeaderComparator> HeaderMap;
+using HeaderString = eastl::fixed_string<char, 64, true>;
+using HeaderMap = eastl::fixed_multimap<HeaderString, HeaderString, 16, true, HeaderComparator>;
 
 class HttpRequest : public fwRefCountable
 {
@@ -30,11 +42,11 @@ private:
 	int m_httpVersionMajor;
 	int m_httpVersionMinor;
 
-	std::string m_requestMethod;
+	HeaderString m_requestMethod;
 
-	std::string m_path;
+	HeaderString m_path;
 
-	std::string m_remoteAddress;
+	net::PeerAddress m_remoteAddress;
 
 	HeaderMap m_headerList;
 
@@ -46,8 +58,10 @@ private:
 
 	std::shared_mutex m_cancelHandlerMutex;
 
+	std::optional<std::vector<uint8_t>> m_pendingData;
+
 public:
-	HttpRequest(int httpVersionMajor, int httpVersionMinor, const std::string& requestMethod, const std::string& path, const HeaderMap& headerList, const std::string& remoteAddress);
+	HttpRequest(int httpVersionMajor, int httpVersionMinor, const HeaderString& requestMethod, const HeaderString& path, const HeaderMap& headerList, const net::PeerAddress& remoteAddress);
 
 	virtual ~HttpRequest() override;
 
@@ -65,8 +79,25 @@ public:
 
 	inline void SetDataHandler(const std::function<void(const std::vector<uint8_t>& data)>& handler)
 	{
+		if (m_pendingData)
+		{
+			if (handler)
+			{
+				handler(*m_pendingData);
+			}
+
+			m_pendingData = {};
+
+			return;
+		}
+
 		std::unique_lock<std::shared_mutex> lock(m_dataHandlerMutex);
 		m_dataHandler = std::make_shared<std::remove_const_t<std::remove_reference_t<decltype(handler)>>>(handler);
+	}
+
+	inline void SetPendingData(std::vector<uint8_t>&& data)
+	{
+		m_pendingData = std::move(data);
 	}
 
 	inline std::shared_ptr<std::function<void()>> GetCancelHandler()
@@ -92,12 +123,12 @@ public:
 		return std::make_pair(m_httpVersionMajor, m_httpVersionMinor);
 	}
 
-	inline const std::string& GetRequestMethod() const
+	inline const auto& GetRequestMethod() const
 	{
 		return m_requestMethod;
 	}
 
-	inline const std::string& GetPath() const
+	inline const auto& GetPath() const
 	{
 		return m_path;
 	}
@@ -107,14 +138,19 @@ public:
 		return m_headerList;
 	}
 
-	inline const std::string& GetHeader(const std::string& key, const std::string& default_ = std::string()) const
+	inline std::string GetHeader(eastl::string_view key, const std::string& default_ = {}) const
 	{
-		auto it = m_headerList.find(key);
+		auto it = m_headerList.find_as(key, HeaderComparator{});
 
-		return (it != m_headerList.end()) ? it->second : default_;
+		return (it != m_headerList.end()) ? std::string{ it->second.c_str(), it->second.size() } : default_;
 	}
 
-	inline const std::string& GetRemoteAddress() const
+	inline std::string GetRemoteAddress() const
+	{
+		return m_remoteAddress.ToString();
+	}
+
+	inline const net::PeerAddress& GetRemotePeer() const
 	{
 		return m_remoteAddress;
 	}
@@ -157,13 +193,43 @@ protected:
 public:
 	HttpResponse(fwRefContainer<HttpRequest> request);
 
-	std::string GetHeader(const std::string& name);
+	inline auto GetHeader(eastl::string_view key, eastl::string_view default_ = {}) const
+	{
+		auto it = m_headerList.find_as(key, HeaderComparator{});
 
-	void RemoveHeader(const std::string& name);
+		return (it != m_headerList.end()) ? it->second : default_;
+	}
 
-	void SetHeader(const std::string& name, const std::string& value);
+	void RemoveHeader(const HeaderString& name);
 
-	void SetHeader(const std::string& name, const std::vector<std::string>& values);
+	void SetHeader(const HeaderString& name, const HeaderString& value);
+
+	void SetHeader(const HeaderString& name, const std::vector<HeaderString>& values);
+
+	inline void SetHeader(const HeaderString& name, const char* value)
+	{
+		SetHeader(name, HeaderString{ value });
+	}
+
+	inline void SetHeader(const HeaderString& name, const std::string& value)
+	{
+		SetHeader(name, HeaderString{
+						value.c_str(), value.size() });
+	}
+
+	inline void SetHeader(const HeaderString& name, const std::vector<std::string>& values)
+	{
+		std::vector<HeaderString> headers;
+		headers.reserve(values.size());
+
+		for (auto& value : values)
+		{
+			headers.push_back(HeaderString{
+				value.c_str(), value.size() });
+		}
+
+		SetHeader(name, headers);
+	}
 
 	void WriteHead(int statusCode);
 
@@ -173,25 +239,31 @@ public:
 
 	virtual void WriteHead(int statusCode, const std::string& statusMessage, const HeaderMap& headers) = 0;
 
-	void Write(const std::string& data);
+	void Write(const std::string& data, fu2::unique_function<void(bool)>&& onComplete = {});
 
-	void Write(std::string&& data);
+	void Write(std::string&& data, fu2::unique_function<void(bool)>&& onComplete = {});
+
+	void Write(std::unique_ptr<char[]> data, size_t length, fu2::unique_function<void(bool)>&& onComplete = {});
 
 	virtual void End() = 0;
 
-	virtual void BeforeWriteHead(const std::string& data);
+	virtual void BeforeWriteHead(size_t length);
 
-	virtual void WriteOut(const std::vector<uint8_t>& data) = 0;
+	virtual void WriteOut(const std::vector<uint8_t>& data, fu2::unique_function<void(bool)>&& onComplete = {}) = 0;
 
-	virtual void WriteOut(std::vector<uint8_t>&& data);
+	virtual void WriteOut(std::unique_ptr<char[]> data, size_t length, fu2::unique_function<void(bool)>&& onComplete = {}) = 0;
 
-	virtual void WriteOut(const std::string& data);
+	virtual void WriteOut(std::vector<uint8_t>&& data, fu2::unique_function<void(bool)>&& onComplete = {});
 
-	virtual void WriteOut(std::string&& data);
+	virtual void WriteOut(const std::string& data, fu2::unique_function<void(bool)>&& onComplete = {});
+
+	virtual void WriteOut(std::string&& data, fu2::unique_function<void(bool)>&& onComplete = {});
 
 	void End(const std::string& data);
 
 	void End(std::string&& data);
+
+	virtual void CloseSocket() = 0;
 
 	inline int GetStatusCode()
 	{

@@ -1,8 +1,8 @@
-import { Component, OnInit, OnDestroy } from '@angular/core';
+import { Component, OnInit, OnDestroy, Inject } from '@angular/core';
 import { GameService } from '../game.service';
 import { DiscourseService } from '../discourse.service';
 import { ServersService } from '../servers/servers.service';
-import { Language, TranslationService, Translation } from 'angular-l10n';
+import { L10nTranslationService, L10nLocale, L10N_LOCALE } from 'angular-l10n';
 import { SettingsService, Setting } from '../settings.service';
 import { Subscription } from 'rxjs';
 
@@ -14,32 +14,49 @@ class SelectOption {
 class DisplaySetting {
     show: boolean;
     label: string;
+    category: string;
     optionsArray: SelectOption[] = [];
 
+	private _placeholder: string;
     private _value: string;
     private subscriptions: Subscription[] = [];
 
     constructor(public setting: Setting) {
         this.show = (setting.showCb) ? false : true;
+        this.category = setting.category;
         this.label = '';
-        this._value = '';
+        this._value = (setting.displayDefault) ? setting.displayDefault : '';
 
         if (setting.getCb) {
             this.subscriptions.push(setting.getCb().subscribe(value => this._value = value));
         }
 
         if (setting.showCb) {
-            this.subscriptions.push(setting.showCb().subscribe(value => this.show = value));
+            this.subscriptions.push(setting.showCb().subscribe(value => {
+				this.show = value;
+			}));
         }
 
         if (setting.labelCb) {
             this.subscriptions.push(setting.labelCb().subscribe(value => this.label = value));
         }
 
+		if (setting.placeholderCb) {
+			this.subscriptions.push(setting.placeholderCb().subscribe(value => {
+				if (value && value !== '') {
+					this._placeholder = value
+				}
+			}));
+		}
+
         if (setting.options) {
             this.optionsArray = Object.entries(setting.options).map(([ value, name ]) => ({ name, value }));
-        }
+		}
     }
+
+	public get placeholder() {
+		return this._placeholder || this.setting.description;
+	}
 
     public get value(): string {
         return this._value;
@@ -75,23 +92,24 @@ class DisplaySetting {
 	styleUrls:   ['settings.component.scss']
 })
 
-export class SettingsComponent extends Translation implements OnInit, OnDestroy {
+export class SettingsComponent implements OnInit, OnDestroy {
     nickname = '';
     localhostPort = '30120';
     devMode = false;
     currentAccount: any = null;
-    darkTheme = false;
+    darkTheme = true;
     language = 'en';
 
-    public settings: DisplaySetting[] = [];
+    public categories: string[] = [];
+    public selectedCategory: string;
 
-    @Language() lang: string;
+	public settings: DisplaySetting[] = [];
+
+	categorizedSettings: Map<string, DisplaySetting[]> = new Map();
 
     constructor(private gameService: GameService, private discourseService: DiscourseService,
-        private serversService: ServersService,
-        public translation: TranslationService, private settingsService: SettingsService) {
-        super();
-
+        private serversService: ServersService, @Inject(L10N_LOCALE) public locale: L10nLocale,
+        public translation: L10nTranslationService, private settingsService: SettingsService) {
         gameService.nicknameChange.subscribe(value => this.nickname = value);
         gameService.devModeChange.subscribe(value => this.devMode = value);
         gameService.localhostPortChange.subscribe(value => this.localhostPort = value);
@@ -114,8 +132,22 @@ export class SettingsComponent extends Translation implements OnInit, OnDestroy 
         this.currentAccount = this.discourseService.currentUser;
 
         for (const setting of this.settingsService.settingsList) {
-            this.settings.push(new DisplaySetting(setting));
+			const displaySetting = new DisplaySetting(setting);
+			let settingCategory = [];
+
+			if (!this.categorizedSettings.has(displaySetting.category)) {
+				this.categorizedSettings.set(displaySetting.category, settingCategory);
+			} else {
+				settingCategory = this.categorizedSettings.get(displaySetting.category);
+			}
+
+            settingCategory.push(displaySetting);
         }
+
+        this.categories = Array.from(new Set<string>(this.settings.map(a => a.category)).values());
+        this.selectedCategory = this.categories[0];
+
+		this.gameService.updateProfiles(true);
     }
 
     ngOnDestroy() {
@@ -146,5 +178,13 @@ export class SettingsComponent extends Translation implements OnInit, OnDestroy 
 
     toggleConvar(name: string) {
         this.gameService.setConvar(name, this.gameService.getConvarValue(name) === 'true' ? 'false' : 'true');
+    }
+
+    setCategory(category: string) {
+        this.selectedCategory = category;
+    }
+
+    shouldShowCategory(category: string): boolean {
+        return !!this.settings.find(a => a.show && a.category === category);
     }
 }

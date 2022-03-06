@@ -1,5 +1,6 @@
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 #include <cpr/cpr.h>
 #include <rapidjson/document.h>
 
@@ -19,9 +20,67 @@ struct NvidiaConnectionInfo
 	}
 };
 
+template<typename TContainer>
+static std::optional<NvidiaConnectionInfo> ParseNvidiaState(const TContainer& data)
+{
+	rapidjson::Document doc;
+	doc.Parse(data.data(), data.size());
+
+	if (!doc.HasParseError() && doc.IsObject())
+	{
+		if (doc.HasMember("port") && doc["port"].IsInt() && doc.HasMember("secret") && doc["secret"].IsString())
+		{
+			return NvidiaConnectionInfo{ doc["port"].GetInt(), doc["secret"].GetString() };
+		}
+	}
+
+	return {};
+}
+
+static std::optional<NvidiaConnectionInfo> GetNvidiaStateNew()
+{
+	std::optional<NvidiaConnectionInfo> rv;
+	auto fileMapping = OpenFileMappingW(FILE_MAP_READ, FALSE, L"{8BA1E16C-FC54-4595-9782-E370A5FBE8DA}");
+
+	if (fileMapping != 0 && fileMapping != INVALID_HANDLE_VALUE)
+	{
+		const void* data = MapViewOfFile(fileMapping, FILE_MAP_READ, 0, 0, 0);
+
+		if (data)
+		{
+			MEMORY_BASIC_INFORMATION mbi = { 0 };
+			VirtualQuery(data, &mbi, sizeof(mbi));
+
+			if (mbi.RegionSize > 0)
+			{
+				rv = ParseNvidiaState(std::string{ (const char*)data, mbi.RegionSize });
+			}
+
+			UnmapViewOfFile(data);
+		}
+
+		CloseHandle(fileMapping);
+	}
+
+	return rv;
+}
+
 static std::optional<NvidiaConnectionInfo> GetNvidiaState()
 {
-	std::wstring path = _wgetenv(L"localappdata") + L"\\NVIDIA Corporation\\NvNode\\nodejs.json"s;
+	if (auto result = GetNvidiaStateNew())
+	{
+		return result;
+	}
+
+	// we shouldn't even bother with systems that somehow broke core environment variables
+	auto lad = _wgetenv(L"localappdata");
+
+	if (!lad)
+	{
+		return {};
+	}
+
+	std::wstring path = lad + L"\\NVIDIA Corporation\\NvNode\\nodejs.json"s;
 
 	FILE* f = _wfopen(path.c_str(), L"rb");
 
@@ -35,17 +94,7 @@ static std::optional<NvidiaConnectionInfo> GetNvidiaState()
 		fread(&data[0], 1, data.size(), f);
 		fclose(f);
 
-		rapidjson::Document doc;
-		doc.Parse(data.data(), data.size());
-
-		if (!doc.HasParseError() && doc.IsObject())
-		{
-			if (doc.HasMember("port") && doc["port"].IsInt() &&
-				doc.HasMember("secret") && doc["secret"].IsString())
-			{
-				return NvidiaConnectionInfo{ doc["port"].GetInt(), doc["secret"].GetString() };
-			}
-		}
+		return ParseNvidiaState(data);
 	}
 
 	return {};
@@ -88,7 +137,7 @@ static bool SetShadowPlayStatus(const NvidiaConnectionInfo& connection, bool ena
 
 static void WriteSPEnableCookie()
 {
-	FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\enable_nvsp").c_str(), L"wb");
+	FILE* f = _wfopen(MakeRelativeCitPath(L"data\\cache\\enable_nvsp").c_str(), L"wb");
 
 	if (f)
 	{
@@ -163,7 +212,7 @@ void NVSP_DisableOnStartup()
 
 void NVSP_ShutdownSafely()
 {
-	FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\enable_nvsp").c_str(), L"rb");
+	FILE* f = _wfopen(MakeRelativeCitPath(L"data\\cache\\enable_nvsp").c_str(), L"rb");
 
 	if (f)
 	{
@@ -178,6 +227,7 @@ void NVSP_ShutdownSafely()
 			SetShadowPlayStatus(*nvConn, true);
 		}
 
-		_wunlink(MakeRelativeCitPath(L"cache\\enable_nvsp").c_str());
+		_wunlink(MakeRelativeCitPath(L"data\\cache\\enable_nvsp").c_str());
 	}
 }
+#endif

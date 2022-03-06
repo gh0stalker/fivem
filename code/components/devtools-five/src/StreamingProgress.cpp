@@ -7,11 +7,17 @@
 #include <Streaming.h>
 #include <nutsnbolts.h>
 
+#include <StatusText.h>
 #include <StreamingEvents.h>
 
 #include <shared_mutex>
 
 #include <mmsystem.h>
+
+#include <ResourceCacheDeviceV2.h>
+#include <VFSManager.h>
+
+#include <ICoreGameInit.h>
 
 struct StreamingDownloadProgress
 {
@@ -58,6 +64,13 @@ static hook::cdecl_stub<rage::fiCollection* ()> getRawStreamer([]()
 	return hook::get_call(hook::get_pattern("48 8B D3 4C 8B 00 48 8B C8 41 FF 90 ? 01 00 00", -5));
 });
 
+#include <atHashMap.h>
+
+struct strRequestInfo
+{
+	uint64_t pad[3];
+};
+
 static void StreamingProgress_Update()
 {
 	// process requests
@@ -66,9 +79,33 @@ static void StreamingProgress_Update()
 
 	std::set<std::string> foundNow;
 
-	for (const auto* entry = streaming->RequestListHead; entry; entry = entry->Next)
+	std::vector<uint32_t> loadingOrRequestedList;
+	loadingOrRequestedList.reserve(64);
+
+	// gather loading/requested list rather than looping over every index
+	atMap<uint32_t, bool>* loadingList = (atMap<uint32_t, bool>*)((char*)streaming + 152); // see rage::strStreamingInfoManager::SetObjectToLoading
+	loadingList->ForAllEntriesWithHash([&loadingOrRequestedList](uint32_t idx, bool*)
 	{
-		auto data = &streaming->Entries[entry->Index];
+		loadingOrRequestedList.push_back(idx);
+	});
+
+	// request list
+	atMap<uint32_t, strRequestInfo>* requestList = (atMap<uint32_t, strRequestInfo>*)((char*)streaming + 64); // see rage::strInfoStatus::AddRequest
+	requestList->ForAllEntriesWithHash([&loadingOrRequestedList](uint32_t idx, strRequestInfo*)
+	{
+		loadingOrRequestedList.push_back(idx);
+	});
+
+	// loop over loading/requested list
+	for (uint32_t idx : loadingOrRequestedList)
+	{
+		auto data = &streaming->Entries[idx];
+		auto flags = data->flags & 3;
+
+		if (flags != 2 && flags != 3)
+		{
+			continue;
+		}
 
 		// try getting streaming data
 		StreamingPackfileEntry* spf = streaming::GetStreamingPackfileForEntry(data);
@@ -116,27 +153,25 @@ static void StreamingProgress_Update()
 
 					if (isCache)
 					{
-						auto device = rage::fiDevice::GetDevice(fileName.c_str(), true);
-						uint64_t ptr;
-						auto handle = device->OpenBulk(fileName.c_str(), &ptr);
-						auto numRead = device->ReadBulk(handle, ptr, readBuffer, 0xFFFFFFFC);
+						auto device = vfs::GetDevice(fileName);
+						fwRefContainer<resources::ResourceCacheDeviceV2> resDevice(device);
 
-						if (numRead == 0)
+						if (!resDevice->ExistsOnDisk(fileName))
 						{
 							std::unique_lock<std::shared_mutex> lock(g_mutex);
 
-							g_downloadList.insert({ nameBuffer, device->GetFileLength(handle) });
+							if (g_downloadList.find(nameBuffer) == g_downloadList.end())
+							{
+								g_downloadList.insert({ nameBuffer, resDevice->GetLength(fileName) });
+							}
+
 							foundNow.insert(nameBuffer);
-							//g_nameMap.insert({ nameBuffer, entryName });
 
 							thisRequests++;
 						}
-
-						device->CloseBulk(handle);
 					}
 				}
 			}
-			//}
 		}
 	}
 
@@ -182,13 +217,11 @@ static void StreamingProgress_Update()
 
 		std::string str = fmt::sprintf("Downloading assets (%d of %d)... (%.2f/%.2f MB)", std::min(g_downloadDone.size(), g_downloadList.size()), g_downloadList.size(), std::min(downloadDone, downloadSize) / 1024.0 / 1024.0, downloadSize / 1024.0 / 1024.0);
 
-		// 1604
-		((void(*)(const char*, int, int))hook::get_adjusted(0x1401C3578))(str.c_str(), 5, 2);
+		ActivateStatusText(str.c_str(), 5, 3);
 	}
 	else
 	{
-		// 1604
-		((void(*)(int))hook::get_adjusted(0x1401C3438))(2);
+		DeactivateStatusText(3);
 
 		g_downloadList.clear();
 		g_downloadDone.clear();
@@ -208,6 +241,21 @@ static InitFunction initFunction([]()
 		static ConVar<bool> useStreamingProgress("game_showStreamingProgress", ConVar_Archive, false);
 
 		if (useStreamingProgress.GetValue())
+		{
+			StreamingProgress_Update();
+		}
+		else if (Instance<ICoreGameInit>::Get()->HasVariable("networkInited"))
+		{
+			DeactivateStatusText(3);
+
+			g_downloadList.clear();
+			g_downloadDone.clear();
+		}
+	});
+
+	OnLookAliveFrame.Connect([]()
+	{
+		if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited"))
 		{
 			StreamingProgress_Update();
 		}

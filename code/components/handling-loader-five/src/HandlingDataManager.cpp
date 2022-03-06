@@ -3,6 +3,7 @@
 #include <HandlingLoader.h>
 #include "Hooking.h"
 
+#include <CoreConsole.h>
 #include <IteratorView.h>
 
 #include <atHashMap.h>
@@ -29,7 +30,7 @@ static void PatchHandlingMounter()
 	void* mounter = g_dataFileMounters[6];
 	void** vmt = *(void***)mounter;
 
-	vmt[2] = UnloadHandlingFileEntry;
+	hook::put(&vmt[2], UnloadHandlingFileEntry);
 }
 
 class Parser;
@@ -87,8 +88,6 @@ static int FindFreeHandlingData()
 	return g_handlingData->GetCount();
 }
 
-static atArray<void*>* g_archetypeFactories;
-
 class CVehicleModelInfo
 {
 public:
@@ -100,17 +99,12 @@ public:
 	// 1365 as well
 	// 1493 too? #TODO1493
 	// 1604 too?? #TODO1604
+	// 1737? #TODO1737
+	// 1868 seemingly as well
 	char pad[1200]; // +8
 	int handlingDataIndex; // +1208
 
 	char pad2[228];
-};
-
-template<typename TSubClass>
-class fwFactoryBase
-{
-public:
-	virtual ~fwFactoryBase() = 0;
 };
 
 template<typename T>
@@ -181,7 +175,7 @@ static bool LoadHandlingFile(const char* handlingPath)
 
 	std::unordered_set<uint32_t> changedHandlings;
 
-	trace("Loading %d handling entries from %s\n", handlingDataList.GetCount(), handlingPath);
+	console::Printf("handling-loader:five", "Loading %d handling entries from %s\n", handlingDataList.GetCount(), handlingPath);
 
 	for (CHandlingData* handling : handlingDataList)
 	{

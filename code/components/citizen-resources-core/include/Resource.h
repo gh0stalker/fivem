@@ -24,6 +24,24 @@ class Resource;
 
 class ResourceManager;
 
+class ResourceManagerError
+{
+public:
+	inline explicit ResourceManagerError(const std::string& error)
+		: m_error(error)
+	{
+
+	}
+
+	inline const std::string& Get() const
+	{
+		return m_error;
+	}
+
+private:
+	std::string m_error;
+};
+
 enum class ResourceState
 {
 	Uninitialized,
@@ -57,9 +75,17 @@ public:
 	virtual ResourceState GetState() = 0;
 
 	//
+	// Loads the resource from the specified root path - compatibility wrapper.
+	//
+	inline bool LoadFrom(const std::string& rootPath)
+	{
+		return LoadFrom(rootPath, nullptr);
+	}
+
+	//
 	// Loads the resource from the specified root path.
 	//
-	virtual bool LoadFrom(const std::string& rootPath) = 0;
+	virtual bool LoadFrom(const std::string& rootPath, std::string* errorResult) = 0;
 
 	//
 	// Starts the resource.
@@ -72,9 +98,9 @@ public:
 	virtual bool Stop() = 0;
 
 	//
-	// Executes a tick on the resource.
+	// Runs a top-level execution callback.
 	//
-	virtual void Tick() = 0;
+	virtual void Run(std::function<void()>&& func) = 0;
 
 	//
 	// Gets a reference to the owning resource manager.
@@ -88,6 +114,11 @@ public:
 	fwEvent<> OnBeforeStart;
 
 	//
+	// An event to handle tasks to be performed before loading a Lua script.
+	//
+	fwEvent<std::vector<char>*> OnBeforeLoadScript;
+
+	//
 	// An event to handle tasks to be performed when starting a resource.
 	//
 	fwEvent<> OnStart;
@@ -98,9 +129,14 @@ public:
 	fwEvent<> OnStop;
 
 	//
-	// An event to handle tasks to be performed when the resource ticks.
+	// An event invoked when the resource enters a top-level execution cycle.
 	//
-	fwEvent<> OnTick;
+	fwEvent<> OnEnter;
+
+	//
+	// An event invoked when the resource leaves a top-level execution cycle.
+	//
+	fwEvent<> OnLeave;
 
 	//
 	// An event to handle tasks to be performed when a resource is created, after the game loads.

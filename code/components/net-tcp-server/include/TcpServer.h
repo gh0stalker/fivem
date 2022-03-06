@@ -8,6 +8,9 @@
 #pragma once
 
 #include "NetAddress.h"
+#include <function2.hpp>
+
+#include <shared_mutex>
 
 #ifdef COMPILING_NET_TCP_SERVER
 #define TCP_SERVER_EXPORT DLL_EXPORT
@@ -24,21 +27,27 @@ public:
 
 	typedef std::function<void()> TCloseCallback;
 
-	typedef std::function<void()> TScheduledCallback;
+	typedef fu2::unique_function<void()> TScheduledCallback;
+
+	typedef fu2::unique_function<void(bool)> TCompleteCallback;
 
 private:
 	TReadCallback m_readCallback;
 
 	TCloseCallback m_closeCallback;
 
+	std::shared_mutex m_cbMutex;
+
 protected:
-	inline const TReadCallback& GetReadCallback()
+	inline TReadCallback GetReadCallback()
 	{
+		std::shared_lock<std::shared_mutex> _(m_cbMutex);
 		return m_readCallback;
 	}
 
-	inline const TCloseCallback& GetCloseCallback()
+	inline TCloseCallback GetCloseCallback()
 	{
+		std::shared_lock<std::shared_mutex> _(m_cbMutex);
 		return m_closeCallback;
 	}
 
@@ -47,13 +56,15 @@ protected:
 public:
 	virtual PeerAddress GetPeerAddress() = 0;
 
-	virtual void Write(const std::string& data);
+	virtual void Write(const std::string& data, TCompleteCallback&& onComplete = {});
 
-	virtual void Write(std::string&& data);
+	virtual void Write(std::string&& data, TCompleteCallback&& onComplete = {});
 
-	virtual void Write(const std::vector<uint8_t>& data) = 0;
+	virtual void Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete = {}) = 0;
 
-	virtual void Write(std::vector<uint8_t>&& data);
+	virtual void Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete = {});
+
+	virtual void Write(std::unique_ptr<char[]> data, size_t size, TCompleteCallback&& onComplete = {});
 
 	virtual void Close() = 0;
 
@@ -61,7 +72,7 @@ public:
 
 	void SetCloseCallback(const TCloseCallback& callback);
 
-	virtual void ScheduleCallback(const TScheduledCallback& callback);
+	virtual void ScheduleCallback(TScheduledCallback&& callback, bool performInline = true);
 
 protected:
 	TcpServerStream() { }

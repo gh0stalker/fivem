@@ -5,7 +5,9 @@ return {
 		if os.istarget('windows') then
 			includedirs { "../vendor/curl/include/" }
 
-			links { 'ws2_32', 'crypt32' }
+			if not static then
+				links { 'ws2_32', 'crypt32' }
+			end
 		else
 			links { 'curl' }
 			
@@ -21,6 +23,8 @@ return {
 			
 			return
 		end
+		
+		local isCrt = not a and not static
 
 		if a then
 			targetname "curl"
@@ -48,7 +52,11 @@ return {
 		end
 
 		-- nghttp2
-		add_dependencies 'vendor:nghttp2'
+		if not isCrt then
+			add_dependencies 'vendor:nghttp2'
+		else
+			add_dependencies 'vendor:nghttp2-crt'
+		end
 
 		-- all the disables except http/file
 		defines { 'BUILDING_LIBCURL', 'USE_IPV6', 'CURL_DISABLE_TFTP', 'CURL_DISABLE_FTP', 'CURL_DISABLE_LDAP', 'CURL_DISABLE_TELNET',
@@ -56,9 +64,12 @@ return {
 				  'CURL_DISABLE_RTMP', 'CURL_DISABLE_GOPHER', 'CURL_DISABLE_SMB', 'USE_IPV6', 'USE_NGHTTP2' }
 
 		if os.istarget('windows') then
-			defines { 'USE_WINDOWS_SSPI', 'USE_OPENSSL', 'OPENSSL_NO_ENGINE' }
+			defines { 'USE_WINDOWS_SSPI' }
+			buildoptions '/MP'
 			
-			if a then
+			defines { 'USE_OPENSSL', 'OPENSSL_NO_ENGINE' }
+			
+			if not isCrt then
 				add_dependencies 'vendor:openssl_crypto'
 				add_dependencies 'vendor:openssl_ssl'
 			else

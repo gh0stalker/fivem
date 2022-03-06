@@ -5,6 +5,9 @@
 * Modified for the CitizenFX framework, removing GTA III dependencies.
 */
 #pragma once
+
+#include "StateGuard.h"
+
 #include <algorithm>
 #include <limits>
 #include <cassert>
@@ -16,7 +19,7 @@ union tPoolObjectFlags
 		unsigned char 	uID : 7;
 		bool 			bIsFreeSlot : 1;
 	}					a;
-	signed char			b;
+	unsigned char		b;
 };
 
 /*

@@ -1,13 +1,14 @@
 #!/bin/sh
 set -e
 
-cd ../webadmin/server/
-dotnet publish -c Release
-cd ../../system-resources/
+apk add --no-cache nodejs npm
+npm install -g npm@7.19.1
 
-mkdir -p data/webadmin/wwwroot/
-mkdir -p data/webadmin/server/bin/Release/netstandard2.0/publish/
-cp -a ../webadmin/__resource.lua data/webadmin/
+mkdir -p data
 
-cp -a ../webadmin/wwwroot/ data/webadmin/
-cp -a ../webadmin/server/bin/Release/netstandard2.0/publish/ data/webadmin/server/bin/Release/netstandard2.0/
+cd ../txAdmin/
+npm ci
+npm run build
+cd ../system-resources/
+
+cp -a ../txAdmin/dist data/monitor

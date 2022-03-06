@@ -8,8 +8,12 @@
 #include "StdInc.h"
 #include "CefOverlay.h"
 
-#include <DrawCommands.h>
-#include <RGBA.h>
+extern nui::GameInterface* g_nuiGi;
+
+#include <CfxRGBA.h>
+
+#include <VFSManager.h>
+#include <VFSWin32.h>
 
 #include <DirectXColors.h>
 #include <wrl.h>
@@ -33,24 +37,23 @@ struct DWMP_GET_COLORIZATION_PARAMETERS_DATA
 	uint32_t ColorizationOpaqueBlend;
 };
 
+static ComPtr<IWICImagingFactory> g_imagingFactory;
+
 class CitizenNUIBackground
 {
 private:
-	rage::grcTexture* m_backdropTexture;
-	rage::grcTexture* m_overlayTexture;
-
-	ComPtr<IWICImagingFactory> m_imagingFactory;
+	fwRefContainer<nui::GITexture> m_backdropTexture;
 
 	typedef void (WINAPI* DwmpGetColorizationParameters_t)(DWMP_GET_COLORIZATION_PARAMETERS_DATA*);
 
 	DwmpGetColorizationParameters_t m_fDwmpGetColorizationParameters;
 
 private:
-	rage::grcTexture* InitializeTextureFromFile(std::wstring filename);
+	fwRefContainer<nui::GITexture> InitializeTextureFromFile(const std::string& filename);
 
 	void EnsureTextures();
 
-	void DrawBackground(rage::grcTexture* texture, CRGBA colorValue);
+	void DrawBackground(fwRefContainer<nui::GITexture> texture, CRGBA colorValue, bool cover = false);
 
 	CRGBA GetCurrentDWMColor(bool usePulse);
 
@@ -203,7 +206,7 @@ void CitizenNUIBackground::Initialize()
 	// COM stuff
 	CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 
-	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory1, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)m_imagingFactory.GetAddressOf());
+	HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory1, nullptr, CLSCTX_INPROC_SERVER, __uuidof(IWICImagingFactory), (void**)g_imagingFactory.GetAddressOf());
 
 	if (FAILED(hr))
 	{
@@ -216,77 +219,94 @@ void CitizenNUIBackground::Initialize()
 
 		if (isMainUI)
 		{
-			CRGBA color = GetCurrentColor(true);
-
-			static uint32_t lastColorUpdate;
-
-			if ((GetTickCount() - lastColorUpdate) > 30000)
-			{
-				CRGBA baseColor = GetCurrentColor(false);
-
-				nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "setColor", "color": [ %d, %d, %d ] })", baseColor.red, baseColor.green, baseColor.blue));
-
-				lastColorUpdate = GetTickCount();
-			}
-
-			DrawBackground(m_backdropTexture, CRGBA(255, 255, 255, 255));
-
-			DrawBackground(m_overlayTexture, color);
+			DrawBackground(m_backdropTexture, CRGBA(255, 255, 255, 255), true);
 		}
 	});
 }
 
-void CitizenNUIBackground::DrawBackground(rage::grcTexture* texture, CRGBA colorValue)
+void CitizenNUIBackground::DrawBackground(fwRefContainer<nui::GITexture> texture, CRGBA colorValue, bool cover /* = false */)
 {
-#ifdef _HAVE_GRCORE_NEWSTATES
-	auto oldBlendState = GetBlendState();
-	SetBlendState(GetStockStateIdentifier(BlendStateDefault));
-#endif
-
-	SetTextureGtaIm(texture);
-
 	int resX, resY;
-	GetGameResolution(resX, resY);
+	g_nuiGi->GetGameResolution(&resX, &resY);
 
-	uint32_t color = colorValue.AsARGB();
+	nui::ResultingRectangle rr;
+	rr.rectangle = CRect(0.0f, 0.0f, resX, resY);
+	rr.color = colorValue;
 
-	DrawImSprite(0.0f, 0.0f, resX, resY, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, &color, 0);
+	if (cover)
+	{
+		float oWidth = 2538.0f;
+		float oHeight = 1355.0f;
 
-#ifdef _HAVE_GRCORE_NEWSTATES
-	SetBlendState(oldBlendState);
-#endif
+		float originalRatios[2] = {
+			resX / oWidth,
+			resY / oHeight
+		};
+
+		float coverRatio = std::max(originalRatios[0], originalRatios[1]);
+
+		float newImageWidth = oWidth * coverRatio;
+		float newImageHeight = oHeight * coverRatio;
+
+		float nx = (resX - newImageWidth) / 2;
+		float ny = (resY - newImageHeight) / 2;
+
+		rr.rectangle = CRect{
+			nx,
+			ny,
+			nx + newImageWidth,
+			ny + newImageHeight
+		};
+	}
+
+	g_nuiGi->SetTexture(texture);
+	g_nuiGi->DrawRectangles(1, &rr);
+	g_nuiGi->UnsetTexture();
 }
 
-rage::grcTexture* g_cursorTexture;
+fwRefContainer<nui::GITexture> g_cursorTexture;
 
 void CitizenNUIBackground::EnsureTextures()
 {
-	if (!m_backdropTexture)
+	if (!m_backdropTexture.GetRef())
 	{
-		m_backdropTexture = InitializeTextureFromFile(MakeRelativeCitPath(L"citizen\\resources\\background_main.jpg"));
+		m_backdropTexture = InitializeTextureFromFile("citizen:/ui/app/bg-night.ef4a7a12cfeb114a9dae.jpg");
+
+		if (!m_backdropTexture.GetRef())
+		{
+			m_backdropTexture = InitializeTextureFromFile("citizen:/resources/background_main.jpg");
+		}
 	}
 
-	if (!m_overlayTexture)
+	if (!g_cursorTexture.GetRef())
 	{
-		m_overlayTexture = InitializeTextureFromFile(MakeRelativeCitPath(L"citizen\\resources\\base_color.png"));
-	}
-
-	if (!g_cursorTexture)
-	{
-		g_cursorTexture = InitializeTextureFromFile(MakeRelativeCitPath(L"citizen\\resources\\citizen_cursor.png"));
+		g_cursorTexture = InitializeTextureFromFile("citizen:/resources/citizen_cursor.png");
 	}
 }
 
-rage::grcTexture* CitizenNUIBackground::InitializeTextureFromFile(std::wstring filename)
+static std::vector<uint32_t> LoadFileBitmap(const std::string& filename, int* outWidth, int* outHeight)
 {
 	ComPtr<IWICBitmapDecoder> decoder;
+	std::vector<uint8_t> v;
 
-	HRESULT hr = m_imagingFactory->CreateDecoderFromFilename(filename.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
+	{
+		auto s = vfs::OpenRead(filename);
+
+		if (!s.GetRef())
+		{
+			return {};
+		}
+
+		v = s->ReadToEnd();
+	}
+
+	auto stream = vfs::CreateComStream(vfs::OpenRead(fmt::sprintf("memory:$%016llx,%d,0:%s", (uintptr_t)v.data(), v.size(), filename)));
+	HRESULT hr = g_imagingFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
 
 	if (SUCCEEDED(hr))
 	{
 		ComPtr<IWICBitmapFrameDecode> frame;
-		
+
 		hr = decoder->GetFrame(0, frame.GetAddressOf());
 
 		if (SUCCEEDED(hr))
@@ -298,10 +318,20 @@ rage::grcTexture* CitizenNUIBackground::InitializeTextureFromFile(std::wstring f
 
 			frame->GetSize(&width, &height);
 
+			if (outWidth)
+			{
+				*outWidth = width;
+			}
+
+			if (outHeight)
+			{
+				*outHeight = height;
+			}
+
 			// try to convert to a pixel format we like
 			frame.As(&source);
 
-			hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppRGBA, source.Get(), convertedSource.GetAddressOf());
+			hr = WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, source.Get(), convertedSource.GetAddressOf());
 
 			if (SUCCEEDED(hr))
 			{
@@ -315,30 +345,91 @@ rage::grcTexture* CitizenNUIBackground::InitializeTextureFromFile(std::wstring f
 
 			if (SUCCEEDED(hr))
 			{
-				rage::grcTextureReference reference;
-				memset(&reference, 0, sizeof(reference));
-				reference.width = width;
-				reference.height = height;
-				reference.depth = 1;
-				reference.stride = width * 4;
-#ifdef GTA_NY
-				reference.format = 1; // RGBA
-#elif defined(GTA_FIVE)
-				reference.format = 11; // should correspond to DXGI_FORMAT_B8G8R8A8_UNORM
-#endif
-				reference.pixelData = (uint8_t*)pixelData.data();
-
-				return rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr);
+				return pixelData;
 			}
 		}
+	}
+
+	return {};
+}
+
+fwRefContainer<nui::GITexture> CitizenNUIBackground::InitializeTextureFromFile(const std::string& filename)
+{
+	int width = 0;
+	int height = 0;
+	auto pixelData = LoadFileBitmap(filename, &width, &height);
+
+	if (!pixelData.empty())
+	{
+		return g_nuiGi->CreateTexture(width, height, nui::GITextureFormat::ARGB, pixelData.data());
 	}
 
 	return nullptr;
 }
 
-static CitizenNUIBackground g_nuiBackground;
+HCURSOR InitDefaultCursor()
+{
+	int width = 0;
+	int height = 0;
+	auto pixelData = LoadFileBitmap("citizen:/resources/citizen_cursor.png", &width, &height);
+
+	if (!pixelData.empty())
+	{
+		BITMAPINFO bitmapInfo = { 0 };
+		bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+		bitmapInfo.bmiHeader.biWidth = width;
+		bitmapInfo.bmiHeader.biHeight = -height;
+		bitmapInfo.bmiHeader.biPlanes = 1;
+		bitmapInfo.bmiHeader.biBitCount = 32;
+		bitmapInfo.bmiHeader.biCompression = BI_RGB;
+		bitmapInfo.bmiHeader.biSizeImage = 0;
+		bitmapInfo.bmiHeader.biXPelsPerMeter = 1;
+		bitmapInfo.bmiHeader.biYPelsPerMeter = 1;
+		bitmapInfo.bmiHeader.biClrUsed = 0;
+		bitmapInfo.bmiHeader.biClrImportant = 0;
+
+		auto hWnd = g_nuiGi->GetHWND();
+		HDC workingDC;
+		HBITMAP bitmap;
+
+		{
+			auto dc = GetDC(hWnd);
+			workingDC = CreateCompatibleDC(dc);
+			bitmap = CreateDIBSection(dc, &bitmapInfo, DIB_RGB_COLORS, 0, 0, 0);
+
+			ReleaseDC(hWnd, dc);
+		}
+
+		SetDIBits(0, bitmap, 0, height, pixelData.data(), &bitmapInfo, DIB_RGB_COLORS);
+
+		// mask
+		HBITMAP oldBitmap = HBITMAP(SelectObject(workingDC, bitmap));
+		SetBkMode(workingDC, TRANSPARENT);
+		SelectObject(workingDC, oldBitmap);
+
+		HBITMAP mask = CreateBitmap(width, height, 1, 1, NULL);
+		ICONINFO ii = { 0 };
+		ii.fIcon = FALSE;
+		ii.xHotspot = 0;
+		ii.yHotspot = 0;
+		ii.hbmMask = mask;
+		ii.hbmColor = bitmap;
+
+		HICON icon = CreateIconIndirect(&ii);
+
+		DeleteDC(workingDC);
+		DeleteObject(mask);
+		DeleteObject(bitmap);
+
+		return icon;
+	}
+
+	return NULL;
+}
+
+static CitizenNUIBackground* g_nuiBackground = new CitizenNUIBackground();
 
 static HookFunction initFunction([] ()
 {
-	g_nuiBackground.Initialize();
+	g_nuiBackground->Initialize();
 });

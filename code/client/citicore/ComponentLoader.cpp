@@ -12,6 +12,11 @@
 #include <Error.h>
 
 #include <LaunchMode.h>
+#include <CrossBuildRuntime.h>
+
+#ifndef IS_FXSERVER
+#include <CL2LaunchMode.h>
+#endif
 
 #ifdef _WIN32
 #define PLATFORM_LIBRARY_STRING L"%s.dll"
@@ -47,6 +52,11 @@ void ComponentLoader::Initialize()
 		componentsName = _P("components-sp.json");
 	}
 
+	if (xbr::IsGameBuild<372>())
+	{
+		componentsName = _P("components-sp372.json");
+	}
+
 	FILE* componentCache = _pfopen(MakeRelativeCitPath(componentsName).c_str(), _P("rb"));
 	if (!componentCache)
 	{
@@ -75,6 +85,11 @@ void ComponentLoader::Initialize()
 		FatalError("Error parsing components.json: %d", doc.GetParseError());
 	}
 
+#ifdef _WIN32
+	wchar_t moduleName[MAX_PATH];
+	GetModuleFileNameW(GetModuleHandleW(NULL), moduleName, std::size(moduleName));
+#endif
+
 	// look through the list for components to load
 	for (auto it = doc.Begin(); it != doc.End(); ++it)
 	{
@@ -86,6 +101,60 @@ void ComponentLoader::Initialize()
 
 		// replace colons with dashes
 		std::replace(nameWide.begin(), nameWide.end(), ':', '-');
+
+#ifdef _WIN32
+		// don't load some useless stuff for ChromeBrowser
+		if (wcsstr(moduleName, L"ChromeBrowser"))
+		{
+			if (nameWide != L"nui-core" && nameWide != L"vfs-core")
+			{
+				continue;
+			}
+		}
+
+#ifndef IS_FXSERVER
+		// don't load some useless stuff for FXNode as well
+		if (launch::IsFXNode()) {
+			std::vector<std::wstring> neededComponentsList = {
+				L"citizen-scripting-v8node",
+				L"citizen-scripting-core",
+				L"citizen-resources-core",
+				L"scripting-gta",
+				L"rage-scripting-five",
+				L"rage-allocator-five",
+				L"http-client",
+				L"citizen-scripting-core",
+				L"conhost-v2",
+				L"vfs-core",
+				L"net-tcp-server",
+				L"net-base",
+			};
+
+			bool wantThisComponent = false;
+
+			for (auto& componentName : neededComponentsList)
+			{
+				if (nameWide == componentName)
+				{
+					wantThisComponent = true;
+					break;
+				}
+			}
+
+			if (!wantThisComponent)
+			{
+				continue;
+			}
+		}
+#endif
+#endif
+
+#ifndef IS_FXSERVER
+		if (nameWide == L"adhesive" && (launch::IsSDK() || launch::IsSDKGuest()))
+		{
+			continue;
+		}
+#endif
 
 		AddComponent(new DllGameComponent(va(PLATFORM_LIBRARY_STRING, nameWide.c_str())));
 	}
@@ -179,6 +248,8 @@ void ComponentLoader::DoGameLoad(void* hModule)
 	{
 		auto& instances = component->GetInstances();
 
+		trace("pre-gameload component %s\n", component->GetName());
+
 		if (!instances.empty())
 		{
 			instances[0]->DoGameLoad(hModule);
@@ -209,7 +280,15 @@ fwRefContainer<ComponentData> ComponentLoader::LoadComponent(const char* compone
 
 	if (!component.GetRef())
 	{
-		FatalError("Unknown component %s.", componentName);
+		if (strcmp(componentName, "adhesive") == 0)
+		{
+			component = m_knownComponents["sticky"];
+		}
+
+		if (!component.GetRef())
+		{
+			FatalError("Unknown component %s.", componentName);
+		}
 	}
 
 	if (component->IsLoaded())
@@ -235,9 +314,40 @@ fwRefContainer<Component> ComponentData::CreateInstance(const std::string& userD
 	return instance;
 }
 
+#ifdef _WIN32
+#include <shellapi.h>
+#endif
+
 fwRefContainer<Component> ComponentData::CreateManualInstance()
 {
 	fwRefContainer<Component> instance = CreateComponent();
+
+#ifdef _WIN32
+	static std::vector<std::string> argvStrs;
+	static std::vector<char*> argvRefs;
+
+	static auto _ = ([]()
+	{
+		int argc;
+		LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+
+		argvStrs.resize(argc);
+		argvRefs.resize(argc);
+
+		for (int i = 0; i < argc; i++)
+		{
+			argvStrs[i] = ToNarrow(argv[i]);
+			argvRefs[i] = &argvStrs[i][0];
+		}
+
+		LocalFree(argv);
+
+		return 0;
+	})();
+
+	instance->SetCommandLine(argvRefs.size(), &argvRefs[0]);
+#endif
+
 	m_instances.push_back(instance);
 
 	return instance;

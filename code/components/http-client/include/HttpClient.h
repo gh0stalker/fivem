@@ -43,7 +43,7 @@ struct HttpIgnoreCaseLess
 	}
 };
 
-using HttpHeaderList = std::map<std::string, std::string, HttpIgnoreCaseLess>;
+using HttpHeaderList = std::multimap<std::string, std::string, HttpIgnoreCaseLess>;
 using HttpHeaderListPtr = std::shared_ptr<HttpHeaderList>;
 
 struct HttpRequestOptions
@@ -55,11 +55,16 @@ struct HttpRequestOptions
 	std::function<bool(const std::string&)> streamingCallback;
 	std::chrono::milliseconds timeoutNoResponse;
 	int weight;
+	bool ipv4;
+	bool addErrorBody;
+	bool followLocation = true;
 
 	inline HttpRequestOptions()
 	{
 		timeoutNoResponse = std::chrono::milliseconds(0);
 		weight = 16;
+		ipv4 = false;
+		addErrorBody = false;
 	}
 };
 
@@ -80,7 +85,7 @@ using HttpRequestPtr = std::shared_ptr<HttpRequestHandle>;
 class HTTP_EXPORT HttpClient
 {
 public:
-	HttpClient(const wchar_t* userAgent = L"CitizenFX/1");
+	HttpClient(const wchar_t* userAgent = L"CitizenFX/1", const std::string& loopId = {});
 	virtual ~HttpClient();
 
 	std::string BuildPostString(const std::map<std::string, std::string>& fields);

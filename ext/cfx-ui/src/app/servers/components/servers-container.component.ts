@@ -1,99 +1,63 @@
 import { Component, OnInit, PLATFORM_ID, Inject, ChangeDetectionStrategy, ChangeDetectorRef } from '@angular/core';
 import { ActivatedRoute } from '@angular/router';
 
-import { Server, ServerIcon, PinConfigCached } from '../server';
-import { ServersService } from '../servers.service';
-import { ServerFilters, ServerFilterContainer, ServerTags } from './server-filter.component';
-
-import { GameService } from '../../game.service';
-
 import { isPlatformBrowser } from '@angular/common';
 
-import { Observable } from 'rxjs/observable';
-
-import 'rxjs/add/operator/bufferTime';
+import { FiltersService } from '../filters.service';
+import { ServersService } from '../servers.service';
+import { GameService } from 'app/game.service';
 
 @Component({
-    moduleId: module.id,
-    selector: 'servers-container',
-    templateUrl: 'servers-container.component.html',
-    styleUrls: ['servers-container.component.scss'],
-    changeDetection: ChangeDetectionStrategy.OnPush
+	moduleId: module.id,
+	selector: 'servers-container',
+	templateUrl: 'servers-container.component.html',
+	styleUrls: ['servers-container.component.scss'],
+	changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class ServersContainerComponent implements OnInit {
-    servers: { [addr: string]: Server } = {};
-    
-    localServers: Server[]; // temp value
-    icons: ServerIcon[];
+	type: string;
 
-    pinConfig: PinConfigCached;
+	serversLoaded = false;
+	sortingComplete = false;
 
-    filters: ServerFilterContainer;
+	constructor(
+		private route: ActivatedRoute,
+		@Inject(PLATFORM_ID) private platformId: any,
+		private filtersService: FiltersService,
+		private serversService: ServersService,
+        private gameService: GameService,
+		private changeDetectorRef: ChangeDetectorRef,
+	) {
+		this.serversService.serversLoadedUpdate.subscribe((loaded) => {
+			this.serversLoaded = loaded;
+			this.changeDetectorRef.markForCheck();
+		});
 
-    type: string;
+		this.filtersService.sortingInProgress.subscribe((inProgress) => {
+			this.sortingComplete = !inProgress;
+			this.changeDetectorRef.markForCheck();
+		});
+	}
 
-    constructor(private serverService: ServersService, private gameService: GameService, private route: ActivatedRoute,
-        @Inject(PLATFORM_ID) private platformId: any, private cdr: ChangeDetectorRef) {
-        this.filters = new ServerFilterContainer();
-        this.pinConfig = new PinConfigCached(null);
-    }
+	ngOnInit() {
+		this.type = this.route.snapshot.data.type;
 
-    serversArray: Server[] = [];
+		this.filtersService.setType(this.type);
+	}
 
-    ngOnInit() {
-        this.type = this.route.snapshot.data.type;
+	isBrowser() {
+		return isPlatformBrowser(this.platformId);
+	}
 
-        if (isPlatformBrowser(this.platformId)) {
-            this.loadServers();
+	isFiltering() {
+        if (this.gameService.gameName === 'rdr3') {
+            return true;
         }
-    }
 
-    setFilters(filters: ServerFilters) {
-        this.filters = {...this.filters, filters};
+		return (this.filtersService.filters?.searchText ?? '') !== '';
+	}
 
-        this.cdr.markForCheck();
-    }
-
-    setTags(tags: ServerTags) {
-        this.filters = {...this.filters, tags: { tagList: { ...tags.tagList }, localeList: { ...tags.localeList } }};
-
-        this.cdr.markForCheck();
-    }
-
-    isBrowser() {
-        return isPlatformBrowser(this.platformId);
-    }
-
-    loadServers() {
-        this.serverService.loadPinConfig()
-            .then(pinConfig => this.pinConfig = new PinConfigCached(pinConfig));
-
-
-        const typedServers = this.serverService
-            .getReplayedServers()
-            .filter(a => a && this.gameService.isMatchingServer(this.type, a));
-
-        // add each new server to our server list
-        typedServers.subscribe(server => {
-            if (!this.servers[server.address]) {
-                this.serversArray.push(server);
-            } else {
-                this.serversArray.splice(
-                    this.serversArray.findIndex(a => a.address === server.address),
-                    1,
-                    server);
-            }
-
-            this.serversArray = this.serversArray.slice();
-
-            this.servers[server.address] = server;
-
-            this.cdr.markForCheck();
-        });
-
-        // ping new servers after a while
-        typedServers
-            .bufferTime(100, null, 250)
-            .subscribe(servers => (servers.length > 0) ? this.gameService.pingServers(servers) : null);
-    }
+	isLoading() {
+		return (!this.serversLoaded || !this.sortingComplete);
+	}
 }

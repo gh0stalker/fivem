@@ -7,13 +7,51 @@
 
 #include "StdInc.h"
 
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(LAUNCHER_PERSONALITY_GAME) || defined(COMPILING_GLUE)
+#include <CfxState.h>
+#include <HostSharedData.h>
+
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
+#include <CfxLocale.h>
+#include <openssl/sha.h>
+#endif
+
+#include <KnownFolders.h>
+#include <shlobj.h>
+
 #undef interface
 #include "InstallerExtraction.h"
 #include <array>
 
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
+#define CURL_STATICLIB
+#include <curl/curl.h>
+#include <curl/easy.h>
+#endif
+
 #include <Error.h>
 
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
+struct GameCacheEntry;
+
+struct DeltaEntry
+{
+	std::array<uint8_t, 20> fromChecksum;
+	std::array<uint8_t, 20> toChecksum;
+	std::string remoteFile;
+	uint64_t dlSize;
+
+	std::string GetFileName() const;
+	GameCacheEntry MakeEntry() const;
+
+	inline std::wstring GetLocalFileName() const
+	{
+		return MakeRelativeCitPath(ToWide("data\\game-storage\\" + GetFileName()));
+	}
+
+	DeltaEntry(std::string_view fromChecksum, std::string_view toChecksum, const std::string& remoteFile, uint64_t dlSize);
+};
+
 // entry for a cached-intent file
 struct GameCacheEntry
 {
@@ -35,60 +73,132 @@ struct GameCacheEntry
 	// remote size of the archive file
 	size_t remoteSize;
 
+	// delta sets
+	std::vector<DeltaEntry> deltas;
+
 	// constructor
-	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize)
-		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr)
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize)
-		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile)
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(nullptr), deltas(deltas)
+	{
+	}
+
+	GameCacheEntry(const char* filename, const char* checksum, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums({ checksum }), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, size_t localSize)
-		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr)
+	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, size_t localSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(localSize), archivedFile(nullptr), deltas(deltas)
 	{
 
 	}
 
-	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize)
-		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile)
+	GameCacheEntry(const char* filename, std::initializer_list<const char*> checksums, const char* remotePath, const char* archivedFile, size_t localSize, size_t remoteSize, std::initializer_list<DeltaEntry> deltas = {})
+		: filename(filename), checksums(checksums), remotePath(remotePath), localSize(localSize), remoteSize(remoteSize), archivedFile(archivedFile), deltas(deltas)
 	{
 
 	}
 
 	// methods
+	bool IsPrimitiveFile() const
+	{
+		return std::string_view{ filename }.find("ros_") == 0 || std::string_view{ filename }.find("launcher/") == 0;
+	}
+
 	std::wstring GetCacheFileName() const
 	{
 		std::string filenameBase = filename;
 
-		if (filenameBase.find("ros_1241/") == 0)
+		if (IsPrimitiveFile())
 		{
-			return MakeRelativeCitPath(ToWide(va("cache\\game\\%s", filenameBase.c_str())));
+			return MakeRelativeCitPath(ToWide(va("data\\game-storage\\%s", filenameBase.c_str())));
 		}
 
 		std::replace(filenameBase.begin(), filenameBase.end(), '/', '+');
 
-		return MakeRelativeCitPath(ToWide(va("cache\\game\\%s_%s", filenameBase.c_str(), checksums[0])));
+		return MakeRelativeCitPath(ToWide(va("data\\game-storage\\%s_%s", filenameBase.c_str(), checksums[0])));
 	}
 
 	std::wstring GetRemoteBaseName() const
 	{
 		std::string remoteNameBase = remotePath;
 
-		int slashIndex = remoteNameBase.find_last_of('/') + 1;
+		size_t slashIndex = remoteNameBase.find_last_of('/') + 1;
 
-		return MakeRelativeCitPath(ToWide("cache\\game\\" + remoteNameBase.substr(slashIndex)));
+		return MakeRelativeCitPath(ToWide("data\\game-storage\\" + remoteNameBase.substr(slashIndex)));
 	}
 
 	std::wstring GetLocalFileName() const
 	{
+		if (_strnicmp(filename, "launcher/", 9) == 0)
+		{
+			static auto mtlPath = ([]()
+			{
+				wchar_t rootBuf[1024] = { 0 };
+				DWORD rootLength = sizeof(rootBuf);
+
+				RegGetValue(HKEY_LOCAL_MACHINE,
+				L"SOFTWARE\\WOW6432Node\\Rockstar Games\\Launcher", L"InstallFolder",
+				RRF_RT_REG_SZ, nullptr, rootBuf, &rootLength);
+				
+				return std::wstring{ rootBuf };
+			})();
+
+			return mtlPath + L"\\" + ToWide(&filename[9]);
+		}
+
+		if (_strnicmp(filename, "ros_", 4) == 0)
+		{
+			static auto scPath = ([]() -> std::wstring
+			{
+				LPWSTR rootPath;
+				if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_ProgramFiles, 0, nullptr, &rootPath)))
+				{
+					std::wstring pathRef = rootPath;
+					CoTaskMemFree(rootPath);
+
+					return pathRef;
+				}
+
+				wchar_t rootBuf[1024] = { 0 };
+				DWORD rootLength = sizeof(rootBuf);
+
+				RegGetValue(HKEY_LOCAL_MACHINE,
+				L"SOFTWARE\\WOW6432Node\\Rockstar Games\\Rockstar Games Social Club", L"InstallFolder",
+				RRF_RT_REG_SZ, nullptr, rootBuf, &rootLength);
+			})();
+
+			return scPath + L"\\" + ToWide(strchr(filename, L'/') + 1);
+		}
+
 		return MakeRelativeGamePath(ToWide(filename));
 	}
 };
+
+GameCacheEntry DeltaEntry::MakeEntry() const
+{
+	return GameCacheEntry{ remoteFile.c_str(), "0000000000000000000000000000000000000000", remoteFile.c_str(), size_t(dlSize) };
+}
+
+std::string DeltaEntry::GetFileName() const
+{
+	std::basic_string_view<uint8_t> from{
+		fromChecksum.data(), 20
+	};
+
+	std::basic_string_view<uint8_t> to{
+		toChecksum.data(), 20
+	};
+
+	return fmt::sprintf("%x_%x", std::hash<decltype(from)>()(from), std::hash<decltype(to)>()(to));
+}
 
 struct GameCacheStorageEntry
 {
@@ -100,12 +210,9 @@ struct GameCacheStorageEntry
 };
 
 // global cache mapping of ROS files to disk files
-static GameCacheEntry g_requiredEntries[] =
+static std::vector<GameCacheEntry> g_requiredEntries =
 {
-	{ "GTA5.exe", "8939c8c71aa98ad7ca6ac773fae1463763c420d8", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe", "$/GTA5.exe", 72484280, 1031302600 },
-	{ "update/update.rpf", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe", "$/update/update.rpf", 966805504, 1031302600 },
-	//{ L"update/update.rpf", "c819ecc1df08f3a90bc144fce0bba08bb7b6f893", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfupdate.rpf", 560553984 },
-	//{ "update/update.rpf", "319d867a44746885427d9c40262e9d735cd2a169", "Game_EFIGS/GTA_V_Patch_1_0_1011_1.exe", "$/update/update.rpf", 701820928, SIZE_MAX },
+#if defined(GTA_FIVE)
 	{ "update/x64/dlcpacks/patchday4ng/dlc.rpf", "124c908d82724258a5721535c87f1b8e5c6d8e57", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday4ng/dlc.rpf", 312438784 },
 	{ "update/x64/dlcpacks/mpluxe/dlc.rpf", "78f7777b49f4b4d77e3da6db728cb3f7ec51e2fc", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpluxe/dlc.rpf", 226260992 },
 
@@ -162,7 +269,7 @@ static GameCacheEntry g_requiredEntries[] =
 
 	//DLCPacks16
 	{ "update/x64/dlcpacks/mpchristmas2017/dlc.rpf", "16f8c031aa79f1e83b7f5ab883df3dbfcda8dddf", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 2406123520 },
-	{ "update/x64/dlcpacks/patchday17ng/dlc.rpf", { "7dc8639f1ffa25b3237d01aea1e9975238628952", "c7163e1d8105c87b867b09928ea8346e26b27565" }, "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday12ng/dlc.rpf", 59975680 },
+	{ "update/x64/dlcpacks/patchday17ng/dlc.rpf", { "7dc8639f1ffa25b3237d01aea1e9975238628952", "c7163e1d8105c87b867b09928ea8346e26b27565", "7dc8639f1ffa25b3237d01aea1e9975238628952" }, "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday12ng/dlc.rpf", 59975680 },
 
 	//DLCPacks17
 	{ "update/x64/dlcpacks/mpassault/dlc.rpf", "7c65b096261dd88bd1f952fc6046626f1ca56215", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 314443776 },
@@ -173,90 +280,169 @@ static GameCacheEntry g_requiredEntries[] =
 	{ "update/x64/dlcpacks/mpbattle/dlc1.rpf", "b16fb76065132f5f9af4b2a92431b9f91b670542", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 992296960 },
 	{ "update/x64/dlcpacks/patchday19ng/dlc.rpf", "3373311add1eb5ff850e1f3fbb7d15512cbc5b8b", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday12ng/dlc.rpf", 765630464 },
 
-	//DLCPacks19
+	//DLCPacks19m
 	{ "update/x64/dlcpacks/mpchristmas2018/dlc.rpf", "c4cda116420f14a28e5a999740cc53cf53a950ec", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3247781888 },
 	{ "update/x64/dlcpacks/patchday20ng/dlc.rpf", "fbba396a0ede622e08f76c5ced8ac1d6839c0227", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfpatchday12ng/dlc.rpf", 457129984 },
+#elif defined(IS_RDR3)
+	{ "x64/dlcpacks/mp007/dlc.rpf", "f9d085bc889fc89d205c43a63d784d131be3ae8f", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1425958473 },
+	{ "x64/dlcpacks/patchpack007/dlc.rpf", "1847fa67af881ae8f6b88149948db6a181b698ac", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 58027818 },
+#endif
 
-	{ "ros_1241/cef.pak", "C308AC7D34F80FE9486716FBF4C713B55924B661", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/cef.pak", 3866710, 85063288 },
-	{ "ros_1241/cef_100_percent.pak", "66EF9A8559E1A8F7976F95FDD2355A0D0E101532", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/cef_100_percent.pak", 647967, 85063288 },
-	{ "ros_1241/cef_200_percent.pak", "0E65DCF353901A8F5D4309585337F6465C3DFC78", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/cef_200_percent.pak", 753127, 85063288 },
-	{ "ros_1241/chrome_elf.dll", "D616A5BB2670476ACC87A8FDF5211F9A46F03688", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/chrome_elf.dll", 547304, 85063288 },
-	{ "ros_1241/d3dcompiler_43.dll", "80FE574E9EB795C8B148C218E4CE5EE52E9C6AB9", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/d3dcompiler_43.dll", 2106344, 85063288 },
-	{ "ros_1241/d3dcompiler_47.dll", "5E5D103067802BB20ACB660CF6FCD74DADC4F6ED", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/d3dcompiler_47.dll", 4300776, 85063288 },
-	{ "ros_1241/icudtl.dat", "C35D6E4DB540518263214697F589C54FAAC87533", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/icudtl.dat", 10171360, 85063288 },
-	{ "ros_1241/libcef.dll", "C30E1DD3CA864BD46A7F316B4663472CF3601423", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/libcef.dll", 94052328, 85063288 },
-	{ "ros_1241/libEGL.dll", "6399CE3EC756586380DE8DDE4734CD8C98255654", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/libEGL.dll", 98792, 85063288 },
-	{ "ros_1241/libGLESv2.dll", "7FBD036872AEADCAAEC84501E255F73DFB70CDDD", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/libGLESv2.dll", 4434920, 85063288 },
-	{ "ros_1241/natives_blob.bin", "7BCA7FCF54CC81CAFBAEEF44EF23DAE4A7C97619", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/natives_blob.bin", 218121, 85063288 },
-	{ "ros_1241/scui.pak", "97DB3B1AAAB9D410A33B3B280069886708535F7A", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/scui.pak", 6035130, 85063288 },
-	{ "ros_1241/snapshot_blob.bin", "0EC391456619FC5BCA046A23BADCF151D72D1B35", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/snapshot_blob.bin", 1362716, 85063288 },
-	{ "ros_1241/socialclub.dll", "EAEA6D9A4564E5C58A401CEFED378AB947F1A5C3", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/socialclub.dll", 7962088, 85063288 },
-	{ "ros_1241/SocialClubHelper.exe", "8D6C6BC68548951358ACC4F51265CAD8177E35D6", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/SocialClubHelper.exe", 1092072, 85063288 },
-	{ "ros_1241/v8_context_snapshot.bin", "9A66D10886CC99BFD7E32C2178894717F33664EE", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/v8_context_snapshot.bin", 1772488, 85063288 },
-	{ "ros_1241/widevinecdmadapter.dll", "9D58F5009C73D5FB9BE1089A46CD9576D2F5654B", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/widevinecdmadapter.dll", 286696, 85063288 },
-	{ "ros_1241/locales/am.pak", "780E74DA7D6299BA8D8278CB42685287BFE9D1DE", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/am.pak", 288192, 85063288 },
-	{ "ros_1241/locales/ar.pak", "0E34AE587EAC54F8535C80EAC6F8D0C73CF8ADD3", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ar.pak", 283698, 85063288 },
-	{ "ros_1241/locales/bg.pak", "8EBA4746AF8927CB75390CD6EBEE59E027B4636E", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/bg.pak", 329621, 85063288 },
-	{ "ros_1241/locales/bn.pak", "AD5A2E603C97D9B48DE47DCA188315D0790765DE", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/bn.pak", 430606, 85063288 },
-	{ "ros_1241/locales/ca.pak", "97EF23AF64A67C8A444E1983D600B4D610F03D34", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ca.pak", 204954, 85063288 },
-	{ "ros_1241/locales/cs.pak", "9ADAE19B1982968EE0650AD5DCDED1E625632B14", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/cs.pak", 208304, 85063288 },
-	{ "ros_1241/locales/da.pak", "463ECE138DACBD6835F72A84EABAA57E20E99DDF", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/da.pak", 187208, 85063288 },
-	{ "ros_1241/locales/de.pak", "60FE88E7AA2E52A57C6F679F235943DF943E3263", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/de.pak", 203794, 85063288 },
-	{ "ros_1241/locales/el.pak", "E3E89A5C4729F20916F40DCCC13D6B8C4AF4C6DA", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/el.pak", 362601, 85063288 },
-	{ "ros_1241/locales/en-GB.pak", "249E3084DD6D148F2487CE9E1A48B7FAE97FDF0E", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/en-GB.pak", 168518, 85063288 },
-	{ "ros_1241/locales/en-US.pak", "5DE10AAD0EFA91043E80C2397375DF52AD825545", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/en-US.pak", 169455, 85063288 },
-	{ "ros_1241/locales/es-419.pak", "5323B07879FCEFE5A0C4924A83DC811F7B6DF6D7", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/es-419.pak", 201890, 85063288 },
-	{ "ros_1241/locales/es.pak", "17D3C5F66B050D4A7B8D798647DB60D64E7E25FB", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/es.pak", 205495, 85063288 },
-	{ "ros_1241/locales/et.pak", "58514249041B33360A8DD0D21A7DABE921E7DC3C", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/et.pak", 182828, 85063288 },
-	{ "ros_1241/locales/fa.pak", "ADAD87081BD3208868B98B5BEE32CB097EBCEBFB", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/fa.pak", 289551, 85063288 },
-	{ "ros_1241/locales/fi.pak", "AC64415B900EDC0F1FECE2638E19E1B1E104F5CB", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/fi.pak", 189663, 85063288 },
-	{ "ros_1241/locales/fil.pak", "D619F2F3ED06DCA54AC02BC6410A291B78A3CD42", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/fil.pak", 208302, 85063288 },
-	{ "ros_1241/locales/fr.pak", "B44BDC854769EFF7755055470D4B743968281F04", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/fr.pak", 219692, 85063288 },
-	{ "ros_1241/locales/gu.pak", "22D4631FF1D32F332F1133E809E774E1A8D29EB3", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/gu.pak", 408074, 85063288 },
-	{ "ros_1241/locales/he.pak", "581690EBCAF2137839212411FBA5B44207153BD2", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/he.pak", 241853, 85063288 },
-	{ "ros_1241/locales/hi.pak", "BD9998EC61BD9F9FD48E890DCF323D9409772AC5", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/hi.pak", 415545, 85063288 },
-	{ "ros_1241/locales/hr.pak", "C41F1E90E9313B13D1BCE7055354596992935CD5", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/hr.pak", 196271, 85063288 },
-	{ "ros_1241/locales/hu.pak", "272AD9767C2DC35938C8104D7AB5D40BCEACF933", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/hu.pak", 215127, 85063288 },
-	{ "ros_1241/locales/id.pak", "32EF210DAAEE35E675525CE50A91F0EC303EB8FF", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/id.pak", 181124, 85063288 },
-	{ "ros_1241/locales/it.pak", "C26951918D1A44CC0F518EEF3C2E7C91BC4AFB23", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/it.pak", 198516, 85063288 },
-	{ "ros_1241/locales/ja.pak", "74D460ACEC0C1791824D0CF9470B76D2771F1CF8", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ja.pak", 246094, 85063288 },
-	{ "ros_1241/locales/kn.pak", "5E8AE3EEBA26548897D10551DB651F753911B179", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/kn.pak", 471779, 85063288 },
-	{ "ros_1241/locales/ko.pak", "FD5072F271E90A9DBF4637C0C56B3B0F60678C41", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ko.pak", 207438, 85063288 },
-	{ "ros_1241/locales/lt.pak", "61779BFDEDE897F89C2618E489C3E57600046FB2", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/lt.pak", 211038, 85063288 },
-	{ "ros_1241/locales/lv.pak", "7383BDF2105F822923483721BFAD83CF721D9236", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/lv.pak", 210459, 85063288 },
-	{ "ros_1241/locales/ml.pak", "6177F6C89BF61827217323EF2056B6A5B9772A5A", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ml.pak", 512370, 85063288 },
-	{ "ros_1241/locales/mr.pak", "A6592A51E543527BD68CD4770260EDF22E8828A0", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/mr.pak", 409172, 85063288 },
-	{ "ros_1241/locales/ms.pak", "06E8900F5BB63FBF8044091CAAA95AE8ED5FC15C", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ms.pak", 187796, 85063288 },
-	{ "ros_1241/locales/nb.pak", "56258B92C4B1E4032F7C45DAAEFC64DFD300D426", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/nb.pak", 184630, 85063288 },
-	{ "ros_1241/locales/nl.pak", "1C64BE844AEF9059234F201B1FF4401ABC4C18AA", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/nl.pak", 193431, 85063288 },
-	{ "ros_1241/locales/pl.pak", "887A8304EAFDEA125E45D83F624C16EBBF772F97", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/pl.pak", 203748, 85063288 },
-	{ "ros_1241/locales/pt-BR.pak", "2CB78986FD9DD8F8A9D50C90E860F28B9F052F2F", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/pt-BR.pak", 199224, 85063288 },
-	{ "ros_1241/locales/pt-PT.pak", "13E7F9FCC875ECA59F49B9B87CDF1FD07A649D29", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/pt-PT.pak", 200771, 85063288 },
-	{ "ros_1241/locales/ro.pak", "B896211961B3F0F53ED64C0D4DB7E7F00E5D3BFF", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ro.pak", 206682, 85063288 },
-	{ "ros_1241/locales/ru.pak", "9B9E82643E7669D3F50C43FB8C4BD85AFD7833DB", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ru.pak", 313752, 85063288 },
-	{ "ros_1241/locales/sk.pak", "8BF7EE156BCFFBDAB6A10285F518441E3E2533A6", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/sk.pak", 212466, 85063288 },
-	{ "ros_1241/locales/sl.pak", "4C578336BAF8A662CB2951C8274201C9DCBE498E", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/sl.pak", 196260, 85063288 },
-	{ "ros_1241/locales/sr.pak", "460513B76BA9845F3E580EFD71922E07EADC9DD3", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/sr.pak", 307758, 85063288 },
-	{ "ros_1241/locales/sv.pak", "05125215C5451A7471BA7972BF18F99D3925C1CA", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/sv.pak", 185484, 85063288 },
-	{ "ros_1241/locales/sw.pak", "1EA9F306A47DB04637D501A0FDBD0EDA5F84C80E", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/sw.pak", 189595, 85063288 },
-	{ "ros_1241/locales/ta.pak", "1C08DAA3F94E6DC72B9B275218F3DC8D496760B6", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/ta.pak", 478276, 85063288 },
-	{ "ros_1241/locales/te.pak", "BEE2FDC9533FA8552A73AB760132714338E9F84F", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/te.pak", 453971, 85063288 },
-	{ "ros_1241/locales/th.pak", "0BB6902FEA12BB6A5496AB0CD2D71B70DD26D5A2", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/th.pak", 389366, 85063288 },
-	{ "ros_1241/locales/tr.pak", "6CCC0C8B430D14335707947B897835D0529C436B", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/tr.pak", 200055, 85063288 },
-	{ "ros_1241/locales/uk.pak", "43092BD4966E2C7F2A0A3425456C61704A1BD398", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/uk.pak", 322593, 85063288 },
-	{ "ros_1241/locales/vi.pak", "CAB3084DB7531EAB27DD8A804780E7EF83D16B6C", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/vi.pak", 228436, 85063288 },
-	{ "ros_1241/locales/zh-CN.pak", "BC70FAC761065BED92E317946F6A4AF5879ECDA8", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/zh-CN.pak", 171281, 85063288 },
-	{ "ros_1241/locales/zh-TW.pak", "490DEE3F6B8B04BAF930803A8C34F51A508B5F71", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/locales/zh-TW.pak", 171913, 85063288 },
-	{ "ros_1241/swiftshader/libEGL.dll", "1C6BCE6CDB4B2E1766A67F931A72519CEFF6AEB1", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/swiftshader/libEGL.dll", 139240, 85063288 },
-	{ "ros_1241/swiftshader/libGLESv2.dll", "484A9699A06A7D87EE5D2BACDF21B284F53328C5", "http://patches.rockstargames.com/prod/socialclub/Social-Club-v1.2.4.1-Setup.exe", "$/swiftshader/libGLESv2.dll", 3019240, 85063288 },
+#if defined(_M_AMD64)
+	{ "ros_2090/cef_100_percent.pak", "ED87BD499CAE74A748E03FC33C36476A20487B78", "https://content.cfx.re/mirrors/ros/2.0.9.0/cef_100_percent.pak", 267314 },
+	{ "ros_2090/cef_200_percent.pak", "ACB1F69B2F0A69D301E6816C5D886F1C10A1BDD9", "https://content.cfx.re/mirrors/ros/2.0.9.0/cef_200_percent.pak", 421955 },
+	{ "ros_2090/cef.pak", "7C95336432AF2E47D4B05D3B55FFE733B34F32F6", "https://content.cfx.re/mirrors/ros/2.0.9.0/cef.pak", 1949064 },
+	{ "ros_2090/chrome_elf.dll", "2DB73805F775C8108E919AA521505EC4E3A11781", "https://content.cfx.re/mirrors/ros/2.0.9.0/chrome_elf.dll", 999320 },
+	{ "ros_2090/d3dcompiler_47.dll", "59A6C4B0D07496A348409268D7B8A6A1CE227BCE", "https://content.cfx.re/mirrors/ros/2.0.9.0/d3dcompiler_47.dll", 4337048 },
+	{ "ros_2090/icudtl.dat", "6BAB2E77925515888808C1EF729C5BB1323100DD", "https://content.cfx.re/mirrors/ros/2.0.9.0/icudtl.dat", 10518160 },
+	{ "ros_2090/libcef.dll", "0D84700E9A387F406164AF17A31BA3F9A498F690", "https://content.cfx.re/mirrors/ros/2.0.9.0/libcef.dll.xz", 132978072, 41881436 },
+	{ "ros_2090/libEGL.dll", "773E2B9A198328864C297D0FE2CCD432C8BE9F0D", "https://content.cfx.re/mirrors/ros/2.0.9.0/libEGL.dll", 399256 },
+	{ "ros_2090/libGLESv2.dll", "BE29C61C4EFFA651B7C93ADB22472228EAC188B6", "https://content.cfx.re/mirrors/ros/2.0.9.0/libGLESv2.dll", 8056728 },
+	{ "ros_2090/scui.pak", "97B9B65F2E0712E69ED68920CC4B78B4F35B998F", "https://content.cfx.re/mirrors/ros/2.0.9.0/scui.pak", 3420268 },
+	{ "ros_2090/snapshot_blob.bin", "2257920539464F2E361348A83F044E2943622165", "https://content.cfx.re/mirrors/ros/2.0.9.0/snapshot_blob.bin", 51261 },
+	{ "ros_2090/socialclub.dll", "AE14687363C0FB5A8B086B4EB24D5A6E2D5161B9", "https://content.cfx.re/mirrors/ros/2.0.9.0/socialclub.dll", 5287320 },
+	{ "ros_2090/socialclub.pak", "D70F269F7EBBA3A13AA2871BAFA58212B01E6280", "https://content.cfx.re/mirrors/ros/2.0.9.0/socialclub.pak", 4996 },
+	{ "ros_2090/SocialClubD3D12Renderer.dll", "73A1421E35B5ED105FA9AF8445F62F0A42EE3C41", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubD3D12Renderer.dll", 415128 },
+	{ "ros_2090/SocialClubHelper.exe", "0DCD077459CCE9B3831B4F0B5797502BB7C41D24", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubHelper.exe", 2768792 },
+	{ "ros_2090/SocialClubVulkanLayer.dll", "572E95099825B507079349A2B24BBAE4C1567B84", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubVulkanLayer.dll", 476056 },
+	{ "ros_2090/SocialClubVulkanLayer.json", "5DA071BDE81BF96C8939978343C6B5B93730CB39", "https://content.cfx.re/mirrors/ros/2.0.9.0/SocialClubVulkanLayer.json", 339 },
+	{ "ros_2090/v8_context_snapshot.bin", "AE3D50F4DB62DC62A37D4C222169BA7C57837E54", "https://content.cfx.re/mirrors/ros/2.0.9.0/v8_context_snapshot.bin", 171494 },
+	{ "ros_2090/locales/am.pak", "91B918C8D9C842535C006CAD51FEF1F7A4DF3DF4", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/am.pak", 397362 },
+	{ "ros_2090/locales/ar.pak", "B7CB43366C3AFC11EECA9E25B7577BB91FA84EE9", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ar.pak", 410699 },
+	{ "ros_2090/locales/bg.pak", "A29DEE681AAC5A851BCEC0EDC8F859AADD37E8EB", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/bg.pak", 449555 },
+	{ "ros_2090/locales/bn.pak", "A61F5CE476F65C9D9A8C0BFCEE73A4555568140B", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/bn.pak", 587356 },
+	{ "ros_2090/locales/ca.pak", "0EE3D65026BE39BE442967545DF4C1C95490040B", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ca.pak", 279277 },
+	{ "ros_2090/locales/cs.pak", "5F0781C07F41BF591B6AF843E0195510666CCB7A", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/cs.pak", 285641 },
+	{ "ros_2090/locales/da.pak", "35A30EF5AD3F9DD412D6A161E187A27B097E6DBD", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/da.pak", 256720 },
+	{ "ros_2090/locales/de.pak", "4B7C0AADBEA7408DC6B88722AC1C9E02CC94CB97", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/de.pak", 277815 },
+	{ "ros_2090/locales/el.pak", "82018633A3A2BFCFD4AFA8E74E4530BC57035748", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/el.pak", 495477 },
+	{ "ros_2090/locales/en-GB.pak", "D0EFD685C081A591AE86599B2688ECB7A5FF2C17", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/en-GB.pak", 228181 },
+	{ "ros_2090/locales/en-US.pak", "82212A642C90B51B8F67E517EE8782DA841B658F", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/en-US.pak", 230622 },
+	{ "ros_2090/locales/es-419.pak", "39D5477AAD201AB6D305FE1A466F9692646033A1", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/es-419.pak", 274527 },
+	{ "ros_2090/locales/es.pak", "2A0014E819249BC202B34A80D1C04496C83D924D", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/es.pak", 278599 },
+	{ "ros_2090/locales/et.pak", "225D5EEE935C42F2668686ED8C6CF9D81686ED65", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/et.pak", 248135 },
+	{ "ros_2090/locales/fa.pak", "D90C04E54C127A98B1F4E9E1061786162E5F6946", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/fa.pak", 398236 },
+	{ "ros_2090/locales/fi.pak", "81BB7DBD212FBC760162B96DA229B39516D1E25F", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/fi.pak", 256469 },
+	{ "ros_2090/locales/fil.pak", "70C132726600A4C640C627D36FB01D8FA2C499F4", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/fil.pak", 284303 },
+	{ "ros_2090/locales/fr.pak", "E22A9A3F57204407AD3EACAB0F320ABA92B79A5B", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/fr.pak", 301254 },
+	{ "ros_2090/locales/gu.pak", "EA5AF8CA67D502E1CB856B6ED02ECC0BF6AE525B", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/gu.pak", 561637 },
+	{ "ros_2090/locales/he.pak", "AE27C24DA778E08E773330111F76FCA5C583AD02", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/he.pak", 343790 },
+	{ "ros_2090/locales/hi.pak", "133DEA57961AB17F1FE4B7175236D02168C2DE8D", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/hi.pak", 579292 },
+	{ "ros_2090/locales/hr.pak", "86BBEAAEBF238F1A1A57FAC33FF6D8CBEB3E086E", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/hr.pak", 272869 },
+	{ "ros_2090/locales/hu.pak", "E7691035840804D7CC3C895855AF209860A6E246", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/hu.pak", 295085 },
+	{ "ros_2090/locales/id.pak", "8268CA0DEC094D655B38CC0A7595FC7404CA6F75", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/id.pak", 246389 },
+	{ "ros_2090/locales/it.pak", "6F0DB2FF20097E53C4CF83A97AEB30FD97CF38E8", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/it.pak", 269987 },
+	{ "ros_2090/locales/ja.pak", "AA3761667AE5FD0D0E69E81354F541E4C0CA9EA6", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ja.pak", 334646 },
+	{ "ros_2090/locales/kn.pak", "E4F6A5221EF853E4480C317BB8A0CA18E7311D05", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/kn.pak", 653458 },
+	{ "ros_2090/locales/ko.pak", "72840023C8DCA628D53917187ABA524AE06B3805", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ko.pak", 281693 },
+	{ "ros_2090/locales/lt.pak", "699BDD5995428B3B206342DC876EBE95739EE555", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/lt.pak", 293018 },
+	{ "ros_2090/locales/lv.pak", "D7A3568EB32B16EB43FDC27D875ACD2EE20B5D24", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/lv.pak", 291468 },
+	{ "ros_2090/locales/ml.pak", "AEC480C5F357D7AC74B4F2081B37E3BD97CDA481", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ml.pak", 689533 },
+	{ "ros_2090/locales/mr.pak", "CF9D8F5AAE61156092239C4D85C3352F0E055C56", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/mr.pak", 552349 },
+	{ "ros_2090/locales/ms.pak", "0B57D80FF583AA4921271EAAD4C0D71C6094A119", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ms.pak", 256222 },
+	{ "ros_2090/locales/nb.pak", "89CF4738188153DE01B6994B55E6F4754A1CA7B7", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/nb.pak", 251280 },
+	{ "ros_2090/locales/nl.pak", "3BED7D65FBB7141CED43B9A4E143190DA3C61CA4", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/nl.pak", 262046 },
+	{ "ros_2090/locales/pl.pak", "71BA95167ED6777EEA6863FD4555C550F56F57A4", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/pl.pak", 284801 },
+	{ "ros_2090/locales/pt-BR.pak", "F8144E74EF3F128E08730F5D4E926914D81E817E", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/pt-BR.pak", 271000 },
+	{ "ros_2090/locales/pt-PT.pak", "D2F9B4F5C5ADE7EB54838ACB4BDA5FA0E4BDF3C0", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/pt-PT.pak", 274231 },
+	{ "ros_2090/locales/ro.pak", "A9B321D3A1AC30E003BACA2E4FB5C984137B17BB", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ro.pak", 280931 },
+	{ "ros_2090/locales/ru.pak", "70C39DF950C6A0C2DB5396BB9BC8070ABF98AC03", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ru.pak", 448316 },
+	{ "ros_2090/locales/sk.pak", "CBD4990B3B6DC6F1F168A8D710980FBF19E49222", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/sk.pak", 289926 },
+	{ "ros_2090/locales/sl.pak", "F8BEF9D34DACFC34C5A8772570D31D27A19869D0", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/sl.pak", 276423 },
+	{ "ros_2090/locales/sr.pak", "F138A577C7D1D681D22E3C001FA4731C667F14B8", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/sr.pak", 426245 },
+	{ "ros_2090/locales/sv.pak", "9142C943F1A2DACD0726BB7487F4EC9EDC01F4CA", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/sv.pak", 253133 },
+	{ "ros_2090/locales/sw.pak", "8B3DB01EBFD19F8775F6ED114973350FF1814C0A", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/sw.pak", 259577 },
+	{ "ros_2090/locales/ta.pak", "18CD81ACF8D9CCAB5B281C9EB02E06D3091A164C", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/ta.pak", 661848 },
+	{ "ros_2090/locales/te.pak", "143A27F67341827F8B32458F3C18ECD604093657", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/te.pak", 620983 },
+	{ "ros_2090/locales/th.pak", "D78AA25633B015464855F60523FE85060959A939", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/th.pak", 526441 },
+	{ "ros_2090/locales/tr.pak", "AD7B39AC558124D7A5F73A83CA0E5E1CC4739425", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/tr.pak", 268763 },
+	{ "ros_2090/locales/uk.pak", "7264E679520E3981A2BF39D7C9EB0085C327A920", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/uk.pak", 448944 },
+	{ "ros_2090/locales/vi.pak", "51CADECB9BCD8FE22AFEAD0A5FC5CECB52C30CAD", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/vi.pak", 314139 },
+	{ "ros_2090/locales/zh-CN.pak", "72BECBAD361E228A8A164B01D1541CCBF7E28EAF", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/zh-CN.pak", 233298 },
+	{ "ros_2090/locales/zh-TW.pak", "DF8FFB51826D76F8E4E11FA8555E0FFB2282A3BE", "https://content.cfx.re/mirrors/ros/2.0.9.0/locales/zh-TW.pak", 233282 },
+	{ "ros_2090/swiftshader/libEGL.dll", "0D68E8B47FE02318526721E178F7EB8E83BBC719", "https://content.cfx.re/mirrors/ros/2.0.9.0/swiftshader/libEGL.dll", 419224 },
+	{ "ros_2090/swiftshader/libGLESv2.dll", "A60249BA16BD12C18B773D702D42B93A5CE598AE", "https://content.cfx.re/mirrors/ros/2.0.9.0/swiftshader/libGLESv2.dll", 2699672 },
 
-	{ "GTAVLauncher.exe", "0962fb5a39d9ec40d4fce2ac636ef11dcd0457cf", "http://patches.rockstargames.com/prod/gtav/Launcher_EFIGS/GTA_V_Launcher_1_0_1604_0.exe", "$/GTAVLauncher.exe", 21606840, 20081224 }
+	{ "launcher/LauncherPatcher.exe", "1C6BCE6CDB4B2E1766A67F931A72519CEFF6AEB1", "", "", 0, 0 },
+	{ "launcher/index.bin", "85e2cc75d6d07518883ce5d377d3425b74636667", "", "", 0, 0 },
+#elif defined(_M_IX86)
+	{ "ros_2079_x86/cef_100_percent.pak", "5DF428B8B1D8584F2670A19224B0A3A11368B8F5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef_100_percent.pak", 658266 },
+	{ "ros_2079_x86/cef_200_percent.pak", "5FA7D4173D0A43610378AC26E05701B0F9F9222D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef_200_percent.pak", 812521 },
+	{ "ros_2079_x86/cef.pak", "743AAAFD06E48CE8006751016E3F9A1D20C528D7", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/cef.pak", 2206428 },
+	{ "ros_2079_x86/chrome_elf.dll", "A35C92343290AA283A57BF8FAA233BAACA2AF378", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/chrome_elf.dll", 816520 },
+	{ "ros_2079_x86/d3dcompiler_47.dll", "24B863C59A8725A2040070D6CD63B4F0B2501122", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/d3dcompiler_47.dll", 3648904 },
+	{ "ros_2079_x86/icudtl.dat", "C8930E95B78DEEF5B7730102ACD39F03965D479A", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/icudtl.dat", 10505952 },
+	{ "ros_2079_x86/libcef.dll", "EF40BDD5C7D1BA378F4BD6661E9D617F77F033BF", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libcef.dll", 104726920 },
+	{ "ros_2079_x86/libEGL.dll", "271F1FB5B00882F6E5D30743CD7B43A91C4F4E31", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libEGL.dll", 319368 },
+	{ "ros_2079_x86/libGLESv2.dll", "C601D45C0A4C7571A8252B7263455B84C7A6E80C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/libGLESv2.dll", 6821768 },
+	{ "ros_2079_x86/scui.pak", "3A03DFA2CECF1E356EB8D080443069ED35A897F1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/scui.pak", 3401985 },
+	{ "ros_2079_x86/snapshot_blob.bin", "FD1DF208437FB8A0E36F57F700C8FD412C300786", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/snapshot_blob.bin", 50522 },
+	{ "ros_2079_x86/socialclub.dll", "1E5702D3E75E1802D16132CC27942589F9301AA2", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/socialclub.dll", 1693064 },
+	{ "ros_2079_x86/socialclub.pak", "D70F269F7EBBA3A13AA2871BAFA58212B01E6280", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/socialclub.pak", 4996 },
+	{ "ros_2079_x86/SocialClubHelper.exe", "A6EE9FFFE5436180B341647E06C60FD26A2F32DC", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/SocialClubHelper.exe", 1052040 },
+	{ "ros_2079_x86/v8_context_snapshot.bin", "9C351FD39D4F64097B778BF920DB9CACB6884A71", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/v8_context_snapshot.bin", 170474 },
+	{ "ros_2079_x86/locales/am.pak", "1BA4F8D3A96D53E236F31315ED94CE7857BE676C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/am.pak", 385976 },
+	{ "ros_2079_x86/locales/ar.pak", "D402FF17B3DEB25C729862367C6A66D4C71064C5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ar.pak", 395800 },
+	{ "ros_2079_x86/locales/bg.pak", "789DEB5B067B64C336ED501A47EACF7AC28C165C", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/bg.pak", 438902 },
+	{ "ros_2079_x86/locales/bn.pak", "D6E4E916D3A5D6B06D7252F5A3EE3546C0D5FA81", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/bn.pak", 570862 },
+	{ "ros_2079_x86/locales/ca.pak", "B3A84377C6DFDCD2EC8B76DAE51EF174A3F32161", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ca.pak", 272754 },
+	{ "ros_2079_x86/locales/cs.pak", "42F2E55A50F980D8A7BC6ACA247FEA38187050C4", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/cs.pak", 278073 },
+	{ "ros_2079_x86/locales/da.pak", "4EFB233CF6F6D6FE7A30887CCDF2758481F7CEF9", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/da.pak", 249964 },
+	{ "ros_2079_x86/locales/de.pak", "E293C63938808FFE58CEF2E911C3E645099122C3", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/de.pak", 271680 },
+	{ "ros_2079_x86/locales/el.pak", "6FB999483B51B732797F46433571CD1F99C6C382", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/el.pak", 483371 },
+	{ "ros_2079_x86/locales/en-GB.pak", "337681F89B3CC5E069066BE31FE548A7FE1BDC3D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/en-GB.pak", 222850 },
+	{ "ros_2079_x86/locales/en-US.pak", "55D6297A4E9BAC33E1975015592324CE32A426E5", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/en-US.pak", 224948 },
+	{ "ros_2079_x86/locales/es-419.pak", "D7CFB264CA28E4310060D4330D0F869F750296EA", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/es-419.pak", 267636 },
+	{ "ros_2079_x86/locales/es.pak", "AD9BCEBBC3DFB6B346E6DDA1B24410DAE844FAD0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/es.pak", 272041 },
+	{ "ros_2079_x86/locales/et.pak", "2CC11D3FE483042FABDB0B568F70EC6D3AA89499", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/et.pak", 241972 },
+	{ "ros_2079_x86/locales/fa.pak", "5A83F5797DB4C5FD4EFE8E83CD32FCF30F7A579B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fa.pak", 387663 },
+	{ "ros_2079_x86/locales/fi.pak", "752D5AB53154F4F6CE671C11CDFFAD87E4B2098F", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fi.pak", 250146 },
+	{ "ros_2079_x86/locales/fil.pak", "CB1FE897C559395F042E113162526A1A985F3C54", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fil.pak", 276980 },
+	{ "ros_2079_x86/locales/fr.pak", "9BD0A49B7F93CECC843C4858FE02FC3233B95FB0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/fr.pak", 293801 },
+	{ "ros_2079_x86/locales/gu.pak", "503499E4B8D7EDE7C2546546C708B62315B93534", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/gu.pak", 546805 },
+	{ "ros_2079_x86/locales/he.pak", "20DE3DE5EFE18A02E3722503812D1BE7F125BAC7", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/he.pak", 332944 },
+	{ "ros_2079_x86/locales/hi.pak", "261DF4775E2E7FF64BBA52D6CC2E3E7E6A744BA6", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hi.pak", 563160 },
+	{ "ros_2079_x86/locales/hr.pak", "CC0EC12EE1A0182FD5095735BDAC50A7968E5941", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hr.pak", 265276 },
+	{ "ros_2079_x86/locales/hu.pak", "3A06F37F8E0DCB4A2C4B9223F4EA630DEC598F30", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/hu.pak", 287478 },
+	{ "ros_2079_x86/locales/id.pak", "7648DD9102EC8D1A989F4CFEE5E77A50EEB2543A", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/id.pak", 240937 },
+	{ "ros_2079_x86/locales/it.pak", "AF12931047F550A700930292678ED68A2F3AE693", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/it.pak", 263141 },
+	{ "ros_2079_x86/locales/ja.pak", "3D69B821559E8B1B7BE61C5E0403013C6E34B472", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ja.pak", 326307 },
+	{ "ros_2079_x86/locales/kn.pak", "BB0B09183BFD4642EDFA4DCDFC6C589D51C91339", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/kn.pak", 637150 },
+	{ "ros_2079_x86/locales/ko.pak", "11E8387A32FA7E25669EA58288AAD02240D59115", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ko.pak", 274716 },
+	{ "ros_2079_x86/locales/lt.pak", "B08521D70C17BC493EDE917CF64483C73CC8CD2B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/lt.pak", 284278 },
+	{ "ros_2079_x86/locales/lv.pak", "68E7175DF0FD0781434761C7AF533D44DFE94DD0", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/lv.pak", 283337 },
+	{ "ros_2079_x86/locales/ml.pak", "0D881D6C532AFD275DB69B4468742F64BDBCEB57", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ml.pak", 672973 },
+	{ "ros_2079_x86/locales/mr.pak", "578BDC9D3EC2A35CA5338DEC949AD6269A95CF81", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/mr.pak", 539342 },
+	{ "ros_2079_x86/locales/ms.pak", "6452CC250C4219EA0130D461942284ABB203105D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ms.pak", 249855 },
+	{ "ros_2079_x86/locales/nb.pak", "B36849BBB46F448DA1A86C93A777E7600898143E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/nb.pak", 245307 },
+	{ "ros_2079_x86/locales/nl.pak", "63C363F3A6D953D2F516926A60036CD45A2BBC73", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/nl.pak", 255846 },
+	{ "ros_2079_x86/locales/pl.pak", "6A9B10202C2A4EABE2DB370478A120303CCEA9E2", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pl.pak", 276450 },
+	{ "ros_2079_x86/locales/pt-BR.pak", "CDDDA77FE5857E7095B0BEF9C95ADDC0E1BFE81E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pt-BR.pak", 263825 },
+	{ "ros_2079_x86/locales/pt-PT.pak", "B01F54FEAC5D8612FADBD1AA1E1A9AE48686765B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/pt-PT.pak", 267667 },
+	{ "ros_2079_x86/locales/ro.pak", "C5F88F5AA8070D93D1A5AC2F6D5B716A405D6402", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ro.pak", 273510 },
+	{ "ros_2079_x86/locales/ru.pak", "3E87FCC49496F1A375022B18F29C5CA184AC94A1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ru.pak", 435040 },
+	{ "ros_2079_x86/locales/sk.pak", "696DB99FE09F2B6F04F6755B562DA0698E67EE73", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sk.pak", 281889 },
+	{ "ros_2079_x86/locales/sl.pak", "FC42DE011EB9EB97F76B90191A0AA6763524F257", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sl.pak", 268266 },
+	{ "ros_2079_x86/locales/sr.pak", "A5F59A87CCAECE1EA27B679DC4CD43B226D44652", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sr.pak", 414419 },
+	{ "ros_2079_x86/locales/sv.pak", "52B28217FA8CFB1BA78DA18FF8FABE96AA65C0CC", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sv.pak", 247090 },
+	{ "ros_2079_x86/locales/sw.pak", "F06249989197891C214B827CB6ACA078A8AC52A9", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/sw.pak", 252916 },
+	{ "ros_2079_x86/locales/ta.pak", "7B2078915D759278F044DA16C331BC35A8EAE366", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/ta.pak", 644686 },
+	{ "ros_2079_x86/locales/te.pak", "81B147F70EFC789597013B862AC7C4C2E932D668", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/te.pak", 606991 },
+	{ "ros_2079_x86/locales/th.pak", "17BB58538907D534C950C830451FD09BE8B699ED", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/th.pak", 514784 },
+	{ "ros_2079_x86/locales/tr.pak", "5872240D9E0700DDBE160CE5FED55B64A8C58D4E", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/tr.pak", 262379 },
+	{ "ros_2079_x86/locales/uk.pak", "403A5AF73EAA7E31FA913B3E92989A3966E84F27", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/uk.pak", 433942 },
+	{ "ros_2079_x86/locales/vi.pak", "4CDA92C95B944456682F49F7542A7DF29AFA390D", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/vi.pak", 305558 },
+	{ "ros_2079_x86/locales/zh-CN.pak", "297C09A18520F9716D81D612540AC8ED7EBDC42B", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/zh-CN.pak", 227335 },
+	{ "ros_2079_x86/locales/zh-TW.pak", "7F67C3A955A99FD31C0A5D5D7B0CD6B404F09BB1", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/locales/zh-TW.pak", 227384 },
+	{ "ros_2079_x86/swiftshader/libEGL.dll", "315BE829397C2C65B4401DE0A9F634D2DF864CD4", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/swiftshader/libEGL.dll", 338312 },
+	{ "ros_2079_x86/swiftshader/libGLESv2.dll", "E62DA6B61D963AB9CD242C2811AC9D7ADA2613AB", "https://content.cfx.re/mirrors/emergency_mirror/ros_2079_x86/swiftshader/libGLESv2.dll", 3017608 },
+#endif
 };
 
 static bool ParseCacheFileName(const char* inString, std::string& fileNameOut, std::string& hashOut)
 {
 	// check if the file name meets the minimum length for there to be a hash
-	int length = strlen(inString);
+	size_t length = strlen(inString);
 
 	if (length < 44)
 	{
@@ -272,7 +458,7 @@ static bool ParseCacheFileName(const char* inString, std::string& fileNameOut, s
 	}
 
 	// find the first underscore following the file extension
-	const char* underscorePos = strchr(inString, '_');
+	const char* underscorePos = strchr(dotPos, '_');
 
 	if (!underscorePos)
 	{
@@ -295,29 +481,34 @@ static bool ParseCacheFileName(const char* inString, std::string& fileNameOut, s
 	return true;
 }
 
+#include <charconv>
+
 template<int Size>
-static std::array<uint8_t, Size> ParseHexString(const char* string)
+static constexpr std::array<uint8_t, Size> ParseHexString(const std::string_view string)
 {
 	std::array<uint8_t, Size> retval;
 
-	assert(strlen(string) == Size * 2);
-
-	for (int i = 0; i < Size; i++)
+	for (size_t i = 0; i < Size; i++)
 	{
-		const char* startIndex = &string[i * 2];
-		char byte[3] = { startIndex[0], startIndex[1], 0 };
+		size_t idx = i * 2;
+		char byte[3] = { string[idx], string[idx + 1], 0 };
 
-		retval[i] = strtoul(byte, nullptr, 16);
+		std::from_chars(&byte[0], &byte[2], retval[i], 16);
 	}
 
 	return retval;
 }
 
+DeltaEntry::DeltaEntry(std::string_view fromChecksum, std::string_view toChecksum, const std::string& remoteFile, uint64_t dlSize)
+	: fromChecksum(ParseHexString<20>(fromChecksum)), toChecksum(ParseHexString<20>(toChecksum)), remoteFile(remoteFile), dlSize(dlSize)
+{
+}
+
 static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 {
 	// create the cache directory if needed
-	CreateDirectory(MakeRelativeCitPath(L"cache").c_str(), nullptr);
-	CreateDirectory(MakeRelativeCitPath(L"cache\\game").c_str(), nullptr);
+	CreateDirectory(MakeRelativeCitPath(L"data").c_str(), nullptr);
+	CreateDirectory(MakeRelativeCitPath(L"data\\game-storage").c_str(), nullptr);
 
 	// output buffer
 	std::vector<GameCacheStorageEntry> cacheStorage;
@@ -325,9 +516,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 	// iterate over files in cache
 	WIN32_FIND_DATA findData;
 
-	HANDLE hFind = FindFirstFile(MakeRelativeCitPath(L"cache\\game\\*.*").c_str(), &findData);
-
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
+	HANDLE hFind = FindFirstFile(MakeRelativeCitPath(L"data\\game-storage\\*.*").c_str(), &findData);
 
 	if (hFind != INVALID_HANDLE_VALUE)
 	{
@@ -337,7 +526,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 			std::string fileName;
 			std::string fileHash;
 
-			if (ParseCacheFileName(converter.to_bytes(findData.cFileName).c_str(), fileName, fileHash))
+			if (ParseCacheFileName(ToNarrow(findData.cFileName).c_str(), fileName, fileHash))
 			{
 				// add the entry, if so
 				LARGE_INTEGER quadTime;
@@ -359,7 +548,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 
 	// load on-disk storage as well
 	{
-		if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"rb"))
+		if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"rb"))
 		{
 			// get file length
 			int length;
@@ -383,6 +572,7 @@ static std::vector<GameCacheStorageEntry> LoadCacheStorage()
 	return cacheStorage;
 }
 
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
 static std::vector<GameCacheEntry> CompareCacheDifferences()
 {
 	// load the cache storage from disk
@@ -410,8 +600,11 @@ static std::vector<GameCacheEntry> CompareCacheDifferences()
 
 					if (GetFileAttributes(cacheFileName.c_str()) == INVALID_FILE_ATTRIBUTES && (GetFileAttributes(entry.GetLocalFileName().c_str()) == INVALID_FILE_ATTRIBUTES || strncmp(entry.remotePath, "nope:", 5) != 0))
 					{
-						// as it doesn't add to the list
-						retval.push_back(entry);
+						if (entry.localSize != 0)
+						{
+							// as it doesn't add to the list
+							retval.push_back(entry);
+						}
 					}
 
 					found = true;
@@ -429,7 +622,33 @@ static std::vector<GameCacheEntry> CompareCacheDifferences()
 		// if no entry was found, add to the list as well
 		if (!found)
 		{
-			retval.push_back(entry);
+			if (entry.IsPrimitiveFile())
+			{
+				auto fileHandle = CreateFileW(entry.GetCacheFileName().c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+				if (fileHandle != INVALID_HANDLE_VALUE && fileHandle != 0)
+				{
+					LARGE_INTEGER fs;
+					GetFileSizeEx(fileHandle, &fs);
+
+					if (fs.QuadPart == entry.localSize)
+					{
+						found = true;
+					}
+
+					CloseHandle(fileHandle);
+				}
+			}
+
+			if (entry.localSize == 0)
+			{
+				found = true;
+			}
+
+			if (!found)
+			{
+				retval.push_back(entry);
+			}
 		}
 	}
 
@@ -442,6 +661,10 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::string& 
 
 #include <commctrl.h>
 
+#if defined(COMPILING_GLUE)
+extern void TaskDialogEmulated(TASKDIALOGCONFIG* config, int* button, void*, void*);
+#endif
+
 static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry, bool>>& entries)
 {
 	// iterate over the entries
@@ -451,12 +674,15 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 
 	bool shouldAllow = true;
 
+	std::string badEntries;
 	for (auto& entry : entries)
 	{
 		// is the file allowed?
 		if (_strnicmp(entry.first.remotePath, "nope:", 5) == 0)
 		{
 			shouldAllow = false;
+			badEntries += entry.first.filename;
+			badEntries += "\n";
 		}
 
 		// if it's a local file...
@@ -471,6 +697,8 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 			if (entry.first.remoteSize == SIZE_MAX)
 			{
 				shouldAllow = false;
+				badEntries += entry.first.filename;
+				badEntries += "\n";
 			}
 
 			remoteSize += entry.first.remoteSize;
@@ -492,13 +720,13 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 	taskDialogConfig.hInstance = GetModuleHandle(nullptr);
 	taskDialogConfig.dwFlags = TDF_EXPAND_FOOTER_AREA;
 	taskDialogConfig.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
-	taskDialogConfig.pszWindowTitle = L"FiveM: Game cache outdated";
+	taskDialogConfig.pszWindowTitle = PRODUCT_NAME L": Game data outdated";
 	taskDialogConfig.pszMainIcon = TD_INFORMATION_ICON;
-	taskDialogConfig.pszMainInstruction = L"FiveM needs to update the game cache";
+	taskDialogConfig.pszMainInstruction = PRODUCT_NAME L" needs to update the local game data";
 
 	if (shouldAllow)
 	{
-		taskDialogConfig.pszContent = va(L"The local FiveM game cache is outdated, and needs to be updated. This will copy %.2f MB of data from the local disk, and download %.2f MB of data from the internet.\nDo you wish to continue?", (localSize / 1024.0 / 1024.0), (remoteSize / 1024.0 / 1024.0));
+		taskDialogConfig.pszContent = va(gettext(L"The local %s game data is outdated, and needs to be updated. This will copy %.2f MB of data from the local disk, and download %.2f MB of data from the internet.\nDo you wish to continue?"), PRODUCT_NAME, (localSize / 1024.0 / 1024.0), (remoteSize / 1024.0 / 1024.0));
 	}
 	else
 	{
@@ -506,7 +734,10 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 			{ 42, L"Close" }
 		};
 
-		taskDialogConfig.pszContent = va(L"DLC files are missing (or corrupted) in your game installation. Please update or verify the game using Steam or the Social Club launcher and try again. See http://rsg.ms/verify step 4 for more info.");
+		std::wstring badEntriesWide = ToWide(badEntries);
+
+		taskDialogConfig.pszMainInstruction = L"Game files missing";
+		taskDialogConfig.pszContent = va(gettext(L"DLC files are missing (or corrupted) in your game installation. Please update or verify the game using Steam, Epic Games Launcher or Rockstar Games Launcher and try again. See http://rsg.ms/verify step 4 for more info.\nCurrently, the game installation in '%s' is being used.\nRelevant files: \n%s"), MakeRelativeGamePath(L""), badEntriesWide.c_str());
 
 		taskDialogConfig.cButtons = 1;
 		taskDialogConfig.dwCommonButtons = 0;
@@ -528,15 +759,24 @@ static bool ShowDownloadNotification(const std::vector<std::pair<GameCacheEntry,
 
 	int outButton;
 
+#if defined(COMPILING_GLUE)
+	TaskDialogEmulated(&taskDialogConfig, &outButton, nullptr, nullptr);
+#else
 	TaskDialogIndirect(&taskDialogConfig, &outButton, nullptr, nullptr);
+#endif
 
 	return (outButton != IDNO && outButton != 42);
 }
+
+extern void StartIPFS();
+
+#include "ZlibDecompressPlugin.h"
 
 static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 {
 	// create UI
 	UI_DoCreation();
+	CL_InitDownloadQueue();
 
 	// hash local files for those that *do* exist, add those that don't match to the download queue and add those that do match to be copied locally
 	std::set<std::string> referencedFiles; // remote URLs that we already requested
@@ -560,6 +800,9 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		}
 	}
 
+	bool hadIpfsFile = false;
+	std::vector<std::tuple<DeltaEntry, GameCacheEntry>> theseDeltas;
+
 	for (auto& entry : entries)
 	{
 		// check if the file is outdated
@@ -569,13 +812,21 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		{
 			hashes.push_back(ParseHexString<20>(checksum));
 		}
+
+		const auto& deltaEntries = entry.deltas;
+
+		for (auto& deltaEntry : deltaEntries)
+		{
+			hashes.push_back(deltaEntry.fromChecksum);
+		}
 		
 		std::array<uint8_t, 20> outHash;
 		bool fileOutdated = false;
 		
 		if (_strnicmp(entry.remotePath, "nope:", 5) != 0)
 		{
-			UI_UpdateText(0, L"Verifying GTA content...");
+			// does *not* start with nope: (manual download)
+			UI_UpdateText(0, gettext(L"Verifying game content...").c_str());
 
 			fileOutdated = CheckFileOutdatedWithUI(entry.GetLocalFileName().c_str(), hashes, &fileStart, fileTotal, &outHash);
 		}
@@ -616,15 +867,14 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			}
 		}
 
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-
 		// if not, copy it from the local filesystem (we're abusing the download code here a lot)
 		if (!fileOutdated)
 		{
 			// should we 'nope' this file?
 			if (_strnicmp(entry.remotePath, "nope:", 5) == 0)
 			{
-				if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"ab"))
+				// *does* start with nope:
+				if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"ab"))
 				{
 					auto hash = outHash;
 
@@ -639,9 +889,39 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			}
 			else
 			{
-				CL_QueueDownload(va("file:///%s", converter.to_bytes(entry.GetLocalFileName()).c_str()), converter.to_bytes(entry.GetCacheFileName()).c_str(), entry.localSize, false);
+				if (outHash == hashes[0])
+				{
+					std::string escapedUrl;
 
-				notificationEntries.push_back({ entry, true });
+					{
+						auto curl = curl_easy_init();
+
+						char* escapedUrlRaw = curl_easy_escape(curl, ToNarrow(entry.GetLocalFileName()).c_str(), 0);
+						escapedUrl = escapedUrlRaw;
+
+						curl_free(escapedUrlRaw);
+						curl_easy_cleanup(curl);
+					}
+
+					CL_QueueDownload(va("file:///%s", escapedUrl), ToNarrow(entry.GetCacheFileName()).c_str(), entry.localSize, compressionAlgo_e::None);
+
+					notificationEntries.push_back({ entry, true });
+				}
+				else
+				{
+					for (auto& deltaEntry : deltaEntries)
+					{
+						if (outHash == deltaEntry.fromChecksum)
+						{
+							CL_QueueDownload(deltaEntry.remoteFile.c_str(), ToNarrow(deltaEntry.GetLocalFileName()).c_str(), deltaEntry.dlSize, compressionAlgo_e::None);
+
+							notificationEntries.push_back({ deltaEntry.MakeEntry(), false });
+							theseDeltas.emplace_back(deltaEntry, entry);
+
+							break;
+						}
+					}
+				}
 			}
 		}
 		else
@@ -650,24 +930,32 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 			if (referencedFiles.find(entry.remotePath) == referencedFiles.end())
 			{
 				// download it from the rockstar service
-				std::string localFileName = (entry.archivedFile) ? converter.to_bytes(entry.GetRemoteBaseName()) : converter.to_bytes(entry.GetCacheFileName());
+				std::string localFileName = (entry.archivedFile) ? ToNarrow(entry.GetRemoteBaseName()) : ToNarrow(entry.GetCacheFileName());
 				const char* remotePath = entry.remotePath;
 
-				if (_strnicmp(remotePath, "http", 4) != 0)
+				if (_strnicmp(remotePath, "http", 4) != 0 && _strnicmp(remotePath, "ipfs", 4) != 0)
 				{
 					remotePath = va("rockstar:%s", entry.remotePath);
 				}
 
 				// if the file isn't of the original size
-				CL_QueueDownload(remotePath, localFileName.c_str(), entry.remoteSize, false);
+				CL_QueueDownload(remotePath, localFileName.c_str(), entry.remoteSize, ((entry.remoteSize != entry.localSize && !entry.archivedFile) ? compressionAlgo_e::XZ : compressionAlgo_e::None));
+
+				if (strncmp(remotePath, "ipfs://", 7) == 0)
+				{
+					hadIpfsFile = true;
+				}
 
 				referencedFiles.insert(entry.remotePath);
 
 				notificationEntries.push_back({ entry, false });
 			}
 
-			// if we want an archived file from here, we should *likely* note its existence
-			extractedEntries.push_back(entry);
+			if (entry.archivedFile && strlen(entry.archivedFile) > 0)
+			{
+				// if we want an archived file from here, we should *likely* note its existence
+				extractedEntries.push_back(entry);
+			}
 		}
 	}
 
@@ -686,7 +974,24 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		return true;
 	}
 
-	UI_UpdateText(0, L"Updating game cache...");
+	// start IPFS
+	std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+
+	bool ipfsPeer = true;
+
+	if (GetFileAttributes(fpath.c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		ipfsPeer = (GetPrivateProfileInt(L"Game", L"DisableIPFSPeer", 0, fpath.c_str()) != 1);
+	}
+
+	static HostSharedData<CfxState> initState("CfxInitState");
+
+	if (ipfsPeer && initState->IsMasterProcess() && hadIpfsFile)
+	{
+		StartIPFS();
+	}
+
+	UI_UpdateText(0, gettext(L"Updating game storage...").c_str());
 
 	bool retval = DL_RunLoop();
 
@@ -698,6 +1003,136 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 		{
 			return strcmp(left.remotePath, right.remotePath) < 0;
 		});
+
+		// apply deltas
+		if (!theseDeltas.empty())
+		{
+			for (auto& [ deltaEntry, entry ] : theseDeltas)
+			{
+				if (retval)
+				{
+					hpatch_TStreamInput oldFile;
+					hpatch_TStreamInput deltaFile;
+					hpatch_TStreamOutput outFile;
+
+					auto openRead = [](hpatch_TStreamInput* entry, const std::wstring& fn) 
+					{
+						entry->streamImport = nullptr;
+						FILE* f = _wfopen(fn.c_str(), L"rb");
+
+						if (!f)
+						{
+							return false;
+						}
+
+						fseek(f, 0, SEEK_END);
+						entry->streamImport = (void*)f;
+						entry->streamSize = ftell(f);
+
+						entry->read = [](const hpatch_TStreamInput* entry, hpatch_StreamPos_t at, uint8_t* begin, uint8_t* end) -> hpatch_BOOL {
+							auto size = end - begin;
+
+							FILE* f = (FILE*)entry->streamImport;
+							fseek(f, at, SEEK_SET);
+
+							return (fread(begin, 1, size, f) == size);
+						};
+
+						return true;
+					};
+
+					UI_UpdateText(1, va(L"Patching %s", ToWide(entry.filename)));
+
+					auto outSize = entry.localSize;
+
+					auto openWrite = [outSize](hpatch_TStreamOutput* entry, const std::wstring& fn)
+					{
+						entry->streamImport = nullptr;
+						FILE* f = _wfopen(fn.c_str(), L"wb");
+
+						if (!f)
+						{
+							return false;
+						}
+
+						entry->streamImport = (void*)f;
+						entry->streamSize = outSize;
+						entry->read_writed = NULL;
+
+						static uint64_t numWritten;
+						numWritten = 0;
+
+						entry->write = [](const hpatch_TStreamOutput* entry, hpatch_StreamPos_t at, const uint8_t* begin, const uint8_t* end) -> hpatch_BOOL
+						{
+							auto size = end - begin;
+
+							FILE* f = (FILE*)entry->streamImport;
+							fseek(f, at, SEEK_SET);
+
+							numWritten += size;
+
+							static auto ticks = 0;
+
+							if ((ticks % 400) == 0)
+							{
+								UI_UpdateProgress((numWritten / (double)entry->streamSize) * 100.0);
+
+								MSG msg;
+
+								// poll message loop
+								while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+								{
+									TranslateMessage(&msg);
+									DispatchMessage(&msg);
+								}
+							}
+
+							ticks++;
+
+							return (fwrite(begin, 1, size, f) == size);
+						};
+
+						return true;
+					};
+
+					auto doClose = [](auto* entry) 
+					{
+						if (entry->streamImport)
+						{
+							fclose((FILE*)entry->streamImport);
+							entry->streamImport = nullptr;
+						}
+					};
+
+					auto theFile = entry.GetCacheFileName();
+					auto tmpFile = theFile + L".tmp";
+
+					retval = retval && openRead(&oldFile, entry.GetLocalFileName());
+					retval = retval && openRead(&deltaFile, deltaEntry.GetLocalFileName());
+					retval = retval && openWrite(&outFile, tmpFile);
+
+					retval = retval && patch_decompress(&outFile, &oldFile, &deltaFile, &zlibDecompressPlugin);
+
+					doClose(&oldFile);
+					doClose(&deltaFile);
+					doClose(&outFile);
+
+					if (retval)
+					{
+						_wunlink(theFile.c_str());
+						_wrename(tmpFile.c_str(), theFile.c_str());
+					}
+					else
+					{
+						UI_DisplayError(va(L"Could not patch %s. Do you have enough free disk space on all drives? (~2 GB)", ToWide(entry.filename)));
+
+						_wunlink(tmpFile.c_str());
+					}
+
+					_wunlink(deltaEntry.GetLocalFileName().c_str());
+				}
+			}
+		}
 
 		// batch up entries per archive
 		if (!extractedEntries.empty())
@@ -714,7 +1149,6 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 				if (lastArchive != entry.remotePath)
 				{
 					// process each entry
-					//retval = retval && ExtractInstallerFile(entry.GetRemoteBaseName(), entry.archivedFile, entry.GetCacheFileName());
 					retval = retval && ExtractInstallerFile(lastEntries[0].GetRemoteBaseName(), [&] (const InstallerInterface& interface)
 					{
 						// scan for a section
@@ -731,7 +1165,6 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 
 						// process the section
 						std::wstring currentDirectory;
-						std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
 						auto processFile = [&] (const ::entry& entry)
 						{
@@ -773,7 +1206,7 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 							// find an entry (slow linear search, what'chagonnado'aboutit?)
 							for (auto& dlEntry : lastEntries)
 							{
-								if (_wcsicmp(converter.from_bytes(dlEntry.archivedFile).c_str(), fileName.c_str()) == 0)
+								if (_wcsicmp(ToWide(dlEntry.archivedFile).c_str(), fileName.c_str()) == 0)
 								{
 									if (foundHashes.find(dlEntry.checksums[0]) == foundHashes.end())
 									{
@@ -834,7 +1267,7 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 					// append entries to cache storage if it succeeded
 					if (retval)
 					{
-						if (FILE* f = _wfopen(MakeRelativeCitPath(L"cache\\game\\cache.dat").c_str(), L"ab"))
+						if (FILE* f = _wfopen(MakeRelativeCitPath(L"data\\game-storage\\game_files.dat").c_str(), L"ab"))
 						{
 							for (auto& entry : lastEntries)
 							{
@@ -876,13 +1309,230 @@ static bool PerformUpdate(const std::vector<GameCacheEntry>& entries)
 
 	return true;
 }
+#endif
+
+#include <CrossBuildRuntime.h>
+
+#if defined(COMPILING_GLUE)
+extern int gameCacheTargetBuild;
+
+template<int Build>
+bool IsTargetGameBuild()
+{
+	return (gameCacheTargetBuild == Build);
+}
+
+template<int Build>
+bool IsTargetGameBuildOrGreater()
+{
+	return (gameCacheTargetBuild >= Build);
+}
+#else
+template<int Build>
+bool IsTargetGameBuild()
+{
+	return xbr::IsGameBuild<Build>();
+}
+
+template<int Build>
+bool IsTargetGameBuildOrGreater()
+{
+	return xbr::IsGameBuildOrGreater<Build>();
+}
+#endif
 
 std::map<std::string, std::string> UpdateGameCache()
 {
+#if defined(_M_AMD64)
+	std::vector<GameCacheEntry> launcherEntries;
+
+	launcherEntries = {
+		{ "launcher/api-ms-win-core-console-l1-1-0.dll", "724F4F91041AD595E365B724A0348C83ACF12BBB", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-console-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-datetime-l1-1-0.dll", "4940D5B92B6B80A40371F8DF073BF3EB406F5658", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-datetime-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-debug-l1-1-0.dll", "E7C8A6C29C3158F8B332EEA5C33C3B1E044B5F73", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-debug-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-errorhandling-l1-1-0.dll", "51CBB7BA47802DC630C2507750432C55F5979C27", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-errorhandling-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-file-l1-1-0.dll", "9ACBEEF0AC510C179B319CA69CD5378D0E70504D", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l1-1-0.dll", 22280 },
+		{ "launcher/api-ms-win-core-file-l1-2-0.dll", "04669214375B25E2DC8A3635484E6EEB206BC4EB", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l1-2-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-file-l2-1-0.dll", "402B7B8F8DCFD321B1D12FC85A1EE5137A5569B2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-file-l2-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-handle-l1-1-0.dll", "A2E2A40CEA25EA4FD64B8DEAF4FBE4A2DB94107A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-handle-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-heap-l1-1-0.dll", "B4310929CCB82DD3C3A779CAB68F1F9F368076F2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-heap-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-interlocked-l1-1-0.dll", "F779CDEF9DED19402AA72958085213D6671CA572", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-interlocked-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-libraryloader-l1-1-0.dll", "47143A66B4A2E2BA019BF1FD07BCCA9CFB8BB117", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-libraryloader-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-localization-l1-2-0.dll", "9874398548891F6A08FC06437996F84EB7495783", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-localization-l1-2-0.dll", 21256 },
+		{ "launcher/api-ms-win-core-memory-l1-1-0.dll", "9C03356CF48112563BB845479F40BF27B293E95E", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-memory-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-namedpipe-l1-1-0.dll", "CB59F1FE73C17446EB196FC0DD7D944A0CD9D81F", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-namedpipe-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-processenvironment-l1-1-0.dll", "2745259F4DBBEFBF6B570EE36D224ABDB18719BC", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processenvironment-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-processthreads-l1-1-0.dll", "50699041060D14576ED7BACBD44BE9AF80EB902A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processthreads-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-core-processthreads-l1-1-1.dll", "0BFFB9ED366853E7019452644D26E8E8F236241B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-processthreads-l1-1-1.dll", 19208 },
+		{ "launcher/api-ms-win-core-profile-l1-1-0.dll", "E7E0B18A40A35BD8B0766AC72253DE827432E148", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-profile-l1-1-0.dll", 18184 },
+		{ "launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", "24F37D46DFC0EF303EF04ABF9956241AF55D25C9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-rtlsupport-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-string-l1-1-0.dll", "637E4A9946691F76E6DEB69BDC21C210921D6F07", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-string-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-core-synch-l1-1-0.dll", "5584C189216A17228CCA6CD07037AAA9A8603241", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-synch-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-core-synch-l1-2-0.dll", "A9AEBBBB73B7B846B051325D7572F2398F5986EE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-synch-l1-2-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-sysinfo-l1-1-0.dll", "F20AE25484A1C1B43748A1F0C422F48F092AD2C1", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-sysinfo-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-core-timezone-l1-1-0.dll", "4BF13DB65943E708690D6256D7DDD421CC1CC72B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-timezone-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-core-util-l1-1-0.dll", "1E1A5AB47E4C2B3C32C81690B94954B7612BB493", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-core-util-l1-1-0.dll", 18696 },
+		{ "launcher/api-ms-win-crt-conio-l1-1-0.dll", "49002B58CB0DF2EE8D868DEC335133CF225657DF", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-conio-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-convert-l1-1-0.dll", "C84E41FDCC4CA89A76AE683CB390A9B86500D3CA", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-convert-l1-1-0.dll", 22792 },
+		{ "launcher/api-ms-win-crt-environment-l1-1-0.dll", "9A4818897251CACB7FE1C6FE1BE3E854985186AD", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-environment-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-crt-filesystem-l1-1-0.dll", "78FA03C89EA12FF93FA499C38673039CC2D55D40", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-filesystem-l1-1-0.dll", 20744 },
+		{ "launcher/api-ms-win-crt-heap-l1-1-0.dll", "60B4CF246C5F414FC1CD12F506C41A1043D473EE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-heap-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-locale-l1-1-0.dll", "9C1DF49A8DBDC8496AC6057F886F5C17B2C39E3E", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-locale-l1-1-0.dll", 19208 },
+		{ "launcher/api-ms-win-crt-math-l1-1-0.dll", "8B35EC4676BD96C2C4508DC5F98CA471B22DEED7", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-math-l1-1-0.dll", 27912 },
+		{ "launcher/api-ms-win-crt-multibyte-l1-1-0.dll", "91EEF52C557AEFD0FDE27E8DF4E3C3B7F99862F2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-multibyte-l1-1-0.dll", 26888 },
+		{ "launcher/api-ms-win-crt-private-l1-1-0.dll", "0C33CFE40EDD278A692C2E73E941184FD24286D9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-private-l1-1-0.dll", 71432 },
+		{ "launcher/api-ms-win-crt-process-l1-1-0.dll", "EC96F7BEEAEC14D3B6C437B97B4A18A365534B9B", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-process-l1-1-0.dll", 19720 },
+		{ "launcher/api-ms-win-crt-runtime-l1-1-0.dll", "A19ACEFA3F95D1B565650FDBC40EF98C793358E9", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-runtime-l1-1-0.dll", 23304 },
+		{ "launcher/api-ms-win-crt-stdio-l1-1-0.dll", "982B5DA1C1F5B9D74AF6243885BCBA605D54DF8C", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-stdio-l1-1-0.dll", 24840 },
+		{ "launcher/api-ms-win-crt-string-l1-1-0.dll", "7F389E6F2D6E5BEB2A3BAF622A0C0EA24BC4DE60", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-string-l1-1-0.dll", 24840 },
+		{ "launcher/api-ms-win-crt-time-l1-1-0.dll", "EE815A158BAACB357D9E074C0755B6F6C286B625", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-time-l1-1-0.dll", 21256 },
+		{ "launcher/api-ms-win-crt-utility-l1-1-0.dll", "EAA07829D012206AC55FB1AF5CC6A35F341D22BE", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/api-ms-win-crt-utility-l1-1-0.dll", 19208 },
+		{ "launcher/Launcher.exe", "F259DE45C50F399D3E278FD39401EF51A3CC031A", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/Launcher.exe", 48490288 },
+		{ "launcher/Launcher.rpf", "237682874D921209CDBDB16E257C65A9480BAD94", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/Launcher.rpf", 858112 },
+		{ "launcher/LauncherPatcher.exe", "BFD3A153979C2CED11F6F8BFDBE767AD502F4655", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/LauncherPatcher.exe", 508208 },
+		{ "launcher/mtl_libovr.dll", "0FF4CEDA9DE3B63C4DE6E1626009D5ED5A475C96", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/mtl_libovr.dll", 178584 },
+		{ "launcher/offline.pak", "53F93E488AA5482C187641CE85164F7C5A1ED8B2", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/offline.pak", 1597382 },
+		{ "launcher/RockstarService.exe", "FCA2A3393CEDB7DE49C6ABAD69F2ACC7354DFD66", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/RockstarService.exe", 2017072 },
+		{ "launcher/RockstarSteamHelper.exe", "8E10781C248612A0F00A2BBFA828FC110978E751", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/RockstarSteamHelper.exe", 1063216 },
+		{ "launcher/ucrtbase.dll", "4189F4459C54E69C6D3155A82524BDA7549A75A6", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ucrtbase.dll", 1016584 },
+		{ "launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping-1.13.1.dll", "9176F6D58E46153342D7B065D279636DF8298603", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping-1.13.1.dll", 23390688 },
+		{ "launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", "AF01787DDB7DE00239EDC62D33E0B20C0BE80037", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Epic/EOSSDK-Win64-Shipping.dll", 9971968 },
+		{ "launcher/ThirdParty/Steam/steam_api64.dll", "BD014660F7978A07BA2F99B6CF0621D678602663", "https://content.cfx.re/mirrors/mtl/1.0.53.576/launcher/ThirdParty/Steam/steam_api64.dll", 121256 }, 
+	};
+
+	for (const auto& entry : launcherEntries)
+	{
+		g_requiredEntries.push_back(entry);
+	}
+#endif
+
+#if defined(COMPILING_GLUE)
+	g_requiredEntries.clear();
+#endif
+
+	// 1604/1868 toggle
+#ifdef GTA_FIVE
+	if (Is372())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "ae6e9cc116e8435e4dcfb5b870deee00a8b0904c", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_372_2.exe", "$/GTA5.exe", 55559560, 399999536 });
+		g_requiredEntries.push_back({ "update/update.rpf", "b72884c9af7170908f558ec5d629d805857b80f2", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_372_2.exe", "$/update/update.rpf", 352569344, 399999536 });
+	}
+	else if (IsTargetGameBuild<2545>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "517556bb548880362c18d502361ce374070994c2", "https://content.cfx.re/mirrors/patches/2545.0/GTA5.exe", 59988376 });
+		g_requiredEntries.push_back({ "update/update.rpf", "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "https://content.cfx.re/mirrors/patches/2545.0/update.rpf", 1366638592 });
+	}
+	else if (IsTargetGameBuild<2372>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "470235e04299b02aa3aef834ef1ff834cac2327f", "https://content.cfx.re/mirrors/patches/2372.0/GTA5.exe", 59716912 });
+		g_requiredEntries.push_back({ "update/update.rpf", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches/2372.0/update.rpf", 1132066816,
+		{
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "1824cdbc27c3e0eaa86920a38751322727872831", "https://content.cfx.re/mirrors/patches/2545_2372_update.hdiff", 276106385 },
+		} });
+	}
+	else if (IsTargetGameBuild<2189>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "fcd5fd8a9f99f2e08b0cab5d500740f28a75b75a", "https://content.cfx.re/mirrors/patches/2189.0/GTA5.exe", 63124096 });
+		g_requiredEntries.push_back({ "update/update.rpf", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches/2189.0/update.rpf", 1276805120,
+		{
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches/2545_2189_update.hdiff", 441617306 },
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches/2372_2189_update.hdiff", 429153146 },
+			{ "748d16b81a34ad317b93cd85e2b088dabdce5cc7", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches/2245_2189_update.hdiff", 193145914 },
+			{ "36c5c94274602527f946497553e118d72500c09f", "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "https://content.cfx.re/mirrors/patches/2215_2189_update.hdiff", 21294688 },	
+		} });
+	}
+	else if (IsTargetGameBuild<2060>())
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "741c8b91ef57140c023d8d29e38aab599759de76", "https://content.cfx.re/mirrors/patches/2060.2/GTA5.exe", 60589184 });
+		g_requiredEntries.push_back({ "update/update.rpf", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2060.2/update.rpf", 1229002752,
+		{
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2545_2060_update.hdiff", 438194552 },
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2372_2060_update.hdiff", 427205591 },
+			{ "748d16b81a34ad317b93cd85e2b088dabdce5cc7", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2245_2060_update.hdiff", 249407832 },
+			{ "36c5c94274602527f946497553e118d72500c09f", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2215_2060_update.hdiff", 249407861 },
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2189_2060_update.rpf.hdiff", 249363428 },
+			{ "2d9756564bece80205165a724536b2fce731c600", "736f1cb26e59167f302c22385463d231cce302d3", "https://content.cfx.re/mirrors/patches/2060_1_2060_update.rpf.hdiff", 799273 },
+		} });
+	}
+	else
+	{
+		g_requiredEntries.push_back({ "GTA5.exe", "8939c8c71aa98ad7ca6ac773fae1463763c420d8", "https://content.cfx.re/mirrors/patches/1604.0/GTA5.exe", 72484280 });
+		g_requiredEntries.push_back({ "update/update.rpf", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://runtime.fivem.net/patches/GTA_V_Patch_1_0_1604_0.exe", "$/update/update.rpf", 966805504, 1031302600,
+		{
+			{ "2993b3c30f61cbbb8dbce859604d7fb717ff8dae", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2545_1604_update.hdiff", 409505316 },
+			{ "1824cdbc27c3e0eaa86920a38751322727872831", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2372_1604_update.hdiff", 400087270 },
+			{ "748d16b81a34ad317b93cd85e2b088dabdce5cc7", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2245_1604_update.hdiff", 255586706 },
+			{ "36c5c94274602527f946497553e118d72500c09f", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2215_1604_update.hdiff", 255586724 },
+			{ "fe387dbc0f700d690b53d44ce1226c624c24b8fc", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2189_1604_update.rpf.hdiff", 257064151 },
+			{ "2d9756564bece80205165a724536b2fce731c600", "fc941d698834e30e40a06a40f6a35b1b18e1c50c", "https://content.cfx.re/mirrors/patches/2060_1_1604_update.rpf.hdiff", 252578172 },
+		} });
+	}
+
+	if (IsTargetGameBuildOrGreater<2060>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsum/dlc.rpf", "ffd81a2ce5741b38eae69e47132ddbfc5cfdf9f4", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 980621312 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2189>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpheist4/dlc.rpf", "1ddd73a584126793478c835efef9899a1c9d6fe7", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3452489728 });
+
+		// 2215.0 DLC update
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/patchday24ng/dlc.rpf", "f1d3a69dc31f50dd7741dfe5495568af40da4191", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 384018432 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2372>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mptuner/dlc.rpf", "7a7521b3396701f4fe8ae51347c6206c46306648", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 3482869760 });
+	}
+
+	if (IsTargetGameBuildOrGreater<2545>())
+	{
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsecurity/dlc.rpf", "27c8100da2537472ad012df036a95da08188d54a", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1978963968 });
+		g_requiredEntries.push_back({ "update/x64/dlcpacks/mpsecurity/dlc1.rpf", "82f34009966d790a2987c70a2872a5658a71f198", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 1308874752 });
+	}
+#elif IS_RDR3
+	// 1311/1355/1436 toggle
+	if (IsTargetGameBuild<1436>())
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "5c474d04c0d8e8f0573be31ec015da2d54e27ff9", "ipfs://bafybeignxmbrmkhzkpvupziem6qpm33lm27xku6ag4pmzsafyo2fcksgg4", 89849752 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "a3721e37521597daec336ee7872e45fb9b286bab", "ipfs://bafybeie2ge4mwttdhaneydf2ylsn3tp2bfwmon3rd34j5lo4zjepbfpub4", 3164575 });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "d5c4b9b845165a473da344d2b29ac5546b3f2b50", "ipfs://bafybeialsn5kxkokbfdz6odouazfntw6y3abvf2qylge3gwlhtortsuvlm", 233898030 });
+		g_requiredEntries.push_back({ "update_1.rpf", "77a30e21b549048a6186f337a6cd6ad6699d460d", "ipfs://bafybeid36os6iw26laqzau3lfe23zfkk42dzsy4o65jln2yneetvrxmcsu", 2836982634 });
+		g_requiredEntries.push_back({ "update_2.rpf", "3550ce534b2997306ae1bc13fc3abeec4573389f", "ipfs://bafybeiaum2y7k6gzsde2xwlstdidcp5vyb6vyqgl5djkwjpb4uesvz2fde", 152008462 });
+		g_requiredEntries.push_back({ "update_3.rpf", "a2d3a0e6908b2834b6fd204e6de89e63788d927a", "ipfs://bafybeibhenxfkjsie7knqxrlk6bflhh57qbf7lrs7wr5f47kiavcfnt7mq", 132374108 });
+		g_requiredEntries.push_back({ "update_4.rpf", "39ca2bbb7a0ab8d8e09288ca8783b91654c9b91b", "ipfs://bafybeiefr5ayhajox2zcfwrkjvhoqt7c4ebcfiaxr3grjtrtvefd4en3fy", 2014659811 });
+	}
+	else if (IsTargetGameBuild<1355>())
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "c2fab1d25daef4779aafd2754ec9c593e674e7c3", "ipfs://bafybeigcudahnyogfbavh2fldp5irtm3jxvseysqyarkgibf75wcsmxo4i", 84664448 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "307609c164e78adaf4e50e993328485e6264803f", "ipfs://bafybeieesm4cgypcfesnlr4n3q5ruxbjywarnarq75bso77nu6chapktbu", 3069247 });
+		g_requiredEntries.push_back({ "update.rpf", "5a087ef32e6b30b4fde8bbeda7babc45f2c1cf4d", "ipfs://bafybeie4roojrcitremf2mdsavxqkzjhwmtbj5la3lkr5wreexaybq7q4e", 4685758145 });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "a7a45988a6067964214cc4b3af21797249817469", "ipfs://bafybeib2dprijqsp7xoauqsueboj4xs7kmxiwy4m4uksw2zlgp6w63zqne", 233487310 });
+	}
+	else
+	{
+		g_requiredEntries.push_back({ "RDR2.exe", "ac3c2abd80bfa949279d8e1d32105a3d9345c6c8", "ipfs://bafybeihtqz54b4or4xxqyvrih5wi4il7ni72e7qxg6mtt2c47s6bbkgy4q", 91439232 });
+		g_requiredEntries.push_back({ "appdata0_update.rpf", "1715741785ce3c28adf9a78633e57f478229bb84", "ipfs://bafybeiapjt7ifvkqrtscmbgghgq2jz7ptpdxvvyqwcrxzqqoqolh45ybwq", 3003087 });
+		g_requiredEntries.push_back({ "update.rpf", "835a767055cfbf2c2ad86cf4462c7dfb931970fd", "ipfs://bafybeidgpk6as7ebr4sakax2cy5mulmjr6gbb32mj74i3apbfbjbeoi2ki", 3515071792 });
+		g_requiredEntries.push_back({ "shaders_x64.rpf", "77bad0ab74cd1ef7c646206ea12152449ec56cdf", "ipfs://bafybeia5ol2sjowvyfzyncn4wiyp5wtr6tdb6hlq3imbh4ed5v5hgll6jm", 233487310 });
+	}
+
+	if (IsTargetGameBuild<1355>())
+	{
+		g_requiredEntries.push_back({ "x64/dlcpacks/mp008/dlc.rpf", "66a50ed07293b92466423e1db5eed159551d8c25", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 487150980 });
+	}
+
+	if (IsTargetGameBuild<1436>())
+	{
+		g_requiredEntries.push_back({ "x64/dlcpacks/mp009/dlc.rpf", "7ae2012968709d6d1079c88ee40369f4359778bf", "nope:https://runtime.fivem.net/patches/dlcpacks/patchday4ng/dlc.rpfmpbiker/dlc.rpf", 494360763 });
+	}
+#endif
+
 	// delete bad migration on 2019-01-10 (incorrect update.rpf download URL caused Steam users to fetch 1493.1 instead of 1604.0)
 	{
-		auto dataPath = MakeRelativeCitPath(L"cache\\game\\cache.dat");
-		auto failPath = MakeRelativeCitPath(L"cache\\game\\update+update.rpf_fc941d698834e30e40a06a40f6a35b1b18e1c50c");
+		auto dataPath = MakeRelativeCitPath(L"data\\game-storage\\game_files.dat");
+		auto failPath = MakeRelativeCitPath(L"data\\game-storage\\update+update.rpf_fc941d698834e30e40a06a40f6a35b1b18e1c50c");
 
 		struct _stat64i32 statData;
 		if (_wstat(failPath.c_str(), &statData) == 0)
@@ -891,6 +1541,48 @@ std::map<std::string, std::string> UpdateGameCache()
 			{
 				_wunlink(failPath.c_str());
 				_wunlink(dataPath.c_str());
+			}
+		}
+	}
+
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
+	// check the game executable(s)
+	for (auto& entry : g_requiredEntries)
+	{
+		// if it's a root-directory .exe
+		if (entry.filename && strstr(entry.filename, ".exe") && !strstr(entry.filename, "/"))
+		{
+			auto cacheName = entry.GetCacheFileName();
+
+			if (auto f = _wfopen(cacheName.c_str(), L"rb"); f)
+			{
+				SHA_CTX ctx;
+				SHA1_Init(&ctx);
+
+				uint8_t buffer[32768];
+
+				while (!feof(f))
+				{
+					int read = fread(buffer, 1, sizeof(buffer), f);
+					assert(read >= 0);
+
+					SHA1_Update(&ctx, buffer, read);
+				}
+
+				fclose(f);
+
+				uint8_t hash[20];
+				SHA1_Final(hash, &ctx);
+
+				auto origCheck = ParseHexString<20>(entry.checksums[0]);
+				if (memcmp(hash, origCheck.data(), 20) != 0)
+				{
+					// delete both the cache metadata and the corrupted file itself
+					auto dataPath = MakeRelativeCitPath(L"data\\game-storage\\game_files.dat");
+
+					_wunlink(dataPath.c_str());
+					_wunlink(cacheName.c_str());
+				}
 			}
 		}
 	}
@@ -905,26 +1597,32 @@ std::map<std::string, std::string> UpdateGameCache()
 			return {};
 		}
 	}
+#endif
 
 	// get a list of cache files that should be mapped given an updated cache
 	std::map<std::string, std::string> retval;
-	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
 	for (auto& entry : g_requiredEntries)
 	{
 		std::string origFileName = entry.filename;
 
-		if (origFileName.find("ros_1241/") == 0)
+		if (origFileName.find("ros_") == 0)
 		{
-			origFileName = "Social Club/" + origFileName.substr(9);
+			origFileName = "Social Club/" + origFileName.substr(origFileName.find_first_of("/\\") + 1);
+		}
+
+		if (origFileName.find("launcher/") == 0)
+		{
+			origFileName = "Launcher/" + origFileName.substr(9);
 		}
 
 		if (GetFileAttributes(entry.GetCacheFileName().c_str()) != INVALID_FILE_ATTRIBUTES)
 		{
-			retval.insert({ origFileName, converter.to_bytes(entry.GetCacheFileName()) });
+			retval.insert({ origFileName, ToNarrow(entry.GetCacheFileName()) });
 		}
 	}
 
 	return retval;
 }
+#endif
 #endif

@@ -12,7 +12,10 @@
 		"citizen:scripting:core",
 		"nui:core",
 		"citizen:resources:client",
-		"net"
+		"net",
+		"voip:mumble",
+		"vendor:directxtex",
+		"vendor:im3d"
 	],
 	"provides": []
 }

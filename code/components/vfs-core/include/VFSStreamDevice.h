@@ -25,7 +25,7 @@ struct WritableStream {};
 struct LengthableStream {};
 struct BulkWritableStream {};
 
-namespace detail
+inline namespace detail
 {
 	template<typename StreamType>
 	struct HandleData
@@ -40,6 +40,26 @@ namespace detail
 		std::shared_ptr<StreamType> stream;
 		std::shared_ptr<BulkStreamType> bulkStream;
 		bool valid;
+	};
+
+	template<bool value>
+	struct GetLengthImpl
+	{
+		template<typename TStream>
+		static size_t GetLength(TStream* stream)
+		{
+			return -1;
+		}
+	};
+
+	template<>
+	struct GetLengthImpl<true>
+	{
+		template<typename TStream>
+		static size_t GetLength(TStream* stream)
+		{
+			return stream->GetLength();
+		}
 	};
 }
 
@@ -169,28 +189,6 @@ public:
 		return -1;
 	}
 
-protected:
-	template<bool value>
-	struct GetLengthImpl
-	{
-		template<typename TStream>
-		static size_t GetLength(TStream* stream)
-		{
-			return -1;
-		}
-	};
-
-	template<>
-	struct GetLengthImpl<true>
-	{
-		template<typename TStream>
-		static size_t GetLength(TStream* stream)
-		{
-			return stream->GetLength();
-		}
-	};
-
-public:
 	virtual size_t GetLength(THandle handle) override
 	{
 		auto data = GetHandle(handle);
@@ -239,6 +237,8 @@ public:
 protected:
 	HandleDataType* AllocateHandle(THandle* handle)
 	{
+		auto lock = AcquireMutex();
+
 		for (int i = 0; i < m_handles.size(); i++)
 		{
 			if (!m_handles[i].valid)
@@ -261,6 +261,8 @@ protected:
 
 	HandleDataType* GetHandle(THandle inHandle)
 	{
+		auto lock = AcquireMutex();
+
 		if (inHandle >= 0 && inHandle < m_handles.size())
 		{
 			if (m_handles[inHandle].valid)
@@ -275,13 +277,13 @@ protected:
 protected:
 	auto AcquireMutex()
 	{
-		return std::move(std::unique_lock<std::mutex>(m_mutex));
+		return std::move(std::unique_lock<std::recursive_mutex>(m_mutex));
 	}
 
 private:
 	std::deque<HandleDataType> m_handles;
 
-	std::mutex m_mutex;
+	std::recursive_mutex m_mutex;
 };
 
 template<class StreamType, class BulkType>

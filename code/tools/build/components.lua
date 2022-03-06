@@ -2,32 +2,6 @@
 local components = { }
 
 dependency = function(name)
-	-- find a matching component
-	--[[local cname
-
-	for _, c in ipairs(components) do
-		if c == name then
-			cname = c
-			break
-		else
-			local basename = c:gsub('(.+)-ny', '%1')
-
-			if basename == name then
-				cname = c
-				break
-			end
-		end
-	end
-
-	if not cname then
-		error("Component " .. name .. " seems unknown.")
-	end
-
-	includedirs { '../' .. name .. '/include/' }
-
-	links { name }]]
-
-	return
 end
 
 package.path = '?.lua'
@@ -59,6 +33,10 @@ component = function(name)
 		decoded.dummy = true
 	end
 
+	if _G.inPrivates then
+		decoded.private = true
+	end
+
 	-- check if the project name ends in a known game name, and if we should ignore it
 	for _, name in ipairs(gamenames) do
 		-- if it ends in the current game name...
@@ -84,6 +62,14 @@ end
 
 vendor_component = function(name)
 	local vendorTable = dofile(name .. '.lua')
+	
+	for k, repo in all_private_repos() do
+		local repoRel = path.getrelative(path.getabsolute(''), repo) .. '/vendor/' .. name .. '.lua'
+		
+		if os.isfile(repoRel) then
+			vendorTable = loadfile(repoRel)(vendorTable)
+		end
+	end
 
 	if vendorTable then
 		component {
@@ -136,8 +122,6 @@ local function process_dependencies(list, basename, deps, hasDeps)
 			local match = find_match(dep)
 
 			if match and not hasDeps[match.rawName] then
-				print(basename .. ' dependency on ' .. dep .. ' fulfilled by ' .. match.rawName)
-
 				hasDeps[match.rawName] = true
 				table.insert(deps, { dep = match.rawName, data = match })
 
@@ -176,18 +160,20 @@ add_dependencies = function(list)
 		local dep = v.dep
 		local data = v.data
 
+		filter {}
+
 		if not data.vendor or not data.vendor.dummy then
 			links { dep }
 		end
-
-		configuration {}
-		filter {}
+		
+		if not data.vendor then
+			includedirs { 'components/' .. dep .. '/include/' }
+		end
 
 		if data.vendor and data.vendor.include then
 			data.vendor.include()
 		end
 
-		configuration {}
 		filter {}
 
 		if data.vendor and data.vendor.depend then
@@ -216,13 +202,40 @@ local do_component = function(name, comp)
 	-- path stuff
 	local relPath = path.getrelative(path.getabsolute(''), comp.absPath)
 
-	-- set group depending on privateness
-	if comp.private then
-		group 'components/private'
-	else
-		group 'components'
+	-- set group depending on origin
+	local groupName = ''
+	local nonGameName = comp.name
+
+	-- prefix with a game name, if any
+	for _, gname in ipairs(gamenames) do
+		-- if it ends in the current game name...
+		if comp.name:ends(':' .. gname) then
+			groupName = '/' .. gname
+			nonGameName = comp.name:gsub(':' .. gname, '')
+			break
+		end
 	end
 
+	if groupName == '' then
+		groupName = '/common'
+	end
+
+	for val in nonGameName:gmatch('([^:]+):') do
+		groupName = groupName .. '/' .. val
+	end
+
+	-- hack: `net` breaks premake/.vs group generator
+	if comp.name == 'net' then
+		groupName = groupName .. '/net'
+	end
+
+	if comp.private then
+		groupName = '/private' .. groupName
+	end
+
+	group('components' .. groupName)
+
+	-- project itself
 	project(name)
 
 	language "C++"
@@ -270,7 +283,7 @@ local do_component = function(name, comp)
 	links { "Shared", "fmtlib" }
 
 	-- HACKHACK: premake doesn't allow unsetting these
-	if name ~= 'adhesive' then
+	if name ~= 'adhesive' and name ~= 'legacy-game-re3' and name ~= 'fxdk-main' then
 		pchsource "client/common/StdInc.cpp"
 		pchheader "StdInc.h"
 	end
@@ -280,7 +293,7 @@ local do_component = function(name, comp)
 		local dep = v.dep
 		local data = v.data
 
-		configuration {}
+		filter {}
 
 		if not data.vendor or not data.vendor.dummy then
 			links { dep }
@@ -295,15 +308,32 @@ local do_component = function(name, comp)
 		end
 	end
 
-	configuration {}
+	_G._ROOTPATH = path.getabsolute('.')
+
+	filter {}
 	local postCb = dofile(comp.absPath .. '/component.lua')
+	local postCbs = {}
+	
+	table.insert(postCbs, postCb)
+	
+	filter {}
+	if not comp.private then
+		for k, repo in all_private_repos() do
+			local repoRel = path.getrelative(path.getabsolute(''), repo) .. '/components/' .. name .. '/component_override.lua'
+			
+			if os.isfile(repoRel) then
+				postCb = dofile(repoRel)
+				table.insert(postCbs, postCb)
+			end
+		end
+	end
 
 	-- loop again in case a previous file has set a configuration constraint
 	for k, v in ipairs(deps) do
 		local dep = v.dep
 		local data = v.data
 
-		configuration {}
+		filter {}
 
 		if data.vendor then
 			if data.vendor.depend then
@@ -314,14 +344,14 @@ local do_component = function(name, comp)
 		end
 	end
 
-	configuration "windows"
+	filter { "system:windows" }
 		buildoptions "/MP"
 
 		files {
 			relPath .. "/component.rc",
 		}
 
-	configuration "not windows"
+	filter { "system:not windows" }
 		files {
 			relPath .. "/component.json"
 		}
@@ -340,8 +370,10 @@ local do_component = function(name, comp)
 	filter()
 		vpaths { ["z/*"] = relPath .. "/component.rc" }
 		
-	if postCb then
-		postCb()
+	for _, v in ipairs(postCbs) do
+		if v then
+			v()
+		end
 	end
 
 	if not _OPTIONS['tests'] then

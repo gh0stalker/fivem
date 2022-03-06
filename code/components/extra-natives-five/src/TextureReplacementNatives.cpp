@@ -6,11 +6,15 @@
 #include <Streaming.h>
 #include <DrawCommands.h>
 
+#include <GameInit.h>
+#include <unordered_set>
+
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
 
 #define RAGE_FORMATS_IN_GAME
 #include <gtaDrawable.h>
+#include <fragType.h>
 
 rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 {
@@ -18,11 +22,11 @@ rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 	auto txdStore = streaming->moduleMgr.GetStreamingModule("ytd");
 
 	uint32_t id = -1;
-	txdStore->GetIndexByName(&id, txd.c_str());
+	txdStore->FindSlot(&id, txd.c_str());
 
 	if (id != 0xFFFFFFFF)
 	{
-		auto txdRef = (rage::five::pgDictionary<rage::grcTexture>*)txdStore->GetAssetPointer(id);
+		auto txdRef = (rage::five::pgDictionary<rage::grcTexture>*)txdStore->GetPtr(id);
 
 		if (txdRef)
 		{
@@ -30,8 +34,40 @@ rage::grcTexture* LookupTexture(const std::string& txd, const std::string& txn)
 		}
 	}
 
+	auto drbStore = streaming->moduleMgr.GetStreamingModule("ydr");
+
+	id = -1;
+	drbStore->FindSlot(&id, txd.c_str());
+
+	if (id != 0xFFFFFFFF)
+	{
+		auto txdRef = (rage::five::gtaDrawable*)drbStore->GetPtr(id);
+
+		if (txdRef && txdRef->GetShaderGroup() && txdRef->GetShaderGroup()->GetTextures())
+		{
+			return (rage::grcTexture*)txdRef->GetShaderGroup()->GetTextures()->Get(txn.c_str());
+		}
+	}
+
+	auto fragStore = streaming->moduleMgr.GetStreamingModule("yft");
+
+	id = -1;
+	fragStore->FindSlot(&id, txd.c_str());
+
+	if (id != 0xFFFFFFFF)
+	{
+		auto txdRef = (rage::five::fragType*)fragStore->GetPtr(id);
+
+		if (txdRef && txdRef->GetPrimaryDrawable() && txdRef->GetPrimaryDrawable()->GetShaderGroup() && txdRef->GetPrimaryDrawable()->GetShaderGroup()->GetTextures())
+		{
+			return (rage::grcTexture*)txdRef->GetPrimaryDrawable()->GetShaderGroup()->GetTextures()->Get(txn.c_str());
+		}
+	}
+
 	return nullptr;
 }
+
+static std::unordered_set<rage::grcTexture*> texturesToRemove;
 
 static InitFunction initFunction([]()
 {
@@ -51,6 +87,7 @@ static InitFunction initFunction([]()
 			return;
 		}
 
+		texturesToRemove.insert(origTexture);
 		AddTextureOverride(origTexture, newTexture);
 	});
 
@@ -67,6 +104,17 @@ static InitFunction initFunction([]()
 			return;
 		}
 
+		texturesToRemove.erase(origTexture);
 		RemoveTextureOverride(origTexture);
+	});
+
+	OnKillNetworkDone.Connect([]()
+	{
+		for (auto texture : texturesToRemove)
+		{
+			RemoveTextureOverride(texture);
+		}
+
+		texturesToRemove.clear();
 	});
 });

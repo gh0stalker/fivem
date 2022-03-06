@@ -17,15 +17,18 @@ namespace CitizenFX.Core
 	class InternalManager : MarshalByRefObject, InternalManagerInterface
 	{
 		private static readonly List<BaseScript> ms_definedScripts = new List<BaseScript>();
-		private static readonly List<Tuple<DateTime, AsyncCallback>> ms_delays = new List<Tuple<DateTime, AsyncCallback>>();
+		private static readonly List<Tuple<DateTime, AsyncCallback, string>> ms_delays = new List<Tuple<DateTime, AsyncCallback, string>>();
 		private static int ms_instanceId;
+		private static bool ms_useSyncContext;
 
 		private string m_resourceName;
 
 		public static IScriptHost ScriptHost { get; internal set; }
 
 		// actually, domain-global
-		private static InternalManager GlobalManager { get; set; }
+		internal static InternalManager GlobalManager { get; set; }
+
+		internal string ResourceName => m_resourceName;
 
 		[SecuritySafeCritical]
 		public InternalManager()
@@ -66,6 +69,11 @@ namespace CitizenFX.Core
 		public void SetResourceName(string resourceName)
 		{
 			m_resourceName = resourceName;
+		}
+
+		public void SetConfiguration(bool useSyncContext)
+		{
+			ms_useSyncContext = useSyncContext;
 		}
 
 		[SecuritySafeCritical]
@@ -125,7 +133,21 @@ namespace CitizenFX.Core
 
 			ms_loadedAssemblies[assemblyFile] = assembly;
 
-			var definedTypes = assembly.GetTypes().Where(t => !t.IsAbstract && t.IsSubclassOf(typeof(BaseScript)) && t.GetConstructor(Type.EmptyTypes) != null);
+			Func<Type, bool> typesPredicate = t =>
+				t != null && !t.IsAbstract && t.IsSubclassOf(typeof(BaseScript)) && t.GetConstructor(Type.EmptyTypes) != null;
+
+			// We have ClientScript and ServerScript defined only in the respective environments.
+			// Handle type load exceptions and keep going.
+			// See https://stackoverflow.com/a/11915414
+			IEnumerable<Type> definedTypes;
+			try
+			{
+				definedTypes = assembly.GetTypes().Where(typesPredicate);
+			}
+			catch (ReflectionTypeLoadException e)
+			{
+				definedTypes = e.Types.Where(typesPredicate);
+			}
 
 			foreach (var type in definedTypes)
 			{
@@ -260,9 +282,9 @@ namespace CitizenFX.Core
 			return LoadAssemblyInternal(args.Name.Split(',')[0], useSearchPaths: true);
 		}
 
-		public static void AddDelay(int delay, AsyncCallback callback)
+		public static void AddDelay(int delay, AsyncCallback callback, string name = null)
 		{
-			ms_delays.Add(Tuple.Create(DateTime.UtcNow.AddMilliseconds(delay), callback));
+			ms_delays.Add(Tuple.Create(DateTime.UtcNow.AddMilliseconds(delay), callback, name));
 		}
 
 		public static void TickGlobal()
@@ -273,6 +295,8 @@ namespace CitizenFX.Core
 		[SecuritySafeCritical]
 		public void Tick()
 		{
+			IsProfiling = ProfilerIsRecording();
+
 			if (GameInterface.SnapshotStackBoundary(out var b))
 			{
 				ScriptHost.SubmitBoundaryStart(b, b.Length);
@@ -280,28 +304,63 @@ namespace CitizenFX.Core
 
 			try
 			{
-				ScriptContext.GlobalCleanUp();
-
-				var delays = ms_delays.ToArray();
-				var now = DateTime.UtcNow;
-
-				foreach (var delay in delays)
+				using (var scope = new ProfilerScope(() => "c# cleanup"))
 				{
-					if (now >= delay.Item1)
-					{
-						delay.Item2(new DummyAsyncResult());
+					ScriptContext.GlobalCleanUp();
+				}
 
-						ms_delays.Remove(delay);
+				using (var scope = new ProfilerScope(() => "c# deferredDelay"))
+				{
+					var now = DateTime.UtcNow;
+					var count = ms_delays.Count;
+
+					for (int delayIdx = 0; delayIdx < count; delayIdx++)
+					{
+						var delay = ms_delays[delayIdx];
+
+						if (now >= delay.Item1)
+						{
+							using (var inScope = new ProfilerScope(() => delay.Item3))
+							{
+								try
+								{
+									BaseScript.CurrentName = delay.Item3;
+									delay.Item2(new DummyAsyncResult());
+								}
+								finally
+								{
+									BaseScript.CurrentName = null;
+								}
+							}
+
+							ms_delays.RemoveAt(delayIdx);
+							delayIdx--;
+							count--;
+						}
 					}
 				}
 
-				foreach (var script in ms_definedScripts.ToArray())
+				using (var scope = new ProfilerScope(() => "c# schedule"))
 				{
-					script.ScheduleRun();
+					var flowBlock = CitizenTaskScheduler.SuppressFlow();
+
+					foreach (var script in ms_definedScripts.ToArray())
+					{
+						script.ScheduleRun();
+					}
+
+					flowBlock?.Undo();
 				}
 
-				CitizenTaskScheduler.Instance.Tick();
-				CitizenSynchronizationContext.Tick();
+				using (var scope = new ProfilerScope(() => "c# tasks"))
+				{
+					CitizenTaskScheduler.Instance.Tick();
+				}
+
+				using (var scope = new ProfilerScope(() => "c# syncCtx"))
+				{
+					CitizenSynchronizationContext.Tick();
+				}
 			}
 			catch (Exception e)
 			{
@@ -313,47 +372,89 @@ namespace CitizenFX.Core
 			}
 		}
 
+		private class SyncContextScope : IDisposable
+		{
+			private static SynchronizationContext citizenContext = new CitizenSynchronizationContext();
+			private SynchronizationContext oldContext;
+
+			public SyncContextScope()
+			{
+				if (ms_useSyncContext)
+				{
+					oldContext = SynchronizationContext.Current;
+					SynchronizationContext.SetSynchronizationContext(citizenContext);
+				}
+			}
+
+			public void Dispose()
+			{
+				if (oldContext != null)
+				{
+					SynchronizationContext.SetSynchronizationContext(oldContext);
+				}
+			}
+		}
+
 		[SecuritySafeCritical]
 		public void TriggerEvent(string eventName, byte[] argsSerialized, string sourceString)
 		{
-			if (GameInterface.SnapshotStackBoundary(out var bo))
+			// not using using statements here as old Mono on Linux build doesn't know of these
+#if IS_FXSERVER
+			using (var syncContext = new SyncContextScope())
+#endif
 			{
-				ScriptHost.SubmitBoundaryStart(bo, bo.Length);
-			}
-
-			try
-			{
-				var obj = MsgPackDeserializer.Deserialize(argsSerialized, netSource: (sourceString.StartsWith("net") ? sourceString : null)) as List<object> ?? (IEnumerable<object>)new object[0];
-
-				var scripts = ms_definedScripts.ToArray();
-
-				var objArray = obj.ToArray();
-
-				NetworkFunctionManager.HandleEventTrigger(eventName, objArray, sourceString);
-
-				foreach (var script in scripts)
+				if (GameInterface.SnapshotStackBoundary(out var bo))
 				{
-					Task.Factory.StartNew(() => script.EventHandlers.Invoke(eventName, sourceString, objArray)).Unwrap().ContinueWith(a =>
-					{
-						if (a.IsFaulted)
-						{
-							Debug.WriteLine($"Error invoking event handlers for {eventName}: {a.Exception?.InnerExceptions.Aggregate("", (b, s) => s + b.ToString() + "\n")}");
-						}
-					});
+					ScriptHost.SubmitBoundaryStart(bo, bo.Length);
 				}
 
-				ExportDictionary.Invoke(eventName, objArray);
+				try
+				{
+#if IS_FXSERVER
+					var netSource = (sourceString.StartsWith("net") || sourceString.StartsWith("internal-net")) ? sourceString : null;
+#else
+					var netSource = sourceString.StartsWith("net") ? sourceString : null;
+#endif
 
-				// invoke a single task tick
-				CitizenTaskScheduler.Instance.Tick();
-			}
-			catch (Exception e)
-			{
-				PrintError($"event ({eventName})", e);
-			}
-			finally
-			{
-				ScriptHost.SubmitBoundaryStart(null, 0);
+					var obj = MsgPackDeserializer.Deserialize(argsSerialized, netSource) as List<object> ?? (IEnumerable<object>)new object[0];
+
+					var scripts = ms_definedScripts.ToArray();
+
+					var objArray = obj.ToArray();
+
+					NetworkFunctionManager.HandleEventTrigger(eventName, objArray, sourceString);
+
+					foreach (var script in scripts)
+					{
+						Task.Factory.StartNew(() =>
+						{
+							BaseScript.CurrentName = $"eventHandler {script.GetType().Name} -> {eventName}";
+							var t = script.EventHandlers.Invoke(eventName, sourceString, objArray);
+							BaseScript.CurrentName = null;
+
+							return t;
+						}, CancellationToken.None, TaskCreationOptions.None, CitizenTaskScheduler.Instance).Unwrap().ContinueWith(a =>
+						{
+							if (a.IsFaulted)
+							{
+								Debug.WriteLine($"Error invoking event handlers for {eventName}: {a.Exception?.InnerExceptions.Aggregate("", (b, s) => s + b.ToString() + "\n")}");
+							}
+						});
+					}
+
+					ExportDictionary.Invoke(eventName, objArray);
+
+					// invoke a single task tick
+					CitizenTaskScheduler.Instance.Tick();
+				}
+				catch (Exception e)
+				{
+					PrintError($"event ({eventName})", e);
+				}
+				finally
+				{
+					ScriptHost.SubmitBoundaryStart(null, 0);
+				}
 			}
 		}
 
@@ -374,46 +475,53 @@ namespace CitizenFX.Core
 		[SecuritySafeCritical]
 		public void CallRef(int refIndex, byte[] argsSerialized, out IntPtr retvalSerialized, out int retvalSize)
 		{
-			if (GameInterface.SnapshotStackBoundary(out var b))
+			// not using using statements here as old Mono on Linux build doesn't know of these
+#if IS_FXSERVER
+			using (var syncContext = new SyncContextScope())
+#endif
 			{
-				ScriptHost.SubmitBoundaryStart(b, b.Length);
-			}
 
-			try
-			{
-				var retvalData = FunctionReference.Invoke(refIndex, argsSerialized);
-
-				if (retvalData != null)
+				if (GameInterface.SnapshotStackBoundary(out var b))
 				{
-					if (m_retvalBuffer == IntPtr.Zero)
-					{
-						m_retvalBuffer = Marshal.AllocHGlobal(32768);
-						m_retvalBufferSize = 32768;
-					}
-
-					if (m_retvalBufferSize < retvalData.Length)
-					{
-						m_retvalBuffer = Marshal.ReAllocHGlobal(m_retvalBuffer, new IntPtr(retvalData.Length));
-						m_retvalBufferSize = retvalData.Length;
-					}
-
-					Marshal.Copy(retvalData, 0, m_retvalBuffer, retvalData.Length);
-
-					retvalSerialized = m_retvalBuffer;
-					retvalSize = retvalData.Length;
+					ScriptHost.SubmitBoundaryStart(b, b.Length);
 				}
-				else
+
+				try
+				{
+					var retvalData = FunctionReference.Invoke(refIndex, argsSerialized);
+
+					if (retvalData != null)
+					{
+						if (m_retvalBuffer == IntPtr.Zero)
+						{
+							m_retvalBuffer = Marshal.AllocHGlobal(32768);
+							m_retvalBufferSize = 32768;
+						}
+
+						if (m_retvalBufferSize < retvalData.Length)
+						{
+							m_retvalBuffer = Marshal.ReAllocHGlobal(m_retvalBuffer, new IntPtr(retvalData.Length));
+							m_retvalBufferSize = retvalData.Length;
+						}
+
+						Marshal.Copy(retvalData, 0, m_retvalBuffer, retvalData.Length);
+
+						retvalSerialized = m_retvalBuffer;
+						retvalSize = retvalData.Length;
+					}
+					else
+					{
+						retvalSerialized = IntPtr.Zero;
+						retvalSize = 0;
+					}
+				}
+				catch (Exception e)
 				{
 					retvalSerialized = IntPtr.Zero;
 					retvalSize = 0;
-				}
-			}
-			catch (Exception e)
-			{
-				retvalSerialized = IntPtr.Zero;
-				retvalSize = 0;
 
-				PrintError($"reference call", e.InnerException ?? e);
+					PrintError($"reference call", e.InnerException ?? e);
+				}
 			}
 		}
 
@@ -453,6 +561,11 @@ namespace CitizenFX.Core
 		public override object InitializeLifetimeService()
 		{
 			return null;
+		}
+
+		internal static void PrintErrorInternal(string where, Exception what)
+		{
+			GlobalManager?.PrintError(where, what);
 		}
 
 		[SecuritySafeCritical]
@@ -507,6 +620,7 @@ namespace CitizenFX.Core
 			private FastMethod<Action<IntPtr, IntPtr>> scriptTraceMethod;
 			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryStartMethod;
 			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryEndMethod;
+			private FastMethod<Func<IntPtr, IntPtr, int>> getLastErrorTextMethod;
 
 			[SecuritySafeCritical]
 			public DirectScriptHost(IntPtr hostPtr)
@@ -520,6 +634,7 @@ namespace CitizenFX.Core
 				scriptTraceMethod = new FastMethod<Action<IntPtr, IntPtr>>(nameof(scriptTraceMethod), hostPtr, 4);
 				submitBoundaryStartMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryStartMethod), hostPtr, 5);
 				submitBoundaryEndMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryEndMethod), hostPtr, 6);
+				getLastErrorTextMethod = new FastMethod<Func<IntPtr, IntPtr, int>>(nameof(getLastErrorTextMethod), hostPtr, 7);
 			}
 
 			[SecuritySafeCritical]
@@ -651,6 +766,72 @@ namespace CitizenFX.Core
 					method.method(hostPtr, new IntPtr(p), boundarySize);
 				}
 			}
+
+			[SecuritySafeCritical]
+			public IntPtr GetLastErrorText()
+			{
+				return GetLastErrorTextInternal();
+			}
+
+			[SecurityCritical]
+			private unsafe IntPtr GetLastErrorTextInternal()
+			{
+				IntPtr retVal = IntPtr.Zero;
+
+				try
+				{
+					IntPtr* retValRef = &retVal;
+
+					Marshal.ThrowExceptionForHR(getLastErrorTextMethod.method(hostPtr, new IntPtr(retValRef)));
+				}
+				finally
+				{
+
+				}
+
+				return retVal;
+			}
+		}
+
+		internal static bool ProfilerIsRecording()
+		{
+			return Native.API.ProfilerIsRecording();
+		}
+
+		internal static void ProfilerEnterScope(string scopeName)
+		{
+			Native.API.ProfilerEnterScope(scopeName);
+		}
+
+		internal static void ProfilerExitScope()
+		{
+			Native.API.ProfilerExitScope();
+		}
+
+		internal static bool IsProfiling { get; private set; }
+	}
+
+
+	internal class ProfilerScope : IDisposable
+	{
+		public ProfilerScope(Func<string> name)
+		{
+			if (!InternalManager.IsProfiling)
+			{
+				return;
+			}
+
+			InternalManager.ProfilerEnterScope(name() ?? "c# scope");
+		}
+
+		public void Dispose()
+		{
+			if (!InternalManager.IsProfiling)
+			{
+				return;
+			}
+
+			InternalManager.ProfilerExitScope();
 		}
 	}
 }

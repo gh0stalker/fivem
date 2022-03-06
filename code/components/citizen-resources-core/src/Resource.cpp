@@ -9,6 +9,8 @@
 #include <ResourceImpl.h>
 #include <ResourceManagerImpl.h>
 
+#include <DebugAlias.h>
+
 #include <ResourceMetaDataComponent.h>
 
 #include <Error.h>
@@ -21,7 +23,7 @@ ResourceImpl::ResourceImpl(const std::string& name, ResourceManagerImpl* manager
 	OnInitializeInstance(this);
 }
 
-bool ResourceImpl::LoadFrom(const std::string& rootPath)
+bool ResourceImpl::LoadFrom(const std::string& rootPath, std::string* errorState)
 {
 	fwRefContainer<ResourceMetaDataComponent> metaData = GetComponent<ResourceMetaDataComponent>();
 
@@ -35,6 +37,11 @@ bool ResourceImpl::LoadFrom(const std::string& rootPath)
 	if (retval)
 	{
 		trace("Resource loading for %s failed:\n%s\n", m_name.c_str(), retval->c_str());
+
+		if (errorState)
+		{
+			*errorState = *retval;
+		}
 	}
 
 	m_rootPath = rootPath;
@@ -119,14 +126,23 @@ bool ResourceImpl::Stop()
 	return true;
 }
 
-void ResourceImpl::Tick()
+void ResourceImpl::Run(std::function<void()>&& fn)
 {
 	if (m_state != ResourceState::Started)
 	{
 		return;
 	}
 
-	OnTick();
+	// save data in case we need to trace this back from dumps
+	char resourceNameBit[128];
+	memcpy(resourceNameBit, GetName().c_str(), std::min(std::size(resourceNameBit), GetName().length() + 1));
+	debug::Alias(resourceNameBit);
+
+	OnEnter();
+	fn();
+
+	// #TODO: unwind-dtor
+	OnLeave();
 }
 
 void ResourceImpl::Destroy()

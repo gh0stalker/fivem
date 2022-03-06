@@ -12,11 +12,19 @@
 #include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_unordered_set.h>
 
+#include "ResourceMetaDataComponent.h"
+
+#ifdef COMPILING_CITIZEN_SCRIPTING_CORE
+#define SCRIPTING_CORE_EXPORT DLL_EXPORT
+#else
+#define SCRIPTING_CORE_EXPORT DLL_IMPORT
+#endif
+
 namespace fx
 {
 class Resource;
 
-class ResourceScriptingComponent : public fwRefCountable
+class ResourceScriptingComponent final : public fwRefCountable
 {
 private:
 	Resource* m_resource;
@@ -25,12 +33,13 @@ private:
 
 	tbb::concurrent_unordered_map<int32_t, fx::OMPtr<IScriptRuntime>> m_scriptRuntimes;
 
-	tbb::concurrent_unordered_map<int32_t, fx::OMPtr<IScriptTickRuntime>> m_tickRuntimes;
+	std::unordered_map<int32_t, fx::OMPtr<IScriptTickRuntime>> m_tickRuntimes;
 
 	tbb::concurrent_unordered_set<std::string> m_eventsHandled;
 
 private:
 	void CreateEnvironments();
+	void CreateEmptyEnvironments();
 
 public:
 	ResourceScriptingComponent(Resource* resource);
@@ -79,7 +88,102 @@ public:
 	{
 		m_eventsHandled.insert(eventName);
 	}
+
+	SCRIPTING_CORE_EXPORT void Tick();
+};
+
+class ScriptMetaDataComponent : public OMClass<ScriptMetaDataComponent, IScriptHostWithResourceData, IScriptHostWithManifest>
+{
+public:
+	// NS_DECL_ISCRIPTHOSTWITHRESOURCEDATA;
+
+	// NS_DECL_ISCRIPTHOSTWITHMANIFEST;
+
+private:
+	Resource* m_resource;
+
+public:
+	ScriptMetaDataComponent(Resource* resource)
+		: m_resource(resource)
+	{
+	}
+
+	result_t OM_DECL GetResourceName(char** outResourceName)
+	{
+		*outResourceName = const_cast<char*>(m_resource->GetName().c_str());
+		return FX_S_OK;
+	}
+
+	result_t OM_DECL GetNumResourceMetaData(char* fieldName, int32_t* numFields)
+	{
+		auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+
+		auto entries = metaData->GetEntries(fieldName);
+
+		*numFields = static_cast<int32_t>(std::distance(entries.begin(), entries.end()));
+
+		return FX_S_OK;
+	}
+
+	result_t OM_DECL GetResourceMetaData(char* fieldName, int32_t fieldIndex, char** fieldValue)
+	{
+		auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+
+		auto entries = metaData->GetEntries(fieldName);
+
+		// and loop over the entries to see if we find anything
+		int i = 0;
+
+		for (auto& entry : entries)
+		{
+			if (fieldIndex == i)
+			{
+				*fieldValue = const_cast<char*>(entry.second.c_str());
+				return FX_S_OK;
+			}
+
+			i++;
+		}
+
+		// return not-found
+		return 0x80070490;
+	}
+
+	result_t OM_DECL IsManifestVersionBetween(const guid_t& lowerBound, const guid_t& upperBound, bool* _retval)
+	{
+		// get the manifest version
+		auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+
+		auto retval = metaData->IsManifestVersionBetween(lowerBound, upperBound);
+
+		if (retval)
+		{
+			*_retval = *retval;
+
+			return FX_S_OK;
+		}
+
+		return FX_E_INVALIDARG;
+	}
+
+	result_t OM_DECL IsManifestVersionV2Between(char* lowerBound, char* upperBound, bool* _retval)
+	{
+		// get the manifest version
+		auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+
+		auto retval = metaData->IsManifestVersionBetween(lowerBound, upperBound);
+
+		if (retval)
+		{
+			*_retval = *retval;
+
+			return FX_S_OK;
+		}
+
+		return FX_E_INVALIDARG;
+	}
 };
 }
 
 DECLARE_INSTANCE_TYPE(fx::ResourceScriptingComponent);
+DECLARE_INSTANCE_TYPE(fx::ScriptMetaDataComponent);

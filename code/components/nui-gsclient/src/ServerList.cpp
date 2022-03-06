@@ -15,6 +15,7 @@
 #include <array>
 
 #include <CoreConsole.h>
+#include <InternalRPCHandler.h>
 
 #include <NetAddress.h> // net:base
 
@@ -24,6 +25,9 @@
 #include <fnv.h>
 
 #include <HttpClient.h>
+#include <windns.h>
+
+#pragma comment(lib, "dnsapi.lib")
 
 #if defined(GTA_NY)
 #define GS_GAMENAME "GTA4"
@@ -96,7 +100,7 @@ void RequestInfoBlob(const std::string& server, const TFunc& cb)
 				cb(sbuffer.GetString());
 
 				uint64_t infoBlobKey = fnv1a_t<8>()(server);
-				std::wstring blobPath = MakeRelativeCitPath(fmt::sprintf(L"cache\\servers\\%016llx.json", infoBlobKey));
+				std::wstring blobPath = MakeRelativeCitPath(fmt::sprintf(L"data\\cache\\servers\\%016llx.json", infoBlobKey));
 
 				FILE* blobFile = _wfopen(blobPath.c_str(), L"w");
 
@@ -114,7 +118,7 @@ template<typename TFunc>
 void LoadInfoBlob(const std::string& server, int expectedVersion, const TFunc& cb)
 {
 	uint64_t infoBlobKey = fnv1a_t<8>()(server);
-	std::wstring blobPath = MakeRelativeCitPath(fmt::sprintf(L"cache\\servers\\%016llx.json", infoBlobKey));
+	std::wstring blobPath = MakeRelativeCitPath(fmt::sprintf(L"data\\cache\\servers\\%016llx.json", infoBlobKey));
 	
 	FILE* blobFile = _wfopen(blobPath.c_str(), L"r");
 
@@ -156,6 +160,8 @@ struct gameserveritemext_t
 	bool responded;
 	bool queried;
 	std::string m_hostName;
+	std::string m_qa;
+	std::string m_attribution;
 	int m_clients;
 	int m_maxClients;
 	int m_ping;
@@ -168,7 +174,7 @@ static struct
 
 	// the list relies on sorting, so using a concurrent_unordered_map won't work
 	std::recursive_mutex serversMutex;
-	std::map<std::tuple<int, net::PeerAddress>, std::shared_ptr<gameserveritemext_t>> queryServers;
+	std::map<std::tuple<int, net::PeerAddress, std::string, std::string>, std::shared_ptr<gameserveritemext_t>> queryServers;
 	std::map<net::PeerAddress, std::shared_ptr<gameserveritemext_t>> servers;
 	DWORD lastQueryStep;
 
@@ -372,6 +378,12 @@ void replaceAll(std::string& str, const std::string& from, const std::string& to
 	}
 }
 
+static std::mutex g_queryArgMutex;
+static std::string g_queryArg;
+
+// the original query argument, used for correlation
+static std::string g_queryArgOrig;
+
 void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAddress& from)
 {
 	std::shared_ptr<gameserveritemext_t> server;
@@ -422,19 +434,26 @@ void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAd
 	std::string addressStr = server->m_Address.ToString();
 
 	const char* infoBlobVersionString = Info_ValueForKey(buffer, "iv");
+	bool isThisOneQuery = !server->m_qa.empty();
 
 	auto onLoadCB = [=](const std::string& infoBlobJson)
 	{
 		rapidjson::Document doc;
 		doc.Parse(infoBlobJson.c_str(), infoBlobJson.size());
 
-		bool isThisOneQuery = (g_cls.isOneQuery && from == g_cls.oneQueryAddress);
+		std::string host, port;
+
+		if (!server->m_qa.empty())
+		{
+			host = server->m_qa.substr(0, server->m_qa.find_last_of(':'));
+			port = server->m_qa.substr(server->m_qa.find_last_of(':') + 1);
+		}
 
 		if (!doc.HasParseError() && nui::HasFrame("mpMenu"))
 		{
 			nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "%s", "name": "%s",)"
 				R"("mapname": "%s", "gametype": "%s", "clients": "%d", "maxclients": %d, "ping": %d,)"
-				R"("addr": "%s", "infoBlob": %s })",
+				R"("addr": "%s", "infoBlob": %s, "address": "%s", "port": "%s", "queryCorrelation": "%s" })",
 				(isThisOneQuery) ? "serverQueried" : "serverAdd",
 				server->m_hostName,
 				mapname,
@@ -443,17 +462,14 @@ void GSClient_HandleInfoResponse(const char* bufferx, int len, const net::PeerAd
 				server->m_maxClients,
 				server->m_ping,
 				addressStr,
-				infoBlobJson));
-		}
-
-		if (isThisOneQuery)
-		{
-			g_cls.isOneQuery = false;
-			g_cls.oneQueryAddress = net::PeerAddress();
+				infoBlobJson,
+				host,
+				port,
+				server->m_attribution));
 		}
 	};
 
-	if (g_cls.isOneQuery && infoBlobVersionString && infoBlobVersionString[0])
+	if (isThisOneQuery && infoBlobVersionString && infoBlobVersionString[0])
 	{
 		std::string serverId = fmt::sprintf("%s", addressStr);
 		int infoBlobVersion = atoi(infoBlobVersionString);
@@ -503,7 +519,7 @@ void GSClient_PollSocket(SOCKET socket)
 
 			if (error != WSAEWOULDBLOCK)
 			{
-				trace("recv() failed - %d\n", error);
+				console::DPrintf("nui:gsclient", "recv() failed - %d\n", error);
 			}
 
 			return;
@@ -576,6 +592,8 @@ void GSClient_QueryAddresses(const TContainer& addrs)
 		auto server = std::make_shared<gameserveritemext_t>();
 		server->queried = false;
 		server->m_Address = std::get<net::PeerAddress>(na);
+		server->m_qa = std::get<2>(na);
+		server->m_attribution = std::get<3>(na);
 
 		std::unique_lock<std::recursive_mutex> lock(g_cls.serversMutex);
 		g_cls.queryServers[na] = server;
@@ -583,20 +601,219 @@ void GSClient_QueryAddresses(const TContainer& addrs)
 	}
 }
 
-void GSClient_QueryOneServer(const std::wstring& arg)
+static void ContinueLanQuery(const std::string& qarg, const std::string& attribution)
 {
-	auto peerAddress = net::PeerAddress::FromString(ToNarrow(arg));
+	auto peerAddress = net::PeerAddress::FromString(qarg);
 
 	if (peerAddress)
 	{
 		g_cls.isOneQuery = true;
 		g_cls.oneQueryAddress = peerAddress.get();
-		GSClient_QueryAddresses(std::vector<std::tuple<int, net::PeerAddress>>{ { 0, peerAddress.get() } });
+		GSClient_QueryAddresses(std::vector<std::tuple<int, net::PeerAddress, std::string, std::string>>{ { 0, peerAddress.get(), qarg, attribution } });
 	}
 	else
 	{
-		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "queryingFailed", "arg": "%s" })", ToNarrow(arg)));
+		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "queryingFailed", "arg": "%s" })", qarg));
 	}
+}
+
+static bool g_inLanQuery;
+
+void GSClient_QueryOneServer(const std::wstring& arg)
+{
+	auto narrowArg = ToNarrow(arg);
+
+	auto processQuery = [narrowArg](const std::string& url)
+	{
+		Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("%sdynamic.json", url), [url, narrowArg](bool success, const char* data, size_t size)
+		{
+			if (success)
+			{
+				std::string dynamicBlob{ data, size };
+
+				Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("%sinfo.json", url), [narrowArg, dynamicBlob](bool success, const char* data, size_t size)
+				{
+					if (success)
+					{
+						std::string infoBlobJson{ data, size };
+
+						rapidjson::Document dynDoc;
+						dynDoc.Parse(dynamicBlob.c_str(), dynamicBlob.size());
+
+						rapidjson::Document doc;
+						doc.Parse(infoBlobJson.c_str(), infoBlobJson.size());
+
+						if (!doc.HasParseError() && !dynDoc.HasParseError() && nui::HasFrame("mpMenu"))
+						{
+							std::string hostname = dynDoc["hostname"].GetString();
+							std::string mapname = dynDoc["mapname"].GetString();
+							std::string gametype = dynDoc["gametype"].GetString();
+
+							replaceAll(hostname, "\"", "\\\"");
+							replaceAll(mapname, "\"", "\\\"");
+							replaceAll(gametype, "\"", "\\\"");
+
+							nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "%s", "name": "%s",)"
+																		 R"("mapname": "%s", "gametype": "%s", "clients": "%d", "maxclients": %d, "ping": %d,)"
+																		 R"("addr": "%s", "infoBlob": %s, "queryCorrelation": "%s" })",
+															"serverQueried",
+															hostname,
+															mapname,
+															gametype,
+															dynDoc["clients"].GetInt(),
+															atoi(dynDoc["sv_maxclients"].GetString()),
+															42,
+															narrowArg,
+															infoBlobJson,
+															narrowArg));
+						}
+					}
+				});
+			}
+		});
+	};
+
+	if (narrowArg.find("cfx.re/join") != std::string::npos)
+	{
+		HttpRequestOptions ro;
+		ro.responseHeaders = std::make_shared<HttpHeaderList>();
+
+		Instance<HttpClient>::Get()->DoGetRequest(fmt::sprintf("https://%s", narrowArg.substr(0, narrowArg.find_last_of(':'))), ro, [ro, processQuery](bool success, const char* data, size_t callback)
+		{
+			if (success)
+			{
+				const auto& rh = *ro.responseHeaders;
+
+				if (auto it = rh.find("X-CitizenFX-Url"); it != rh.end() && it->second != "https://private-placeholder.cfx.re/")
+				{
+					auto url = it->second;
+
+					processQuery(url);
+				}
+			}
+		});
+
+		return;
+	}
+
+	if (narrowArg.find("https://") == 0)
+	{
+		processQuery(narrowArg + ((narrowArg[narrowArg.length() - 1] == '/') ? "" : "/"));
+		return;
+	}
+
+	if (narrowArg.find("localhost_sentinel") == 0)
+	{
+		if (g_inLanQuery)
+		{
+			return;
+		}
+
+		g_inLanQuery = true;
+
+		std::string qa;
+		std::string qao;
+
+		{
+			std::unique_lock _(g_queryArgMutex);
+			g_queryArg = "localhost" + narrowArg.substr(strlen("localhost_sentinel"));
+			g_queryArgOrig = narrowArg;
+
+			qa = g_queryArg;
+			qao = g_queryArgOrig;
+		}
+
+		// try hunting down a LAN server, maybe?
+		static auto dnslib = LoadLibraryW(L"dnsapi.dll");
+
+		if (dnslib)
+		{
+			static auto _DnsServiceBrowse = (decltype(&DnsServiceBrowse))GetProcAddress(dnslib, "DnsServiceBrowse");
+			static auto _DnsServiceBrowseCancel = (decltype(&DnsServiceBrowseCancel))GetProcAddress(dnslib, "DnsServiceBrowseCancel");
+
+			if (_DnsServiceBrowse)
+			{
+				static bool result = false;
+				result = false;
+
+				DNS_SERVICE_BROWSE_REQUEST request = { 0 };
+				request.Version = DNS_QUERY_REQUEST_VERSION1;
+				request.InterfaceIndex = 0;
+				request.QueryName = L"_cfx._udp.local";
+				request.pBrowseCallback = [](DWORD Status,
+										  PVOID pQueryContext,
+										  PDNS_RECORD pDnsRecord)
+				{
+					std::string qa, qao;
+
+					if (Status == ERROR_SUCCESS)
+					{
+						result = true;
+
+						if (pDnsRecord)
+						{
+							for (auto rec = pDnsRecord; rec; rec = rec->pNext)
+							{
+								if (rec->wType == DNS_TYPE_SRV)
+								{
+									{
+										std::unique_lock _(g_queryArgMutex);
+										qa = g_queryArg = fmt::sprintf("%s:%d", ToNarrow(rec->Data.Srv.pNameTarget), rec->Data.Srv.wPort);
+										qao = g_queryArgOrig;
+									}
+
+									ContinueLanQuery(qa, qao);
+									break;
+								}
+							}
+
+							DnsRecordListFree(pDnsRecord, DnsFreeRecordList);
+							return;
+						}
+					}
+
+					{
+						std::unique_lock _(g_queryArgMutex);
+						qa = g_queryArg;
+						qao = g_queryArgOrig;
+					}
+
+					ContinueLanQuery(qa, qao);
+				};
+
+				static DNS_SERVICE_CANCEL cancel;
+
+				if (_DnsServiceBrowse(&request, &cancel) == DNS_REQUEST_PENDING)
+				{
+					Sleep(2000);
+					g_inLanQuery = false;
+
+					_DnsServiceBrowseCancel(&cancel);
+
+					if (result)
+					{
+						return;
+					}
+				}
+			}
+		}
+
+		g_inLanQuery = false;
+
+		ContinueLanQuery(qa, qao);
+		return;
+	}
+
+	ContinueLanQuery(narrowArg, narrowArg);
+}
+
+DWORD WINAPI GSClient_QueryOneServerWrap(LPVOID ctx)
+{
+	auto str = (std::wstring*)ctx;
+	GSClient_QueryOneServer(*str);
+	delete str;
+
+	return 0;
 }
 
 void GSClient_Ping(const std::wstring& arg)
@@ -618,7 +835,7 @@ void GSClient_Ping(const std::wstring& arg)
 		return;
 	}
 
-	std::vector<std::tuple<int, net::PeerAddress>> addresses;
+	std::vector<std::tuple<int, net::PeerAddress, std::string, std::string>> addresses;
 
 	for (auto it = doc.Begin(); it != doc.End(); it++)
 	{
@@ -656,7 +873,7 @@ void GSClient_Ping(const std::wstring& arg)
 		auto port = portVal.GetInt();
 
 		auto netAddr = net::PeerAddress::FromString(addr, port);
-		addresses.push_back({ 1000 - weight, netAddr.get() });
+		addresses.push_back({ 1000 - weight, netAddr.get(), "", "" });
 	}
 
 	GSClient_QueryAddresses(addresses);
@@ -668,6 +885,11 @@ void GSClient_GetFavorites()
 	std::string json;
 	favFile >> json;
 	favFile.close();
+
+	if (json.empty())
+	{
+		json = "[]";
+	}
 
 	nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "getFavorites", "list": %s })", json));
 }
@@ -681,9 +903,104 @@ void GSClient_SaveFavorites(const wchar_t *json)
 
 static InitFunction initFunction([] ()
 {
+	nui::RPCHandlerManager* rpcHandlerManager = Instance<nui::RPCHandlerManager>::Get();
+	rpcHandlerManager->RegisterEndpoint("gsclient", [](std::string functionName, std::string arguments, std::map<std::string, std::string> postMap, nui::RPCHandlerManager::TCallbackFn cb)
+	{
+		if (!nui::HasMainUI())
+		{
+			cb("null");
+			return;
+		}
+
+		if (functionName == "url" || functionName == "dynamic")
+		{
+			auto urlEntry = postMap["url"];
+
+			struct Context
+			{
+				decltype(cb) cb;
+				decltype(urlEntry) url;
+				decltype(functionName) functionName;
+			};
+
+			QueueUserWorkItem([](LPVOID cxt) -> DWORD
+			{
+				auto c = (Context*)cxt;
+
+				// if not starting with 'http'
+				if (c->url.find("http") != 0)
+				{
+					auto peerAddress = net::PeerAddress::FromString(c->url, 30120, net::PeerAddress::LookupType::ResolveWithService);
+
+					if (peerAddress)
+					{
+						c->url = "https://" + peerAddress->ToString();
+					}
+				}
+
+				if (c->functionName == "dynamic")
+				{
+					c->url += "/dynamic.json";
+				}
+
+				// request it
+				HttpRequestOptions options;
+				auto rhl = std::make_shared<HttpHeaderList>();
+				options.responseHeaders = rhl;
+				options.followLocation = false;
+
+				Instance<HttpClient>::Get()->DoGetRequest(c->url, options, [rhl, c](bool success, const char* data, size_t length)
+				{
+					if (c->functionName == "dynamic")
+					{
+						auto cb = std::move(c->cb);
+						delete c;
+
+						if (success)
+						{
+							cb(std::string(data, length));
+						}
+						else
+						{
+							cb("null");
+						}
+
+						return;
+					}
+
+					auto cb = std::move(c->cb);
+					delete c;
+
+					if (auto it = rhl->find("location"); it != rhl->end())
+					{
+						if (it->second.find("https://cfx.re/join/") == 0)
+						{
+							cb(it->second.substr(20));
+						}
+						else
+						{
+							cb(it->second);
+						}
+
+						return;
+					}
+
+					cb("");
+				});
+
+				return 0;
+			},
+			new Context{ cb, urlEntry, functionName }, 0);
+
+			return;
+		}
+
+		cb("null");
+	});
+
 	ui_maxQueriesPerMinute = std::make_unique<ConVar<int>>("ui_maxQueriesPerMinute", ConVar_Archive, 5000);
 
-	CreateDirectory(MakeRelativeCitPath(L"cache\\servers\\").c_str(), nullptr);
+	CreateDirectory(MakeRelativeCitPath(L"data\\cache\\servers\\").c_str(), nullptr);
 
 	nui::OnInvokeNative.Connect([] (const wchar_t* type, const wchar_t* arg)
 	{
@@ -701,9 +1018,9 @@ static InitFunction initFunction([] ()
 
 		if (!_wcsicmp(type, L"queryServer"))
 		{
-			trace("Pinging specified server...\n");
+			console::DPrintf("nui:gsclient", "Pinging specified server...\n");
 
-			GSClient_QueryOneServer(arg);
+			QueueUserWorkItem(GSClient_QueryOneServerWrap, new std::wstring(arg), 0);
 		}
 
 		if (!_wcsicmp(type, L"getFavorites"))

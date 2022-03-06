@@ -23,7 +23,7 @@ void MumbleDataHandler::HandleCurrentPacket()
 
 	if (handler)
 	{
-		handler->HandleMessage(m_messageBuffer, m_totalBytes);
+		handler->HandleMessage(m_messageBuffer.get(), m_totalBytes);
 	}
 }
 
@@ -37,13 +37,17 @@ void MumbleDataHandler::HandleIncomingData(const uint8_t* data, size_t length)
 		// if this is a new 'packet'
 		if (m_readBytes == 0)
 		{
+			if (read < 6)
+			{
+				return;
+			}
+
 			const MumblePacketHeader* header = (const MumblePacketHeader*)origin;
 
-			m_readBytes = 0;
 			m_totalBytes = header->GetPacketLength();
 			m_messageType = header->GetPacketType();
 
-			m_messageBuffer = new uint8_t[m_totalBytes];
+			m_messageBuffer = std::unique_ptr<uint8_t[]>(new uint8_t[m_totalBytes]);
 
 			origin = &origin[sizeof(MumblePacketHeader)];
 			read -= sizeof(MumblePacketHeader);

@@ -17,6 +17,7 @@
 
 #include <HostSharedData.h>
 #include <CfxState.h>
+#include <UUIState.h>
 
 #include <Error.h>
 
@@ -135,56 +136,57 @@ int ReturnInt()
 	return Value;
 }
 
-static int CustomGameElementCall(char* element)
-{
-	static std::map<uint32_t, std::string> hashMap;
-
-	if (hashMap.size() == 0)
-	{
-		FILE* f = fopen("Y:\\dev\\v\\strings2.txt", "r");
-
-		if (f)
-		{
-			char stringBuf[4096];
-
-			while (!feof(f))
-			{
-				fgets(stringBuf, sizeof(stringBuf), f);
-				stringBuf[sizeof(stringBuf) - 1] = '\0';
-
-				stringBuf[strlen(stringBuf) - 2] = '\0';
-
-				hashMap[HashString(stringBuf)] = stringBuf;
-			}
-		}
-	}
-
-	uint32_t hash = *(uint32_t*)(element + 16);
-
-	std::string name;
-
-	auto it = hashMap.find(hash);
-
-	if (it != hashMap.end())
-	{
-		name = " - " + it->second;
-	}
-
-	trace("Entered game element %08x%s.\n", hash, name.c_str());
-
-	uintptr_t func = *(uintptr_t*)(element + 32);
-	int retval = ((int(*)())func)();
-
-	trace("Exited game element %08x%s.\n", hash, name.c_str());
-
-	return retval;
-}
-
 static void* DeleteVideo(void*, char* videoName)
 {
+	DWORD oldProtect;
+	VirtualProtect(videoName, 4, PAGE_READWRITE, &oldProtect);
 	strcpy(videoName, "nah");
 	return nullptr;
 }
+
+static void InitialGameHook()
+{
+	// ignore launcher requirement
+	// 1737 updated this for MTL
+	// and 1868 made it Arxan.
+	hook::call(hook::pattern("84 C0 75 0C B2 01 B9 2F A9 C2 F4").count(1).get(0).get<void>(-5), ThisIsActuallyLaunchery);
+
+	// ignore steam requirement
+	/*auto pattern = hook::pattern("FF 15 ? ? ? ? 84 C0 74 0C B2 01 B9 91 32 25");// 31 E8");
+	if (pattern.size() > 0)
+	{
+		hook::nop(pattern.get(0).get<void>(0), 6);
+		hook::put<uint8_t>(pattern.get(0).get<void>(8), 0xEB);
+	}*/
+
+	// ignore loading 'videos'
+	hook::call(hook::get_pattern("8B F8 48 85 C0 74 47 48 8B C8 E8 ? ? ? ? 4C", -6), DeleteVideo);
+	
+	// draw loading screen even if 'not' enabled
+	hook::nop(hook::get_pattern("85 DB 0F 84 ? ? ? ? 8B 05 ? ? ? ? A8 01 75 15 83", 2), 6);
+}
+#elif defined(IS_RDR3)
+static void* g_f;
+static char g_b[5];
+
+int ThisIsActuallyLaunchery()
+{
+	memcpy(g_f, g_b, 5);
+
+	return 1;
+}
+
+static void InitialGameHook()
+{
+	g_f = hook::get_call(hook::get_pattern("BA 99 CA D1 D1 B9 2F A9 C2 F4", -28));
+	memcpy(g_b, g_f, 5);
+	hook::jump(g_f, ThisIsActuallyLaunchery);
+}
+#else
+static void InitialGameHook()
+{
+}
+#endif
 
 bool g_ranStartupInfo;
 
@@ -203,34 +205,13 @@ VOID WINAPI GetStartupInfoWHook(_Out_ LPSTARTUPINFOW lpStartupInfo)
 
 	if (getenv("CitizenFX_ToolMode"))
 	{
-		auto plRoutine = (void(*)())GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "ToolMode_RunPostLaunchRoutine");
+		auto plRoutine = (void (*)())GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "ToolMode_RunPostLaunchRoutine");
 		plRoutine();
 
 		return;
 	}
 
-	// ignore launcher requirement
-	hook::call(hook::pattern("E8 ? ? ? ? 84 C0 75 ? B2 01 B9 2F A9 C2 F4").count(1).get(0).get<void>(), ThisIsActuallyLaunchery);
-
-	// ignore steam requirement
-	/*auto pattern = hook::pattern("FF 15 ? ? ? ? 84 C0 74 0C B2 01 B9 91 32 25");// 31 E8");
-	if (pattern.size() > 0)
-	{
-		hook::nop(pattern.get(0).get<void>(0), 6);
-		hook::put<uint8_t>(pattern.get(0).get<void>(8), 0xEB);
-	}*/
-
-	// ignore loading 'videos'
-	hook::call(hook::get_pattern("8B F8 48 85 C0 74 47 48 8B C8 E8 ? ? ? ? 4C", -6), DeleteVideo);
-	
-	// draw loading screen even if 'not' enabled
-	hook::nop(hook::get_pattern("0F 29 74 24 30 85 DB", 7), 6);
-
-	// game elements for crash handling purposes
-	char* vtablePtrLoc = hook::pattern("41 89 40 10 49 83 60 18 00 48 8D 05").count(1).get(0).get<char>(12);
-	void* vtablePtr = (void*)(*(int32_t*)vtablePtrLoc + vtablePtrLoc + 4);
-
-	//hook::put(&((uintptr_t*)vtablePtr)[1], CustomGameElementCall);
+	InitialGameHook();
 
 	if (!g_launcher->PostLoadGame(GetModuleHandle(nullptr), nullptr))
 	{
@@ -242,7 +223,6 @@ VOID WINAPI GetStartupInfoWHook(_Out_ LPSTARTUPINFOW lpStartupInfo)
 		ExitProcess(0);
 	}
 }
-#endif
 
 static LONG NTAPI HandleVariant(PEXCEPTION_POINTERS exceptionInfo)
 {
@@ -263,8 +243,8 @@ void CitizenGame::InvokeEntryPoint(void(*entryPoint)())
 	}
 }
 
-#ifdef GTA_FIVE
-static int NoWindowsHookExA(int, HOOKPROC, HINSTANCE, DWORD)
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
+static int WINAPI NoWindowsHookExA(int, HOOKPROC, HINSTANCE, DWORD)
 {
 	return 1;
 }
@@ -273,13 +253,11 @@ extern std::map<std::string, std::string> g_redirectionData;
 
 static std::wstring MapRedirectedFilename(const wchar_t* lpFileName)
 {
-	static std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-
 	// original filename with backslashes converted to slashes
 	std::wstring origFileName = lpFileName;
 	std::replace(origFileName.begin(), origFileName.end(), L'\\', L'/');
 
-	std::string fileName = converter.to_bytes(origFileName);
+	std::string fileName = ToNarrow(origFileName);
 
 	for (auto& redirectedPair : g_redirectionData)
 	{
@@ -292,7 +270,7 @@ static std::wstring MapRedirectedFilename(const wchar_t* lpFileName)
 			{
 				fileName = redirectedPair.second;
 
-				origFileName = converter.from_bytes(fileName);
+				origFileName = ToWide(fileName);
 
 				return origFileName;
 			}
@@ -302,31 +280,37 @@ static std::wstring MapRedirectedFilename(const wchar_t* lpFileName)
 	return lpFileName;
 }
 
-static HANDLE CreateFileWHook(_In_ LPCWSTR lpFileName, _In_ DWORD dwDesiredAccess, _In_ DWORD dwShareMode, _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes, _In_ DWORD dwCreationDisposition, _In_ DWORD dwFlagsAndAttributes, _In_opt_ HANDLE hTemplateFile)
+static HANDLE WINAPI CreateFileWHook(_In_ LPCWSTR lpFileName, _In_ DWORD dwDesiredAccess, _In_ DWORD dwShareMode, _In_opt_ LPSECURITY_ATTRIBUTES lpSecurityAttributes, _In_ DWORD dwCreationDisposition, _In_ DWORD dwFlagsAndAttributes, _In_opt_ HANDLE hTemplateFile)
 {
 	std::wstring fileName = MapRedirectedFilename(lpFileName);
 
 	return CreateFileW(fileName.c_str(), dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 }
 
-static DWORD GetFileAttributesWHook(_In_ LPCWSTR lpFileName)
+static DWORD WINAPI GetFileAttributesWHook(_In_ LPCWSTR lpFileName)
 {
 	std::wstring fileName = MapRedirectedFilename(lpFileName);
 
 	return GetFileAttributesW(fileName.c_str());
 }
 
-static BOOL GetFileAttributesExWHook(_In_ LPCWSTR lpFileName, _In_ GET_FILEEX_INFO_LEVELS fInfoLevelId, _Out_writes_bytes_(sizeof(WIN32_FILE_ATTRIBUTE_DATA)) LPVOID lpFileInformation)
+static BOOL WINAPI GetFileAttributesExWHook(_In_ LPCWSTR lpFileName, _In_ GET_FILEEX_INFO_LEVELS fInfoLevelId, _Out_writes_bytes_(sizeof(WIN32_FILE_ATTRIBUTE_DATA)) LPVOID lpFileInformation)
 {
 	std::wstring fileName = MapRedirectedFilename(lpFileName);
 
 	return GetFileAttributesExW(fileName.c_str(), fInfoLevelId, lpFileInformation);
 }
+#else
+static std::wstring MapRedirectedFilename(const wchar_t* lpFileName)
+{
+	return lpFileName;
+}
 #endif
 
 void CitizenGame::SetCoreMapping()
 {
-    auto CoreSetMappingFunction = (void(*)(wchar_t*(*)(const wchar_t*, void*(*)(size_t))))GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreSetMappingFunction");
+#ifndef IS_LAUNCHER
+	auto CoreSetMappingFunction = (void(*)(wchar_t*(*)(const wchar_t*, void*(*)(size_t))))GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreSetMappingFunction");
 
     if (CoreSetMappingFunction)
     {
@@ -340,33 +324,66 @@ void CitizenGame::SetCoreMapping()
             return outString;
         });
     }
+#endif
 }
+
+#include <sddl.h>
+#pragma comment(lib, "ntdll.lib")
 
 void AAD_Initialize()
 {
-#if defined(GTA_FIVE)
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 	// set BeingDebugged
 	PPEB peb = (PPEB)__readgsqword(0x60);
 	peb->BeingDebugged = false;
 
 	// set GlobalFlags
 	*(DWORD*)((char*)peb + 0xBC) &= ~0x70;
+#elif defined(GTA_NY)
+	// set BeingDebugged
+	PPEB peb = (PPEB)__readfsdword(0x30);
+	peb->BeingDebugged = false;
 
-	if (CoreIsDebuggerPresent())
-	{
-		// NOP OutputDebugStringA; the debugger doesn't like multiple async exceptions
-		uint8_t* func = (uint8_t*)OutputDebugStringA;
-
-		DWORD oldProtect;
-		VirtualProtect(func, 1, PAGE_EXECUTE_READWRITE, &oldProtect);
-
-		//*func = 0xC3;
-
-		VirtualProtect(func, 1, oldProtect, &oldProtect);
-	}
+	// set GlobalFlags
+	*(DWORD*)((char*)peb + 0x68) &= ~0x70;
 #endif
 
 	AddVectoredExceptionHandler(0, HandleVariant);
+}
+
+#include <psapi.h>
+
+BOOL EnumProcessModulesHook(
+	HANDLE  hProcess,
+	HMODULE* lphModule,
+	DWORD   cb,
+	LPDWORD lpcbNeeded
+)
+{
+	trace("enum modules\n");
+
+	return EnumProcessModules(hProcess, lphModule, cb, lpcbNeeded);
+}
+
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+static std::string g_minModeManifest;
+
+void CitizenGame::SetMinModeManifest(const std::string& manifest)
+{
+	g_minModeManifest = manifest;
+}
+
+inline void CoreSetMinModeManifest(const char* str)
+{
+	static void(*func)(const char*);
+
+	if (!func)
+	{
+		func = (void(*)(const char*))GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreSetMinModeManifest");
+	}
+
+	(func) ? func(str) : (void)0;
 }
 
 void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
@@ -383,12 +400,25 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 		return;
 	}
 
-	// force loading _this_ variant
-	LoadLibrary(MakeRelativeCitPath(L"scripthookv.dll").c_str());
+#ifdef GTA_FIVE
+	wchar_t moduleName[MAX_PATH];
+	GetModuleFileNameW(GetModuleHandleW(NULL), moduleName, std::size(moduleName));
+
+	// unless we're ChromeBrowser or ROSLauncher, try loading scripthookv.dll
+	if (wcsstr(moduleName, L"ChromeBrowser") == nullptr && wcsstr(moduleName, L"ROSLauncher") == nullptr)
+	{
+		// force loading _this_ variant
+		LoadLibrary(MakeRelativeCitPath(L"scripthookv.dll").c_str());
+	}
+#endif
 
 	CoreSetDebuggerPresent();
+	CoreSetMinModeManifest(g_minModeManifest.c_str());
 
-    SetCoreMapping();
+	if (!getenv("CitizenFX_ToolMode"))
+	{
+		SetCoreMapping();
+	}
 
 	InitializeMiniDumpOverride();
 
@@ -399,6 +429,10 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 	{
 		return;
 	}
+
+#ifdef GTA_NY
+	AAD_Initialize();
+#endif
 
 	ILauncherInterface* launcher = getLauncherInterface();
 
@@ -421,6 +455,7 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 		return;
 	}
 
+#ifdef LAUNCHER_PERSONALITY_GAME
 	// load the game executable data in temporary memory
 	FILE* gameFile = _wfopen(MapRedirectedFilename(gamePath.c_str()).c_str(), L"rb");
 	
@@ -446,15 +481,17 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 	fclose(gameFile);
 
 	// load the executable into our module context
-	HMODULE exeModule = GetModuleHandle(NULL);
+	HMODULE exeModule = (HMODULE)&__ImageBase;
 
 	ExecutableLoader exeLoader(data);
 #if defined(GTA_NY)
-	exeLoader.SetLoadLimit(0xF0D000);
+	exeLoader.SetLoadLimit(0x1BE8000 + 0x400000);
 #elif defined(PAYNE)
 	exeLoader.SetLoadLimit(0x20000000);
 #elif defined(GTA_FIVE)
 	exeLoader.SetLoadLimit(0x140000000 + 0x60000000);
+#elif defined(IS_RDR3)
+	exeLoader.SetLoadLimit(0x140000000 + 0x80000000);
 #else
 #error No load limit defined.
 #endif
@@ -522,12 +559,13 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 
 	exeLoader.SetFunctionResolver([] (HMODULE module, const char* functionName) -> LPVOID
 	{
-#if defined(GTA_FIVE)
 		if (!_stricmp(functionName, "GetStartupInfoW"))
 		{
 			return GetStartupInfoWHook;
 		}
-		else if (!_stricmp(functionName, "SetWindowsHookExA"))
+
+#if defined(GTA_FIVE) || defined(IS_RDR3)
+		if (!_stricmp(functionName, "SetWindowsHookExA"))
 		{
 			return NoWindowsHookExA;
 		}
@@ -543,12 +581,23 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 		{
 			return GetFileAttributesWHook;
 		}
+		else if (!_stricmp(functionName, "K32EnumProcessModules"))
+		{
+			return EnumProcessModulesHook;
+		}
 #endif
 
 		return (LPVOID)GetProcAddress(module, functionName);
 	});
 
 	exeLoader.LoadIntoModule(exeModule);
+
+#if defined(GTA_FIVE) && defined(RWX_TEST)
+	if (!getenv("CitizenFX_ToolMode"))
+	{
+		exeLoader.Protect();
+	}
+#endif
 
 	// overwrite our header
 #if defined(PAYNE)
@@ -564,20 +613,20 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 
 	entryPoint = (void(*)())exeLoader.GetEntryPoint();
 
-#if !defined(PAYNE) && !defined(GTA_FIVE)
+	// i.e. not using GetStartupInfo hook
+#if !defined(PAYNE) && !defined(GTA_FIVE) && !defined(IS_RDR3) && !defined(GTA_NY)
 	if (!launcher->PostLoadGame(exeModule, &entryPoint))
+	{
+		ExitProcess(0);
+	}
+
+	if (!launcher->PreResumeGame())
 	{
 		ExitProcess(0);
 	}
 #endif
 
-#if defined(GTA_NY)
-	// apply memory protection
-	DWORD oldProtect;
-	VirtualProtect((void*)0x401000, 0x94C000, PAGE_EXECUTE_READ, &oldProtect); // .text
-	VirtualProtect((void*)0xD4D000, 0x1BF000, PAGE_READONLY, &oldProtect); // .idata/.rdata
-#endif
-
+	//
 #if defined(PAYNE)
 	// hook GetModuleFileNameA/W (in a bit of an ugly way) - GameShield reads some verification from here
 	DWORD oldProtect;
@@ -607,11 +656,16 @@ void CitizenGame::Launch(const std::wstring& gamePath, bool isMainGame)
 	// store the launcher interface
 	g_launcher = launcher;
 
+#ifndef GTA_NY
 	AAD_Initialize();
+#endif
 
 #ifndef _M_AMD64
 	return InvokeEntryPoint(entryPoint);
 #else
 	return entryPoint();
+#endif
+#else
+	return;
 #endif
 }

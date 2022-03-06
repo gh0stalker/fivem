@@ -1,6 +1,6 @@
 @echo off
-setlocal
+py -m pip install Jinja2 MarkupSafe ply six
+
 set PYTHONPATH=code\tools\idl\deps\
 mkdir code\tools\idl\deps
-python -m easy_install -d code\tools\idl\deps\ ply
-endlocal
+py -m pip install Jinja2 MarkupSafe ply six

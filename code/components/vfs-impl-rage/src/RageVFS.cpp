@@ -12,6 +12,9 @@
 #include <VFSDevice.h>
 #include <VFSManager.h>
 
+#include <LocalDevice.h>
+#include <RelativeDevice.h>
+
 #include <IteratorView.h>
 
 #include <strsafe.h>
@@ -19,6 +22,9 @@
 #include <Error.h>
 
 #include <optional>
+#include <queue>
+
+static bool g_vfsInit;
 
 class RageVFSDeviceAdapter : public rage::fiCustomDevice
 {
@@ -30,31 +36,35 @@ private:
 public:
 	RageVFSDeviceAdapter(fwRefContainer<vfs::Device> device);
 
-	virtual uint64_t Open(const char* fileName, bool readOnly) override;
+	virtual size_t Open(const char* fileName, bool readOnly) override;
 
-	virtual uint64_t OpenBulk(const char* fileName, uint64_t* ptr) override;
+	virtual size_t OpenBulk(const char* fileName, uint64_t* ptr) override;
 
-	virtual uint64_t Create(const char* fileName) override;
+	virtual size_t Create(const char* fileName) override;
 
-	virtual uint32_t Read(uint64_t handle, void* buffer, uint32_t toRead) override;
+	virtual uint32_t Read(size_t handle, void* buffer, uint32_t toRead) override;
 
-	virtual uint32_t ReadBulk(uint64_t handle, uint64_t ptr, void* buffer, uint32_t toRead) override;
+	virtual uint32_t ReadBulk(size_t handle, uint64_t ptr, void* buffer, uint32_t toRead) override;
 
-	virtual uint32_t Write(uint64_t, void*, int) override;
+	virtual uint32_t Write(size_t, void*, int) override;
 
-	virtual uint32_t Seek(uint64_t handle, int32_t distance, uint32_t method) override;
+	virtual uint32_t Seek(size_t handle, int32_t distance, uint32_t method) override;
 
-	virtual uint64_t SeekLong(uint64_t handle, int64_t distance, uint32_t method) override;
+#ifndef GTA_NY
+	virtual uint64_t SeekLong(size_t handle, int64_t distance, uint32_t method) override;
+#endif
 
-	virtual int32_t Close(uint64_t handle) override;
+	virtual int32_t Close(size_t handle) override;
 
-	virtual int32_t CloseBulk(uint64_t handle) override;
+	virtual int32_t CloseBulk(size_t handle) override;
 
-	virtual int GetFileLength(uint64_t handle) override;
+	virtual int GetFileLength(size_t handle) override;
 
 	virtual uint64_t GetFileLengthLong(const char* fileName) override;
 
-	virtual uint64_t GetFileLengthUInt64(uint64_t handle) override;
+#ifndef GTA_NY
+	virtual uint64_t GetFileLengthUInt64(size_t handle) override;
+#endif
 
 	virtual bool RemoveFile(const char* file) override;
 
@@ -70,11 +80,11 @@ public:
 
 	virtual uint32_t GetFileAttributes(const char* path) override;
 
-	virtual uint64_t FindFirst(const char* path, rage::fiFindData* findData) override;
+	virtual size_t FindFirst(const char* path, rage::fiFindData* findData) override;
 
-	virtual bool FindNext(uint64_t handle, rage::fiFindData* findData) override;
+	virtual bool FindNext(size_t handle, rage::fiFindData* findData) override;
 
-	virtual int FindClose(uint64_t handle) override;
+	virtual int FindClose(size_t handle) override;
 
 	virtual int GetResourceVersion(const char* fileName, rage::ResourceFlags* version) override;
 	/*{
@@ -86,6 +96,7 @@ public:
 		return 0;
 	}*/
 
+#ifndef GTA_NY
 	virtual int m_yx() override
 	{
 		return 2;
@@ -97,6 +108,7 @@ public:
 	{
 		return "RageVFSDeviceAdapter";
 	}
+#endif
 };
 
 RageVFSDeviceAdapter::RageVFSDeviceAdapter(fwRefContainer<vfs::Device> device)
@@ -105,42 +117,42 @@ RageVFSDeviceAdapter::RageVFSDeviceAdapter(fwRefContainer<vfs::Device> device)
 
 }
 
-uint64_t RageVFSDeviceAdapter::Open(const char* fileName, bool readOnly)
+size_t RageVFSDeviceAdapter::Open(const char* fileName, bool readOnly)
 {
 	return m_cfxDevice->Open(fileName, readOnly);
 }
 
-uint64_t RageVFSDeviceAdapter::OpenBulk(const char* fileName, uint64_t* ptr)
+size_t RageVFSDeviceAdapter::OpenBulk(const char* fileName, uint64_t* ptr)
 {
 	return m_cfxDevice->OpenBulk(fileName, ptr);
 }
 
-uint64_t RageVFSDeviceAdapter::Create(const char* fileName)
+size_t RageVFSDeviceAdapter::Create(const char* fileName)
 {
 	return m_cfxDevice->Create(fileName);
 }
 
-uint32_t RageVFSDeviceAdapter::Read(uint64_t handle, void* buffer, uint32_t toRead)
+uint32_t RageVFSDeviceAdapter::Read(size_t handle, void* buffer, uint32_t toRead)
 {
 	return m_cfxDevice->Read(handle, buffer, toRead);
 }
 
-uint32_t RageVFSDeviceAdapter::ReadBulk(uint64_t handle, uint64_t ptr, void* buffer, uint32_t toRead)
+uint32_t RageVFSDeviceAdapter::ReadBulk(size_t handle, uint64_t ptr, void* buffer, uint32_t toRead)
 {
 	return m_cfxDevice->ReadBulk(handle, ptr, buffer, toRead);
 }
 
-uint32_t RageVFSDeviceAdapter::Write(uint64_t handle, void* buffer, int length)
+uint32_t RageVFSDeviceAdapter::Write(size_t handle, void* buffer, int length)
 {
 	return m_cfxDevice->Write(handle, buffer, length);
 }
 
-int32_t RageVFSDeviceAdapter::Close(uint64_t handle)
+int32_t RageVFSDeviceAdapter::Close(size_t handle)
 {
 	return m_cfxDevice->Close(handle) ? 0 : -1;
 }
 
-int32_t RageVFSDeviceAdapter::CloseBulk(uint64_t handle)
+int32_t RageVFSDeviceAdapter::CloseBulk(size_t handle)
 {
 	return m_cfxDevice->CloseBulk(handle) ? 0 : -1;
 }
@@ -165,7 +177,7 @@ int RageVFSDeviceAdapter::RenameFile(const char* from, const char* to)
 	return m_cfxDevice->RenameFile(from, to);
 }
 
-int RageVFSDeviceAdapter::GetFileLength(uint64_t handle)
+int RageVFSDeviceAdapter::GetFileLength(size_t handle)
 {
 	return m_cfxDevice->GetLength(handle);
 }
@@ -175,20 +187,24 @@ uint64_t RageVFSDeviceAdapter::GetFileLengthLong(const char* fileName)
 	return m_cfxDevice->GetLength(fileName);
 }
 
+#ifndef GTA_NY
 uint64_t RageVFSDeviceAdapter::GetFileLengthUInt64(uint64_t handle)
 {
 	return m_cfxDevice->GetLength(handle);
 }
+#endif
 
-uint32_t RageVFSDeviceAdapter::Seek(uint64_t handle, int32_t distance, uint32_t method)
+uint32_t RageVFSDeviceAdapter::Seek(size_t handle, int32_t distance, uint32_t method)
 {
 	return m_cfxDevice->Seek(handle, distance, method);
 }
 
-uint64_t RageVFSDeviceAdapter::SeekLong(uint64_t handle, int64_t distance, uint32_t method)
+#ifndef GTA_NY
+uint64_t RageVFSDeviceAdapter::SeekLong(size_t handle, int64_t distance, uint32_t method)
 {
 	return m_cfxDevice->Seek(handle, distance, method);
 }
+#endif
 
 uint64_t RageVFSDeviceAdapter::GetFileTime(const char* file)
 {
@@ -215,13 +231,24 @@ int RageVFSDeviceAdapter::GetResourceVersion(const char* file, rage::ResourceFla
 	if (m_cfxDevice->ExtensionCtl(VFS_GET_RAGE_PAGE_FLAGS, &ext, sizeof(ext)))
 	{
 		*version = ext.flags;
+#if defined(GTA_NY)
+		// pgStreamer expects this in NY - has to be -1 or a version assertion will fail (North laziness)
+		return -1;
+#else
 		return ext.version;
+#endif
 	}
 
+#if defined(GTA_NY)
+	*version = 0;
+#elif !defined(IS_RDR3)
 	version->flag1 = 0;
 	version->flag2 = 0;
+#else
+	memset(version, 0, sizeof(*version));
+#endif
 
-	trace(__FUNCTION__ " not implemented");
+	trace(__FUNCTION__ " not implemented\n");
 
 	return 0;
 }
@@ -236,7 +263,7 @@ uint32_t RageVFSDeviceAdapter::GetFileAttributes(const char* path)
 	return m_cfxDevice->GetAttributes(path);
 }
 
-uint64_t RageVFSDeviceAdapter::FindFirst(const char* folder, rage::fiFindData* findData)
+size_t RageVFSDeviceAdapter::FindFirst(const char* folder, rage::fiFindData* findData)
 {
 	vfs::FindData findDataOrig;
 	auto handle = m_cfxDevice->FindFirst(folder, &findDataOrig);
@@ -251,7 +278,7 @@ uint64_t RageVFSDeviceAdapter::FindFirst(const char* folder, rage::fiFindData* f
 	return handle;
 }
 
-bool RageVFSDeviceAdapter::FindNext(uint64_t handle, rage::fiFindData* findData)
+bool RageVFSDeviceAdapter::FindNext(size_t handle, rage::fiFindData* findData)
 {
 	vfs::FindData findDataOrig;
 	bool valid = m_cfxDevice->FindNext(handle, &findDataOrig);
@@ -266,7 +293,7 @@ bool RageVFSDeviceAdapter::FindNext(uint64_t handle, rage::fiFindData* findData)
 	return valid;
 }
 
-int RageVFSDeviceAdapter::FindClose(uint64_t handle)
+int RageVFSDeviceAdapter::FindClose(size_t handle)
 {
 	m_cfxDevice->FindClose(handle);
 	return 0;
@@ -386,8 +413,13 @@ size_t RageVFSDevice::Write(THandle handle, const void* buffer, size_t size)
 
 size_t RageVFSDevice::Seek(THandle handle, intptr_t offset, int seekType)
 {
+#ifndef GTA_NY
 	return WrapInt(m_device->SeekLong(handle, offset, seekType));
+#else
+	return m_device->Seek(handle, offset, seekType);
+#endif
 }
+
 
 bool RageVFSDevice::Close(THandle handle)
 {
@@ -406,7 +438,8 @@ bool RageVFSDevice::RemoveFile(const std::string& filename)
 
 bool RageVFSDevice::RenameFile(const std::string& from, const std::string& to)
 {
-	return m_device->RenameFile(from.substr(m_pathPrefixLength).c_str(), to.substr(m_pathPrefixLength).c_str());
+	m_device->RenameFile(from.substr(m_pathPrefixLength).c_str(), to.substr(m_pathPrefixLength).c_str());
+	return true; // should ignore return value
 }
 
 bool RageVFSDevice::RemoveDirectory(const std::string& name)
@@ -421,7 +454,11 @@ bool RageVFSDevice::CreateDirectory(const std::string& name)
 
 size_t RageVFSDevice::GetLength(THandle handle)
 {
+#ifndef GTA_NY
 	return m_device->GetFileLengthUInt64(handle);
+#else
+	return m_device->GetFileLength(handle);
+#endif
 }
 
 size_t RageVFSDevice::GetLength(const std::string& fileName)
@@ -471,7 +508,11 @@ void RageVFSDevice::FindClose(THandle handle)
 
 bool RageVFSDevice::IsCollection()
 {
+#ifndef GTA_NY
 	return m_device->IsCollection();
+#else
+	return false;
+#endif
 }
 
 void RageVFSDevice::SetPathPrefix(const std::string& pathPrefix)
@@ -487,6 +528,7 @@ bool RageVFSDevice::ExtensionCtl(int controlIdx, void* controlData, size_t contr
 
 		return FlushFileBuffers(reinterpret_cast<HANDLE>(data->handle));
 	}
+#ifndef GTA_NY
 	else if (controlIdx == VFS_GET_RAGE_PAGE_FLAGS)
 	{
 		auto data = (GetRagePageFlagsExtension*)controlData;
@@ -496,10 +538,12 @@ bool RageVFSDevice::ExtensionCtl(int controlIdx, void* controlData, size_t contr
 
 		return true;
 	}
+#endif
 
 	return false;
 }
 
+#ifndef GTA_NY
 bool RageVFSDeviceAdapter::IsCollection()
 {
 	if (m_collectionCache)
@@ -528,6 +572,7 @@ bool RageVFSDeviceAdapter::IsCollection()
 
 	return false;
 }
+#endif
 
 #include <mutex>
 
@@ -550,9 +595,56 @@ public:
 	virtual void Unmount(const std::string& path) override;
 };
 
+static std::multimap<std::string, fwRefContainer<vfs::Device>> g_mountCache;
+
+namespace vfs
+{
+fwRefContainer<Device> MakeMemoryDevice();
+}
+
 fwRefContainer<vfs::Device> RageVFSManager::GetDevice(const std::string& path)
 {
 	std::unique_lock<std::recursive_mutex> lock(m_managerLock);
+
+	if (!g_vfsInit)
+	{
+		// logic from server device
+		for (const auto& mount : g_mountCache)
+		{
+			// if the prefix patches
+			if (strncmp(path.c_str(), mount.first.c_str(), mount.first.length()) == 0)
+			{
+				vfs::Device::THandle handle;
+
+				auto device = mount.second;
+
+				if ((handle = device->Open(path, true)) != vfs::Device::InvalidHandle)
+				{
+					device->Close(handle);
+
+					return device;
+				}
+			}
+		}
+
+		if (path.find("citizen:/") == 0)
+		{
+			static fwRefContainer<vfs::RelativeDevice> g_citizenDevice = new vfs::RelativeDevice(ToNarrow(MakeRelativeCitPath(L"citizen/")));
+			g_citizenDevice->SetPathPrefix("citizen:/");
+
+			return g_citizenDevice;
+		}
+
+		if (_strnicmp(path.c_str(), "memory:", 7) == 0)
+		{
+			static fwRefContainer<vfs::Device> memoryDevice = vfs::MakeMemoryDevice();
+
+			return memoryDevice;
+		}
+
+		static fwRefContainer<vfs::LocalDevice> g_localDevice = new vfs::LocalDevice;
+		return g_localDevice;
+	}
 
 	rage::fiDevice* nativeDevice = rage::fiDevice::GetDevice(path.c_str(), true);
 
@@ -575,22 +667,38 @@ fwRefContainer<vfs::Device> RageVFSManager::GetNativeDevice(void* nativeDevice)
 	return it->second;
 }
 
+static std::queue<std::function<void()>> g_onInitQueue;
+
 void RageVFSManager::Mount(fwRefContainer<vfs::Device> device, const std::string& path)
 {
 	std::unique_lock<std::recursive_mutex> lock(m_managerLock);
 
-	auto adapter = new RageVFSDeviceAdapter(device);
+	auto run = [this, path, device]()
+	{
+		auto adapter = new RageVFSDeviceAdapter(device);
 
-	m_mountedDevices.insert({ path, adapter });
+		m_mountedDevices.insert({ path, adapter });
 
-	// track the owner of the VFS device so it won't have to go
-	// through a VFS adapter (which loses refcounts) if the caller is the VFS.
-	m_deviceCache.insert({ adapter, device });
+		// track the owner of the VFS device so it won't have to go
+		// through a VFS adapter (which loses refcounts) if the caller is the VFS.
+		m_deviceCache.insert({ adapter, device });
 
-	// ensure the allocator is defined
-	rage::sysMemAllocator::UpdateAllocatorValue();
+		// ensure the allocator is defined
+		rage::sysMemAllocator::UpdateAllocatorValue();
 
-	rage::fiDevice::MountGlobal(path.c_str(), adapter, true);
+		rage::fiDevice::MountGlobal(path.c_str(), adapter, true);
+	};
+
+	if (g_vfsInit)
+	{
+		run();
+	}
+	else
+	{
+		g_mountCache.insert({ path, device });
+
+		g_onInitQueue.push(run);
+	}
 
 	device->SetPathPrefix(path);
 }
@@ -616,5 +724,25 @@ void RageVFSManager::Unmount(const std::string& path)
 
 static InitFunction initFunction([]()
 {
+	rage::fiDevice::OnInitialMount.Connect([]()
+	{
+		g_vfsInit = true;
+	}, INT32_MIN);
+
+	rage::fiDevice::OnInitialMount.Connect([]()
+	{
+		std::function<void()> fn;
+
+		while (!g_onInitQueue.empty())
+		{
+			fn = std::move(g_onInitQueue.front());
+			g_onInitQueue.pop();
+
+			fn();
+		}
+
+		g_mountCache.clear();
+	}, 1);
+
 	Instance<vfs::Manager>::Set(new RageVFSManager());
 });

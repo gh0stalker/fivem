@@ -7,19 +7,17 @@ using CitizenFX.Core.Native;
 
 namespace CitizenFX.Core
 {
-#if !IS_FXSERVER
+#if !IS_FXSERVER && !IS_RDR3 && !GTA_NY
 	public class PlayerList : IEnumerable<Player>
 	{
 		public const int MaxPlayers = 256;
 
 		public IEnumerator<Player> GetEnumerator()
 		{
-			for (var i = 0; i < MaxPlayers; i++)
+			var list = (IList<object>)(object)API.GetActivePlayers();
+			foreach (var p in list)
 			{
-				if (API.NetworkIsPlayerActive(i))
-				{
-					yield return new Player(i);
-				}
+				yield return new Player(Convert.ToInt32(p));
 			}
 		}
 

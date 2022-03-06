@@ -1,4 +1,4 @@
-﻿/*
+/*
  * This file is part of the CitizenFX project - http://citizen.re/
  *
  * See LICENSE and MENTIONS in the root of the source tree for information
@@ -13,7 +13,7 @@ namespace fx
 {
 class ResourceManagerImpl;
 
-class ResourceImpl : public Resource
+class ResourceImpl final : public Resource
 {
 private:
 	std::string m_name;
@@ -27,7 +27,7 @@ private:
 public:
 	ResourceImpl(const std::string& name, ResourceManagerImpl* manager);
 
-	virtual bool LoadFrom(const std::string& rootPath) override;
+	virtual bool LoadFrom(const std::string& rootPath, std::string* errorState) override;
 
 	virtual const std::string& GetName() override;
 
@@ -41,7 +41,7 @@ public:
 
 	virtual bool Stop() override;
 
-	virtual void Tick() override;
+	virtual void Run(std::function<void()>&& fn) override;
 
 	virtual ResourceManager* GetManager() override;
 

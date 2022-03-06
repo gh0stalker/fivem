@@ -33,6 +33,10 @@ public:
 
 	bool OneSyncEnabled = false;
 
+	bool OneSyncBigIdEnabled = false;
+
+	bool SyncIsARQ = false;
+
 	uint64_t NetProtoVersion = 0;
 
 private:
@@ -51,16 +55,22 @@ public:
 
 	inline void SetVariable(const std::string& variable)
 	{
-		OnSetVariable(variable, true);
+		if (VariableList.find(variable) == VariableList.end())
+		{
+			OnSetVariable(variable, true);
 
-		VariableList.insert(variable);
+			VariableList.insert(variable);
+		}
 	}
 
 	inline void ClearVariable(const std::string& variable)
 	{
-		OnSetVariable(variable, false);
+		if (VariableList.find(variable) != VariableList.end())
+		{
+			OnSetVariable(variable, false);
 
-		VariableList.erase(variable);
+			VariableList.erase(variable);
+		}
 	}
 
 	inline bool GetData(const std::string& key, std::string* value)

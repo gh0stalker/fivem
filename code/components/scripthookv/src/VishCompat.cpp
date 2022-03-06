@@ -8,14 +8,15 @@
 #include "StdInc.h"
 #include <scrEngine.h>
 #include <ScriptHandlerMgr.h>
+#include <nutsnbolts.h>
+#include <DrawCommands.h>
 
 #include "ICoreGameInit.h"
 #include <InputHook.h>
 #include <IteratorView.h>
 
 #include <LaunchMode.h>
-
-#include <ResourceManager.h>
+#include <CrossBuildRuntime.h>
 
 #include <memory>
 
@@ -262,12 +263,25 @@ DLL_EXPORT uint64_t* getGlobalPtr(int)
 
 enum eGameVersion : int
 {
-	DummyVersion = 44 // VER_1_0_1493_1_NOSTEAM
+	VER_1_0_372_2_NOSTEAM = 5,
+	VER_1_0_1604_0_NOSTEAM = 47,
+	VER_1_0_2060_0_NOSTEAM = 60,
+	VER_1_0_2189_0_NOSTEAM = 64,
+	VER_1_0_2372_0_NOSTEAM = 70,
+	VER_1_0_2545_0_NOSTEAM = 72,
 };
 
+// ScriptHookV uses incremental numbers instead of build
 DLL_EXPORT eGameVersion getGameVersion()
 {
-	return DummyVersion;
+	if (xbr::IsGameBuild<372>()) return VER_1_0_372_2_NOSTEAM;
+	if (xbr::IsGameBuild<1604>()) return VER_1_0_1604_0_NOSTEAM;
+	if (xbr::IsGameBuild<2060>()) return VER_1_0_2060_0_NOSTEAM;
+	if (xbr::IsGameBuild<2189>()) return VER_1_0_2189_0_NOSTEAM;
+	if (xbr::IsGameBuild<2372>()) return VER_1_0_2372_0_NOSTEAM;
+	if (xbr::IsGameBuild<2545>()) return VER_1_0_2545_0_NOSTEAM;
+
+	return VER_1_0_1604_0_NOSTEAM; // Default build
 }
 
 class FishNativeContext : public NativeContext
@@ -305,20 +319,6 @@ void DLL_EXPORT nativePush64(uint64_t value)
 	g_context.Push(value);
 }
 
-bool MpGamerTagCheck()
-{
-	// create MP gamer tag
-	if (g_hash == 0xBFEFE3321A3F5015 || g_hash == 0x6DD05E9D83EFA4C9)
-	{
-		if (Instance<fx::ResourceManager>::Get()->GetResource("playernames").GetRef())
-		{
-			return false;
-		}
-	}
-
-	return true;
-}
-
 DLL_EXPORT uint64_t* nativeCall()
 {
 	auto fn = rage::scrEngine::GetNativeHandler(g_hash);
@@ -346,12 +346,6 @@ DLL_EXPORT uint64_t* nativeCall()
 		{
 			lastWasHash = false;
 		}
-	}
-
-	// workaround `playernames` resource conflicting with local SH addons
-	if (valid)
-	{
-		valid = MpGamerTagCheck();
 	}
 
 	if (valid)
@@ -427,14 +421,57 @@ int DLL_EXPORT worldGetAllObjects(int* array, int arraySize)
 	return 0;
 }
 
-static InitFunction initFunction([] ()
+typedef void(*PresentCallback)(void*);
+
+static std::set<PresentCallback> g_presentCallbacks;
+
+void DLL_EXPORT presentCallbackRegister(PresentCallback cb)
 {
-	rage::scrEngine::OnScriptInit.Connect([] ()
+	g_presentCallbacks.insert(cb);
+}
+
+void DLL_EXPORT presentCallbackUnregister(PresentCallback cb)
+{
+	g_presentCallbacks.erase(cb);
+}
+
+static InitFunction initFunction([]()
+{
+	rage::scrEngine::OnScriptInit.Connect([]()
 	{
 		rage::scrEngine::CreateThread(&g_fish);
 	});
 
-	InputHook::OnWndProc.Connect([] (HWND, UINT wMsg, WPARAM wParam, LPARAM lParam, bool&, LRESULT& result)
+	InputHook::QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
+	{
+		static struct : InputTarget
+		{
+			virtual inline void KeyDown(UINT vKey, UINT scanCode) override
+			{
+				auto functions = g_keyboardFunctions;
+
+				for (auto& function : functions)
+				{
+					function(vKey, 0, 0, FALSE, FALSE, FALSE, FALSE);
+				}
+			}
+
+			virtual inline void KeyUp(UINT vKey, UINT scanCode) override
+			{
+				auto functions = g_keyboardFunctions;
+
+				for (auto& function : functions)
+				{
+					function(vKey, 0, 0, FALSE, FALSE, FALSE, TRUE);
+				}
+			}
+
+		} tgt;
+
+		targets.push_back(&tgt);
+	});
+
+	InputHook::DeprecatedOnWndProc.Connect([] (HWND, UINT wMsg, WPARAM wParam, LPARAM lParam, bool&, LRESULT& result)
 	{
 		if (wMsg == WM_KEYDOWN || wMsg == WM_KEYUP || wMsg == WM_SYSKEYDOWN || wMsg == WM_SYSKEYUP)
 		{

@@ -11,7 +11,6 @@
 #include "NetLibrary.h"
 #include "FontRenderer.h"
 #include "DrawCommands.h"
-#include "Screen.h"
 #include <CoreConsole.h>
 #include <mmsystem.h>
 
@@ -20,10 +19,12 @@
 #include <imgui.h>
 #include <imguivariouscontrols.h>
 
+extern DLL_IMPORT fwEvent<int, int> OnPushNetMetrics;
+
 const int g_netOverlayOffsetX = -30;
 const int g_netOverlayOffsetY = -60;
 const int g_netOverlayWidth = 400;
-const int g_netOverlayHeight = 300;
+const int g_netOverlayHeight = 320;
 
 const int g_netOverlaySampleSize = 200; // milliseconds per sample frame
 const int g_netOverlaySampleCount = 150;
@@ -56,16 +57,27 @@ private:
 	std::map<uint32_t, std::string_view> m_lookupList;
 };
 
+// rg -i '"msg' | grep -oP '"msg[A-Z].*?"' | sed 's/"$/",/g' | sort -u | clip
 static const char* g_knownPackets[]
 {
+	"msgArrayUpdate",
+	"msgCloneAcks",
+	"msgCloneRemove",
 	"msgConVars",
+	"msgConfirm",
 	"msgEnd",
 	"msgEntityCreate",
+	"msgFrame",
+	"msgHeHost",
+	"msgIHost",
+	"msgIQuit",
+	"msgNetEvent",
 	"msgNetGameEvent",
 	"msgObjectIds",
 	"msgPackedAcks",
 	"msgPackedClones",
 	"msgPaymentRequest",
+	"msgReassembledEvent",
 	"msgRequestObjectIds",
 	"msgResStart",
 	"msgResStop",
@@ -74,14 +86,15 @@ static const char* g_knownPackets[]
 	"msgRpcNative",
 	"msgServerCommand",
 	"msgServerEvent",
+	"msgStateBag",
 	"msgTimeSync",
 	"msgTimeSyncReq",
 	"msgWorldGrid",
-	"msgFrame",
-	"msgIHost",
+	"msgWorldGrid3",
+
+	// manual list that doesn't start with 'msg'
 	"gameStateAck",
-	"msgNetEvent",
-	"msgServerEvent",
+	"gameStateNAck",
 };
 
 static RageHashList g_hashes{ g_knownPackets };
@@ -102,6 +115,8 @@ public:
 	virtual void OnPingResult(int msec) override;
 
 	virtual void OnRouteDelayResult(int msec) override;
+
+	virtual void OnPacketLossResult(int plPercent) override;
 
 	virtual void OnIncomingCommand(uint32_t type, size_t size, bool reliable) override;
 
@@ -139,6 +154,8 @@ private:
 	int m_inRouteDelaySampleArchive;
 	int m_inRouteDelaySamplesArchive[2000];
 
+	int m_packetLoss;
+
 	bool m_enabled;
 
 	bool m_enabledCommands;
@@ -163,12 +180,23 @@ private:
 
 	std::map<uint32_t, size_t> m_lastOutgoingMetrics;
 
+	std::vector<std::tuple<uint32_t, size_t>> m_lastIncomingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_lastOutgoingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_incomingData;
+
+	std::vector<std::tuple<uint32_t, size_t>> m_outgoingData;
+
 private:
 	inline int GetOverlayLeft()
 	{
+		int x, y;
+		GetGameResolution(x, y);
+
 		if (g_netOverlayOffsetX < 0)
 		{
-			return GetScreenResolutionX() + g_netOverlayOffsetX - g_netOverlayWidth;
+			return x + g_netOverlayOffsetX - g_netOverlayWidth;
 		}
 		else
 		{
@@ -178,9 +206,12 @@ private:
 
 	inline int GetOverlayTop()
 	{
+		int x, y;
+		GetGameResolution(x, y);
+
 		if (g_netOverlayOffsetY < 0)
 		{
-			return GetScreenResolutionY() + g_netOverlayOffsetY - g_netOverlayHeight;
+			return y + g_netOverlayOffsetY - g_netOverlayHeight;
 		}
 		else
 		{
@@ -203,6 +234,7 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 	  m_inBytes(0), m_inPackets(0), m_outBytes(0), m_outPackets(0),
 	  m_inRoutePackets(0), m_lastInRoutePackets(0), m_outRoutePackets(0), m_lastOutRoutePackets(0),
 	  m_inRouteDelay(0), m_inRouteDelaySample(0), m_inRouteDelayMax(0), m_inRouteDelaySampleArchive(0),
+	  m_packetLoss(0),
 	  m_enabled(false), m_enabledCommands(false)
 {
 	memset(m_inRouteDelaySamples, 0, sizeof(m_inRouteDelaySamples));
@@ -222,10 +254,11 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 			return;
 		}
 
-		auto& io = ImGui::GetIO();
+		int x, y;
+		GetGameResolution(x, y);
 
 		ImGui::SetNextWindowBgAlpha(0.0f);
-		ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x + g_netOverlayOffsetX, io.DisplaySize.y + g_netOverlayOffsetY), ImGuiCond_Once, ImVec2(1.0f, 1.0f));
+		ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + x + g_netOverlayOffsetX, ImGui::GetMainViewport()->Pos.y + y + g_netOverlayOffsetY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
 		ImGui::SetNextWindowSize(ImVec2(g_netOverlayWidth, g_netOverlayHeight));
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
@@ -257,47 +290,81 @@ NetOverlayMetricSink::NetOverlayMetricSink()
 
 	ConHost::OnDrawGui.Connect([this]()
 	{
-		if (m_enabledCommands)
+		if (!m_enabledCommands)
 		{
-			if (ImGui::Begin("Network Metrics"))
+			return;
+		}
+
+		if (ImGui::Begin("Network Metrics", &m_enabledCommands))
+		{
+			std::unique_lock<std::mutex> lock(m_metricMutex);
+
+			static bool showIncoming = true;
+			static bool showOutgoing = true;
+			static bool showLog = true;
+
+			auto showList = [](const decltype(m_lastIncomingMetrics)& list, const decltype(m_incomingReliable)& reliable)
 			{
-				std::unique_lock<std::mutex> lock(m_metricMutex);
+				ImGui::Columns(3);
 
-				static bool showIncoming = true;
-				static bool showOutgoing = true;
-
-				auto showList = [](const decltype(m_lastIncomingMetrics)& list, const decltype(m_incomingReliable)& reliable)
+				for (auto& entry : list)
 				{
-					ImGui::Columns(3);
+					ImGui::Text("%s", (reliable.find(entry.first)->second ? "R" : "U"));
+					ImGui::NextColumn();
 
-					for (auto& entry : list)
-					{
-						ImGui::Text("%s", (reliable.find(entry.first)->second ? "R" : "U"));
-						ImGui::NextColumn();
+					ImGui::Text("%s", g_hashes.LookupHash(entry.first).c_str());
+					ImGui::NextColumn();
 
-						ImGui::Text("%s", g_hashes.LookupHash(entry.first));
-						ImGui::NextColumn();
-
-						ImGui::Text("%d B", entry.second);
-						ImGui::NextColumn();
-					}
-
-					ImGui::Columns(1);
-				};
-
-				if (ImGui::CollapsingHeader("Incoming", &showIncoming))
-				{
-					showList(m_lastIncomingMetrics, m_incomingReliable);
+					ImGui::Text("%d B", entry.second);
+					ImGui::NextColumn();
 				}
 
-				if (ImGui::CollapsingHeader("Outgoing", &showOutgoing))
-				{
-					showList(m_lastOutgoingMetrics, m_outgoingReliable);
-				}
+				ImGui::Columns(1);
+			};
+
+			if (ImGui::CollapsingHeader("Incoming", &showIncoming))
+			{
+				showList(m_lastIncomingMetrics, m_incomingReliable);
 			}
 
-			ImGui::End();
+			if (ImGui::CollapsingHeader("Outgoing", &showOutgoing))
+			{
+				showList(m_lastOutgoingMetrics, m_outgoingReliable);
+			}
+
+			if (ImGui::CollapsingHeader("Log", &showLog))
+			{
+				ImGui::Columns(2);
+
+				for (int i = 0; i < std::max(m_lastIncomingData.size(), m_lastOutgoingData.size()); i++)
+				{
+					if (i < m_lastIncomingData.size())
+					{
+						ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastIncomingData[i])).c_str(), std::get<1>(m_lastIncomingData[i]));
+					}
+					else
+					{
+						ImGui::Text("");
+					}
+
+					ImGui::NextColumn();
+
+					if (i < m_lastOutgoingData.size())
+					{
+						ImGui::Text("%d. %s (%d)", i + 1, g_hashes.LookupHash(std::get<0>(m_lastOutgoingData[i])).c_str(), std::get<1>(m_lastOutgoingData[i]));
+					}
+					else
+					{
+						ImGui::Text("");
+					}
+
+					ImGui::NextColumn();
+				}
+
+				ImGui::Columns(1);
+			}
 		}
+		ImGui::End();
 	});
 }
 
@@ -334,6 +401,11 @@ void NetOverlayMetricSink::OnPingResult(int msec)
 	m_ping = msec;
 }
 
+void NetOverlayMetricSink::OnPacketLossResult(int plPercent)
+{
+	m_packetLoss = plPercent;
+}
+
 void NetOverlayMetricSink::OnRouteDelayResult(int msec)
 {
 	// quick samples
@@ -363,6 +435,7 @@ void NetOverlayMetricSink::OnIncomingCommand(uint32_t type, size_t size, bool re
 	std::unique_lock<std::mutex> lock(m_metricMutex);
 	m_incomingMetrics[type] += size;
 	m_incomingReliable[type] = reliable;
+	m_incomingData.push_back({ type, size });
 }
 
 void NetOverlayMetricSink::OnOutgoingCommand(uint32_t type, size_t size, bool reliable)
@@ -370,6 +443,7 @@ void NetOverlayMetricSink::OnOutgoingCommand(uint32_t type, size_t size, bool re
 	std::unique_lock<std::mutex> lock(m_metricMutex);
 	m_outgoingMetrics[type] += size;
 	m_outgoingReliable[type] = reliable;
+	m_outgoingData.push_back({ type, size });
 }
 
 // log data if enabled
@@ -428,6 +502,9 @@ void NetOverlayMetricSink::UpdateMetrics()
 
 			m_lastIncomingMetrics = std::move(m_incomingMetrics);
 			m_lastOutgoingMetrics = std::move(m_outgoingMetrics);
+
+			m_lastIncomingData = std::move(m_incomingData);
+			m_lastOutgoingData = std::move(m_outgoingData);
 		}
 
 		// log output?
@@ -466,6 +543,8 @@ void NetOverlayMetricSink::UpdateMetrics()
 				timeGetTime() - netLogInitTime, m_ping, m_lastInBytes, m_lastInPackets, m_lastOutBytes, m_lastOutPackets, m_lastInRoutePackets, m_lastOutRoutePackets));
 		}
 	}
+
+	OnPushNetMetrics(m_ping, m_packetLoss);
 }
 
 void NetOverlayMetricSink::DrawGraph()
@@ -505,12 +584,18 @@ void NetOverlayMetricSink::DrawGraph()
 		&data3
 	};
 
+	ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+	ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+
 	ImGui::PlotMultiLines("Net Bw", NET_PACKET_SUB_MAX, names, colors, [](const void* cxt, int idx) -> float
 	{
 		auto dataContext = (DataContext*)cxt;
 
 		return dataContext->metrics[idx].GetElementSize(dataContext->index);
 	}, datas, _countof(m_metrics) - 1, FLT_MAX, FLT_MAX, ImVec2(g_netOverlayWidth, g_netOverlayHeight - 100));
+
+	ImGui::PopStyleColor();
+	ImGui::PopStyleColor();
 }
 
 ImColor NetOverlayMetricSink::GetColorIndex(int index)
@@ -537,13 +622,6 @@ ImColor NetOverlayMetricSink::GetColorIndex(int index)
 
 void NetOverlayMetricSink::DrawBaseMetrics()
 {
-	// positioning
-	int x = GetOverlayLeft();
-	int y = GetOverlayTop() + (g_netOverlayHeight - 100) + 10;
-
-	CRGBA color(255, 255, 255);
-	CRect rect(x, y, x + (g_netOverlayWidth / 2), y + 100);
-
 	// collecting
 	int ping = m_ping;
 	int inPackets = m_lastInPackets;
@@ -559,9 +637,6 @@ void NetOverlayMetricSink::DrawBaseMetrics()
 	//
 	// second column
 	//
-
-	// positioning
-	rect.SetRect(rect.fX2, rect.fY1, rect.fX2 + (g_netOverlayWidth / 2), rect.fY2);
 
 	// collecting
 	int inBytes = m_lastInBytes;

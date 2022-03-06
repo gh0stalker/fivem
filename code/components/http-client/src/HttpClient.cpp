@@ -21,18 +21,28 @@
 
 #include <tbb/concurrent_queue.h>
 
+#include <shared_mutex>
+
+#include <UvLoopManager.h>
+
 class HttpClientImpl
 {
 public:
 	CURLM* multi;
-	bool shouldRun;
-	std::thread thread;
 	tbb::concurrent_queue<CURL*> handlesToAdd;
 	tbb::concurrent_queue<std::function<void()>> cbsToRun;
 	HttpClient* client;
+	uv_loop_t* loop;
+	uv_timer_t timeout;
+	std::string userAgent;
+
+	std::shared_ptr<uvw::AsyncHandle> addHandle;
+	std::shared_ptr<uvw::AsyncHandle> runCb;
+
+	std::shared_mutex mutex;
 
 	HttpClientImpl()
-		: multi(nullptr), shouldRun(true)
+		: multi(nullptr), client(nullptr), loop(nullptr)
 	{
 
 	}
@@ -43,6 +53,13 @@ public:
 void HttpClientImpl::AddCurlHandle(CURL* easy)
 {
 	handlesToAdd.push(easy);
+
+	std::shared_lock<std::shared_mutex> _(mutex);
+
+	if (addHandle)
+	{
+		addHandle->send();
+	}
 }
 
 class CurlData
@@ -64,6 +81,8 @@ public:
 	std::shared_ptr<int> responseCode;
 	std::chrono::milliseconds timeoutNoResponse;
 	std::chrono::high_resolution_clock::duration reqStart;
+	std::stringstream errorBody;
+	bool addErrorBody;
 
 	CurlData();
 
@@ -86,6 +105,17 @@ CurlData::CurlData()
 
 size_t CurlData::HandleWrite(const void* data, size_t size, size_t nmemb)
 {
+	if (addErrorBody)
+	{
+		long code;
+		curl_easy_getinfo(curlHandle, CURLINFO_RESPONSE_CODE, &code);
+
+		if (code >= 400)
+		{
+			errorBody << std::string((const char*)data, size * nmemb);
+		}
+	}
+
 	return writeFunction(data, size * nmemb);
 }
 
@@ -114,7 +144,11 @@ void CurlData::HandleResult(CURL* handle, CURLcode result)
 
 		if (code >= 400)
 		{
-			auto failure = fmt::sprintf("HTTP %d", code);
+			auto failure = fmt::sprintf("HTTP %d%s",
+				code,
+				addErrorBody
+					? fmt::sprintf(": %s", this->errorBody.str())
+					: "");
 
 			callback(false, failure.c_str(), failure.size());
 		}
@@ -127,113 +161,218 @@ void CurlData::HandleResult(CURL* handle, CURLcode result)
 	}
 }
 
-HttpClient::HttpClient(const wchar_t* userAgent /* = L"CitizenFX/1" */)
+struct curl_context_t
+{
+	uv_poll_t poll_handle;
+	curl_socket_t sockfd;
+	HttpClientImpl* impl;
+};
+
+static curl_context_t* CreateCurlContext(HttpClientImpl* i, curl_socket_t sockfd)
+{
+	curl_context_t* context = new curl_context_t;
+	context->sockfd = sockfd;
+
+	uv_poll_init_socket(i->loop, &context->poll_handle, sockfd);
+	context->poll_handle.data = context;
+	context->impl = i;
+
+	return context;
+}
+
+static void CheckMultiInfo(HttpClientImpl* impl)
+{
+	// read infos
+	CURLMsg* msg;
+
+	do
+	{
+		int nq;
+		msg = curl_multi_info_read(impl->multi, &nq);
+
+		// is this a completed transfer?
+		if (msg && msg->msg == CURLMSG_DONE)
+		{
+			// get the handle and the result
+			CURL* curl = msg->easy_handle;
+			CURLcode result = msg->data.result;
+
+			char* dataPtr;
+			curl_easy_getinfo(curl, CURLINFO_PRIVATE, &dataPtr);
+
+			auto data = reinterpret_cast<std::shared_ptr<CurlData>*>(dataPtr);
+			(*data)->HandleResult(curl, result);
+
+			curl_multi_remove_handle(impl->multi, curl);
+			curl_easy_cleanup(curl);
+
+			// delete data
+			(*data)->curlHandle = nullptr;
+			delete data;
+		}
+	} while (msg);
+}
+
+static void CurlPerform(uv_poll_t* req, int status, int events)
+{
+	int running_handles;
+	int flags = 0;
+	curl_context_t* context;
+
+	if (events & UV_READABLE)
+		flags |= CURL_CSELECT_IN;
+	if (events & UV_WRITABLE)
+		flags |= CURL_CSELECT_OUT;
+
+	context = (curl_context_t*)req->data;
+
+	curl_multi_socket_action(context->impl->multi, context->sockfd, flags,
+	&running_handles);
+
+	CheckMultiInfo(context->impl);
+}
+
+static void CurlCloseCb(uv_handle_t* handle)
+{
+	curl_context_t* context = (curl_context_t*)handle->data;
+	delete context;
+}
+
+static void DestroyCurlContext(curl_context_t* context)
+{
+	uv_close((uv_handle_t*)&context->poll_handle, CurlCloseCb);
+}
+
+static int CurlHandleSocket(CURL* easy, curl_socket_t s, int action, void* userp, void* socketp)
+{
+	auto impl = reinterpret_cast<HttpClientImpl*>(userp);
+
+	curl_context_t* curl_context;
+	int events = 0;
+
+	switch (action)
+	{
+		case CURL_POLL_IN:
+		case CURL_POLL_OUT:
+		case CURL_POLL_INOUT:
+			curl_context = socketp ? (curl_context_t*)socketp : CreateCurlContext(impl, s);
+
+			curl_multi_assign(impl->multi, s, (void*)curl_context);
+
+			if (action != CURL_POLL_IN)
+				events |= UV_WRITABLE;
+			if (action != CURL_POLL_OUT)
+				events |= UV_READABLE;
+
+			uv_poll_start(&curl_context->poll_handle, events, CurlPerform);
+			break;
+		case CURL_POLL_REMOVE:
+			if (socketp)
+			{
+				uv_poll_stop(&((curl_context_t*)socketp)->poll_handle);
+				DestroyCurlContext((curl_context_t*)socketp);
+				curl_multi_assign(impl->multi, s, NULL);
+			}
+			break;
+	}
+
+	return 0;
+}
+
+static void OnTimeout(uv_timer_t* req)
+{
+	auto impl = reinterpret_cast<HttpClientImpl*>(req->data);
+
+	int running_handles;
+	curl_multi_socket_action(impl->multi, CURL_SOCKET_TIMEOUT, 0,
+	&running_handles);
+	CheckMultiInfo(impl);
+}
+
+static int CurlStartTimeout(CURLM* multi, long timeout_ms, void* userp)
+{
+	auto impl = reinterpret_cast<HttpClientImpl*>(userp);
+
+	if (timeout_ms < 0)
+	{
+		uv_timer_stop(&impl->timeout);
+	}
+	else
+	{
+		if (timeout_ms == 0)
+			timeout_ms = 1; /* 0 means directly call socket_action, but we'll do it
+                         in a bit */
+		uv_timer_start(&impl->timeout, OnTimeout, timeout_ms, 0);
+	}
+	return 0;
+}
+
+HttpClient::HttpClient(const wchar_t* userAgent /* = L"CitizenFX/1" */, const std::string& loopId)
 	: m_impl(new HttpClientImpl())
 {
 	m_impl->client = this;
+	m_impl->userAgent = ToNarrow(userAgent);
 	m_impl->multi = curl_multi_init();
 	curl_multi_setopt(m_impl->multi, CURLMOPT_PIPELINING, CURLPIPE_HTTP1 | CURLPIPE_MULTIPLEX);
 	curl_multi_setopt(m_impl->multi, CURLMOPT_MAX_HOST_CONNECTIONS, 8);
+	curl_multi_setopt(m_impl->multi, CURLMOPT_SOCKETFUNCTION, CurlHandleSocket);
+	curl_multi_setopt(m_impl->multi, CURLMOPT_SOCKETDATA, m_impl);
+	curl_multi_setopt(m_impl->multi, CURLMOPT_TIMERFUNCTION, CurlStartTimeout);
+	curl_multi_setopt(m_impl->multi, CURLMOPT_TIMERDATA, m_impl);
 	
-	m_impl->thread = std::move(std::thread([=]()
+	auto loop = Instance<net::UvLoopManager>::Get()->GetOrCreate(loopId.empty() ? "httpClient" : loopId);
+	m_impl->loop = loop->GetLoop();
+
+	loop->EnqueueCallback([this, loop]()
 	{
-		using namespace std::literals;
+		auto impl = m_impl;
+		uv_timer_init(loop->GetLoop(), &impl->timeout);
+		impl->timeout.data = impl;
 
-		SetThreadName(-1, "[Cfx] HttpClient Thread");
-
-		int lastRunning = 0;
-
-		do 
+		auto runCbs = [impl]()
 		{
-			// add new handles
+			std::function<void()> runCb;
+
+			while (impl->cbsToRun.try_pop(runCb))
 			{
-				CURL* addHandle;
-
-				while (m_impl->handlesToAdd.try_pop(addHandle))
-				{
-					curl_multi_add_handle(m_impl->multi, addHandle);
-				}
+				runCb();
 			}
+		};
 
-			// run callback queue
+		auto runAdds = [impl]()
+		{
+			CURL* addHandle;
+
+			while (impl->handlesToAdd.try_pop(addHandle))
 			{
-				std::function<void()> runCb;
-
-				while (m_impl->cbsToRun.try_pop(runCb))
-				{
-					runCb();
-				}
+				curl_multi_add_handle(impl->multi, addHandle);
 			}
+		};
 
-			// run iteration
-			CURLMcode mc;
-			int numfds;
-			int nowRunning;
+		auto addHandle = loop->Get()->resource<uvw::AsyncHandle>();
+		addHandle->on<uvw::AsyncEvent>([runAdds](const uvw::AsyncEvent& ev, uvw::AsyncHandle& handle)
+		{
+			runAdds();
+		});
 
-			// perform requests
-			mc = curl_multi_perform(m_impl->multi, &nowRunning);
+		auto runCb = loop->Get()->resource<uvw::AsyncHandle>();
+		runCb->on<uvw::AsyncEvent>([runCbs](const uvw::AsyncEvent& ev, uvw::AsyncHandle& handle)
+		{
+			runCbs();
+		});
 
-			if (mc == CURLM_OK)
-			{
-				// read infos
-				CURLMsg* msg;
+		std::lock_guard<std::shared_mutex> _(impl->mutex);
 
-				do 
-				{
-					int nq;
-					msg = curl_multi_info_read(m_impl->multi, &nq);
+		runCbs();
+		runAdds();
 
-					// is this a completed transfer?
-					if (msg && msg->msg == CURLMSG_DONE)
-					{
-						// get the handle and the result
-						CURL* curl = msg->easy_handle;
-						CURLcode result = msg->data.result;
-
-						char* dataPtr;
-						curl_easy_getinfo(curl, CURLINFO_PRIVATE, &dataPtr);
-
-						auto data = reinterpret_cast<std::shared_ptr<CurlData>*>(dataPtr);
-						(*data)->HandleResult(curl, result);
-
-						curl_multi_remove_handle(m_impl->multi, curl);
-						curl_easy_cleanup(curl);
-
-						// delete data
-						(*data)->curlHandle = nullptr;
-						delete data;
-					}
-				} while (msg);
-
-				// save the last value
-				lastRunning = nowRunning;
-			}
-
-			mc = curl_multi_wait(m_impl->multi, nullptr, 0, 20, &numfds);
-
-			if (mc != CURLM_OK)
-			{
-				FatalError("curl_multi_wait failed with error %s", curl_multi_strerror(mc));
-				return;
-			}
-
-			if (numfds == 0)
-			{
-				std::this_thread::sleep_for(20ms);
-			}
-		} while (m_impl->shouldRun);
-	}));
+		impl->runCb = runCb;
+		impl->addHandle = addHandle;
+	});
 }
 
 HttpClient::~HttpClient()
 {
-	m_impl->shouldRun = false;
-
-	if (m_impl->thread.joinable())
-	{
-		m_impl->thread.join();
-	}
-
 	delete m_impl;
 }
 
@@ -320,7 +459,7 @@ static size_t CurlHeaderInfo(char* buffer, size_t size, size_t nitems, void* use
 		
 		if (colonPos != std::string::npos)
 		{
-			(*cd->responseHeaders)[str.substr(0, colonPos)] = str.substr(colonPos + 2, str.length() - 2 - colonPos - 2);
+			(*cd->responseHeaders).emplace(str.substr(0, colonPos), str.substr(colonPos + 2, str.length() - 2 - colonPos - 2));
 		}
 	}
 
@@ -341,6 +480,7 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 	curlData->responseHeaders = options.responseHeaders;
 	curlData->responseCode = options.responseCode;
 	curlData->timeoutNoResponse = options.timeoutNoResponse;
+	curlData->addErrorBody = options.addErrorBody;
 
 	auto scb = options.streamingCallback;
 
@@ -356,6 +496,7 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 
 	auto curlDataPtr = new std::shared_ptr<CurlData>(curlData);
 
+	curl_easy_setopt(curlHandle, CURLOPT_USERAGENT, impl->userAgent.c_str());
 	curl_easy_setopt(curlHandle, CURLOPT_URL, curlData->url.c_str());
 	curl_easy_setopt(curlHandle, CURLOPT_PRIVATE, curlDataPtr);
 	curl_easy_setopt(curlHandle, CURLOPT_WRITEDATA, curlDataPtr);
@@ -363,7 +504,7 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 	curl_easy_setopt(curlHandle, CURLOPT_XFERINFODATA, curlDataPtr);
 	curl_easy_setopt(curlHandle, CURLOPT_XFERINFOFUNCTION, CurlXferInfo);
 	curl_easy_setopt(curlHandle, CURLOPT_NOPROGRESS, 0);
-	curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, true);
+	curl_easy_setopt(curlHandle, CURLOPT_FOLLOWLOCATION, options.followLocation);
 	curl_easy_setopt(curlHandle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
 	curl_easy_setopt(curlHandle, CURLOPT_ERRORBUFFER, &curlData->errBuffer);
 	curl_easy_setopt(curlHandle, CURLOPT_SSL_VERIFYPEER, 0);
@@ -383,6 +524,11 @@ static std::tuple<CURL*, std::shared_ptr<CurlData>> SetupCURLHandle(HttpClientIm
 	}
 
 	curl_easy_setopt(curlHandle, CURLOPT_HTTPHEADER, headers);
+
+	if (options.ipv4)
+	{
+		curl_easy_setopt(curlHandle, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+	}
 
 	impl->client->OnSetupCurlHandle(curlHandle, url);
 
@@ -430,6 +576,12 @@ public:
 				curl_easy_setopt(request->curlHandle, CURLOPT_STREAM_WEIGHT, long(newWeight));
 			}
 		});
+
+		std::shared_lock<std::shared_mutex> _(request->impl->mutex);
+		if (request->impl->runCb)
+		{
+			request->impl->runCb->send();
+		}
 	}
 
 	virtual void Abort() override
@@ -460,6 +612,12 @@ public:
 
 			delete data;
 		});
+
+		std::shared_lock<std::shared_mutex> _(request->impl->mutex);
+		if (request->impl->runCb)
+		{
+			request->impl->runCb->send();
+		}
 	}
 };
 
@@ -589,9 +747,7 @@ HttpRequestPtr HttpClient::DoFileGetRequest(const std::string& urlStr, fwRefCont
 
 	curlData->writeFunction = [=] (const void* data, size_t length)
 	{
-		outDevice->Write(handle, data, length);
-
-		return length;
+		return outDevice->Write(handle, data, length);
 	};
 
 	curlData->preCallback = [=] ()

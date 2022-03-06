@@ -1,9 +1,13 @@
 #include "StdInc.h"
 
-#ifndef IS_FXSERVER
 #include <VFSManager.h>
 #include <VFSZipFile.h>
 #include <ResourceManager.h>
+
+namespace fx
+{
+bool mountedAnyNatives = false;
+}
 
 static void MountNatives(const std::string& name)
 {
@@ -30,6 +34,7 @@ static void MountNatives(const std::string& name)
 
 		if (device->OpenArchive(fmt::sprintf("memory:$%016llx,%d,0:%s", (uintptr_t)thisData, thisDataSize, name)))
 		{
+			fx::mountedAnyNatives = true;
 			vfs::Mount(device, fmt::sprintf("nativesLua:/%s/", name));
 		}
 	}
@@ -43,12 +48,19 @@ static InitFunction initFunction([]()
 
 		if (!mountedFiles)
 		{
+#if defined(IS_RDR3)
+			MountNatives("rdr3_universal");
+#elif defined(GTA_NY)
+			MountNatives("ny_universal");
+#elif defined(GTA_FIVE)
 			MountNatives("natives_universal");
 			MountNatives("natives_21e43a33");
 			MountNatives("natives_0193d0af");
+#elif defined(IS_FXSERVER)
+			MountNatives("natives_server");
+#endif
 
 			mountedFiles = true;
 		}
 	});
 });
-#endif

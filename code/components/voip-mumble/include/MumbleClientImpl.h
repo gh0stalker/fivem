@@ -21,17 +21,16 @@
 #include <MumbleAudioInput.h>
 #include <MumbleAudioOutput.h>
 
+#include <concurrent_queue.h>
+
 #include <thread>
 
-enum class ClientTask
+#include <uvw.hpp>
+
+namespace net
 {
-	Idle,
-	BeginConnect,
-	EndConnect,
-	RecvData,
-	UDPRead,
-	Unknown
-};
+	class UvLoopHolder;
+}
 
 class MumbleCredentialsManager : public Botan::Credentials_Manager
 {
@@ -87,7 +86,13 @@ public:
 
 	virtual concurrency::task<void> DisconnectAsync() override;
 
+	virtual void RunFrame() override;
+
 	virtual MumbleConnectionInfo* GetConnectionInfo() override;
+
+	virtual void UpdateVoiceTarget(int idx, const VoiceTargetConfig& config) override;
+
+	virtual void SetVoiceTarget(int idx) override;
 
 	virtual bool IsAnyoneTalking() override;
 
@@ -95,11 +100,31 @@ public:
 
 	virtual void SetChannel(const std::string& channelName) override;
 
+	virtual void AddListenChannel(const std::string& channelName) override;
+
+	virtual void RemoveListenChannel(const std::string& channelName) override;
+
+	virtual std::shared_ptr<lab::AudioContext> GetAudioContext(const std::string& name) override;
+
+	virtual void SetClientVolumeOverride(const std::wstring& clientName, float volume) override;
+
+	virtual void SetClientVolumeOverrideByServerId(uint32_t serverId, float volume) override;
+
+	virtual std::wstring GetPlayerNameFromServerId(uint32_t serverId) override;
+
+	virtual std::string GetVoiceChannelFromServerId(uint32_t serverId) override;
+
 	virtual void GetTalkers(std::vector<std::string>* referenceIds) override;
 
 	virtual void SetPositionHook(const TPositionHook& hook) override;
 
 	virtual void SetAudioDistance(float distance) override;
+
+	virtual void SetAudioInputDistance(float distance) override;
+
+	virtual void SetAudioOutputDistance(float distance) override;
+
+	virtual float GetAudioDistance() override;
 
 	virtual void SetActorPosition(float position[3]) override;
 
@@ -118,17 +143,15 @@ public:
 	virtual void SetOutputDevice(const std::string& dsoundDeviceId) override;
 
 private:
-	SOCKET m_socket;
+	fwRefContainer<net::UvLoopHolder> m_loop;
 
-	std::thread m_mumbleThread;
+	std::shared_ptr<uvw::TimerHandle> m_connectTimer;
 
-	HANDLE m_beginConnectEvent;
+	std::shared_ptr<uvw::TimerHandle> m_idleTimer;
 
-	HANDLE m_socketConnectEvent;
-	HANDLE m_socketReadEvent;
-	HANDLE m_udpReadEvent;
+	std::shared_ptr<uvw::TCPHandle> m_tcp;
 
-	HANDLE m_idleEvent;
+	std::shared_ptr<uvw::UDPHandle> m_udp;
 
 	MumbleConnectionInfo m_connectionInfo;
 
@@ -139,6 +162,8 @@ private:
 	MumbleAudioOutput m_audioOutput;
 
 	concurrency::task_completion_event<MumbleConnectionInfo*> m_completionEvent;
+
+	concurrency::concurrent_queue<std::tuple<uint32_t, std::array<float, 3>>> m_positionUpdates;
 
 	Botan::AutoSeeded_RNG m_rng;
 
@@ -166,9 +191,11 @@ private:
 	uint32_t m_udpPingCount;
 	uint32_t m_udpPings[12];
 
+	int m_voiceTarget;
+
 	std::chrono::milliseconds m_lastUdp;
 
-	SOCKET m_udpSocket;
+	std::chrono::milliseconds m_nextPing;
 
 	TPositionHook m_positionHook;
 
@@ -176,8 +203,18 @@ private:
 
 	std::string m_curManualChannel;
 
+	std::string m_lastManualChannel;
+
+	std::set<std::string> m_curChannelListens;
+
+	std::set<std::string> m_lastChannelListens;
+
+	std::map<int, VoiceTargetConfig> m_pendingVoiceTargetUpdates;
+
 public:
 	static fwRefContainer<MumbleClient> GetCurrent();
+
+	inline int GetVoiceTarget() { return m_voiceTarget; }
 
 	inline MumbleClientState& GetState() { return m_state; }
 
@@ -248,9 +285,6 @@ public:
 
 	}
 
-private:
-	static void ThreadFunc(MumbleClient* client);
-
 public:
 	void MarkConnected();
 
@@ -265,10 +299,6 @@ private:
 	bool OnHandshake(const Botan::TLS::Session& session);
 
 	void OnActivated();
-
-	ClientTask WaitForTask();
-
-	void ThreadFuncImpl();
 
 	void Send(const char* buf, size_t size);
 };

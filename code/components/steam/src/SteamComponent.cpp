@@ -19,6 +19,18 @@
 #include <sstream>
 #include <thread>
 
+struct CfxPresenceState
+{
+	char gameName[512];
+	volatile bool needRefresh;
+
+	CfxPresenceState()
+		: needRefresh(0)
+	{
+		memset(gameName, 0, sizeof(gameName));
+	}
+};
+
 class KeyValuesBuilder
 {
 private:
@@ -71,13 +83,13 @@ SteamComponent::SteamComponent()
 
 }
 
-static void RunChildLauncher()
+static void RunChildLauncher(bool syncWait = false)
 {
 	// get the base executable path
 	auto ourPath = MakeCfxSubProcess(L"SteamChild.exe");
 
 	wchar_t ourDirectory[MAX_PATH];
-	GetCurrentDirectory(sizeof(ourDirectory), ourDirectory);
+	GetCurrentDirectory(std::size(ourDirectory), ourDirectory);
 
 	std::wstring commandLine = va(L"\"%s\" -steamparent:%d", ourPath, GetCurrentProcessId());
 
@@ -87,12 +99,24 @@ static void RunChildLauncher()
 
 	CreateProcess(ourPath, (wchar_t*)commandLine.c_str(), nullptr, nullptr, FALSE, 0, nullptr, ourDirectory, &si, &pi);
 
-	// wait for it to finish
-	WaitForSingleObject(pi.hProcess, 15000);
+	auto wait = [pi = std::move(pi)]()
+	{
+		// wait for it to finish
+		WaitForSingleObject(pi.hProcess, 15000);
 
-	// and close up afterwards
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+		// and close up afterwards
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	};
+
+	if (syncWait)
+	{
+		wait();
+	}
+	else
+	{
+		std::thread(wait).detach();
+	}
 }
 
 #include <base64.h>
@@ -120,7 +144,7 @@ void SteamComponent::Initialize()
 		InitializePublicAPI();
 
 		// run the child launcher
-		RunChildLauncher();
+		RunChildLauncher(true);
 
 		// initialize the private Steam API
 		InitializeClientAPI();
@@ -271,14 +295,17 @@ void SteamComponent::RemoveSteamCallback(int registeredID)
 }
 
 #if defined(GTA_NY)
-#define PARENT_APP_ID 12210
-#define PRODUCT_DISPLAY_NAME "CitizenFX:IV \xF0\x9F\x92\x8A"
+#define PARENT_APP_ID 218
+#define PRODUCT_DISPLAY_NAME "LibertyM \xF0\x9F\x92\x8A"
 #elif defined(PAYNE)
 #define PARENT_APP_ID 204100
 #define PRODUCT_DISPLAY_NAME "CitizenPayne \xF0\x9F\x92\x8A"
 #elif defined(GTA_FIVE)
 #define PARENT_APP_ID 218
 #define PRODUCT_DISPLAY_NAME "FiveM \xF0\x9F\x90\x8C" // snail
+#elif defined(IS_RDR3)
+#define PARENT_APP_ID 218
+#define PRODUCT_DISPLAY_NAME "RedM"
 #else
 #define PARENT_APP_ID 218
 #define PRODUCT_DISPLAY_NAME "Unknown CitizenFX product"
@@ -335,7 +362,7 @@ void SteamComponent::InitializePresence()
 	m_parentAppID = parentAppID;
 
 	// create a fake app to hold our gameid
-	uint64_t gameID = 0xA18F2DAB01000000 | parentAppID; // crc32 for 'kekking' + mod
+	uint64_t gameID = 0xD8A9994402000000 | parentAppID; // crc32 for 'cfx' + shortcut
 
 	InterfaceMapper steamAppsInterface(m_clientEngine->GetIClientApps(m_steamUser, m_steamPipe, "CLIENTAPPS_INTERFACE_VERSION001"));
 
@@ -344,7 +371,7 @@ void SteamComponent::InitializePresence()
 	builder.PackString("name", PRODUCT_DISPLAY_NAME);
 	builder.PackUint64("gameid", gameID);
 	builder.PackString("installed", "1");
-	builder.PackString("gamedir", "kekking");
+	builder.PackString("gamedir", "cfx");
 	builder.PackString("serverbrowsername", "lovely!");
 	builder.PackEnd();
 
@@ -370,6 +397,14 @@ void SteamComponent::InitializePresence()
 			productName = ToNarrow(nameStream.str());
 		}
 
+		static HostSharedData<CfxPresenceState> gameData("PresenceState");
+		gameData->needRefresh = false;
+
+		if (gameData->gameName[0])
+		{
+			productName += fmt::sprintf(": %s", gameData->gameName);
+		}
+
 		// set our pipe appid
 		InterfaceMapper steamUtils(m_clientEngine->GetIClientUtils(m_steamPipe, "CLIENTUTILS_INTERFACE_VERSION001"));
 
@@ -383,7 +418,7 @@ void SteamComponent::InitializePresence()
 
 		static HostSharedData<CfxState> hostData("CfxInitState");
 
-		std::wstring commandLine = va(L"\"%s\" -steamchild:%d", ourPath, hostData->initialPid);
+		std::wstring commandLine = va(L"\"%s\" -steamchild:%d", ourPath, hostData->GetInitialPid());
 
 		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 
@@ -403,6 +438,16 @@ void SteamComponent::InitializePresence()
 				// removed: parent app ID explicit argument
 				// added: last argument (bitfield, related to SteamVR)
 				steamUserInterface.Invoke<bool>("SpawnProcess", converter.to_bytes(ourPath).c_str(), converter.to_bytes(commandLine).c_str(), 0, converter.to_bytes(ourDirectory).c_str(), gameID, productName.c_str(), 0, 0);
+				return true;
+			},
+
+			// some 2019/2020 update that wasn't caught at all beforehand
+			[&]()
+			{
+				// removed: VAC blob!
+				// added: another flag
+				// also CGameID is a pointer now
+				steamUserInterface.Invoke<bool>("SpawnProcess", converter.to_bytes(ourPath).c_str(), converter.to_bytes(commandLine).c_str(), converter.to_bytes(ourDirectory).c_str(), &gameID, productName.c_str(), 0, 0, 0);
 				return true;
 			}
 		};
@@ -460,7 +505,20 @@ bool SteamComponent::RunPresenceDummy()
 			trace("waiting for process to exit...\n");
 
 			// ... wait for it to exit and close the handle afterwards
-			WaitForSingleObject(processHandle, INFINITE);
+			while (true)
+			{
+				if (WaitForSingleObject(processHandle, 1000) != WAIT_TIMEOUT)
+				{
+					break;
+				}
+
+				static HostSharedData<CfxPresenceState> gameData("PresenceState");
+
+				if (gameData->needRefresh)
+				{
+					return true;
+				}
+			}
 
 			DWORD exitCode;
 			GetExitCodeProcess(processHandle, &exitCode);
@@ -585,6 +643,15 @@ void SteamComponent::SetRichPresenceValue(int idx, const std::string& value)
 	m_richPresenceValues[idx] = value;
 
 	m_richPresenceChanged = true;
+
+	if (idx == 0)
+	{
+		static HostSharedData<CfxPresenceState> gameData("PresenceState");
+		gameData->needRefresh = true;
+		strcpy_s(gameData->gameName, value.c_str());
+
+		RunChildLauncher();
+	}
 }
 
 static SteamComponent steamComponent;

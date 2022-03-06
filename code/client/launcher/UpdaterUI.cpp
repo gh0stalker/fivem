@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
 #include <CommCtrl.h>
 #include <shobjidl.h>
 
@@ -15,11 +16,22 @@
 #include <winrt/Windows.Storage.Streams.h>
 
 #include "CitiLaunch/BackdropBrush.g.h"
+#include "winrt/Microsoft.Graphics.Canvas.Effects.h"
 
 #include <DirectXMath.h>
 #include <roapi.h>
 
+#include <CfxState.h>
+#include <HostSharedData.h>
+
 #include <boost/algorithm/string.hpp>
+
+#include <d2d1effects.h>
+#include <d2d1_1.h>
+#pragma comment(lib, "dxguid.lib")
+
+#include <windows.graphics.effects.h>
+#include <windows.graphics.effects.interop.h>
 
 #pragma comment(lib, "runtimeobject.lib")
 #pragma comment(lib, "delayimp.lib")
@@ -29,128 +41,128 @@
 #pragma comment(lib, "dwrite.lib")
 #pragma comment(lib, "shcore.lib")
 
-extern "C" DLL_EXPORT HRESULT WINRT_CALL DllGetActivationFactory(HSTRING classId, IActivationFactory** factory);
+using namespace ABI::Windows::Graphics::Effects;
 
-namespace winrt
+struct CompositionEffect : winrt::implements
+	<
+		CompositionEffect,
+		winrt::Windows::Graphics::Effects::IGraphicsEffectSource, 
+		winrt::Windows::Graphics::Effects::IGraphicsEffect,
+		ABI::Windows::Graphics::Effects::IGraphicsEffectD2D1Interop
+	>
 {
-	namespace Microsoft::Graphics::Canvas::Effects
+	CompositionEffect(const GUID& effectId)
 	{
-		class ColorSourceEffect;
-		class Transform2DEffect;
-		class ColorMatrixEffect;
-		class CompositeEffect;
+		m_effectId = effectId;
 	}
 
-	namespace impl
+	winrt::hstring Name()
 	{
-		template <typename Class, typename Interface = Windows::Foundation::IActivationFactory>
-		auto get_local_activation_factory(hresult_error * exception = nullptr) noexcept
+		return m_name;
+	}
+
+	void Name(winrt::hstring const& name)
+	{
+		m_name = name;
+	}
+
+	template<typename T>
+	void SetProperty(const std::string& name, const T& value, GRAPHICS_EFFECT_PROPERTY_MAPPING mapping = GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT)
+	{
+		m_properties.emplace_back(name, winrt::box_value(value), mapping);
+	}
+
+	template<int N>
+	void SetProperty(const std::string& name, const float (&value)[N], GRAPHICS_EFFECT_PROPERTY_MAPPING mapping = GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT)
+	{
+		m_properties.emplace_back(name, winrt::Windows::Foundation::PropertyValue::CreateSingleArray(winrt::array_view<const float>{ (float*)&value, (float*)&value + N }), mapping);
+	}
+
+	template<>
+	void SetProperty(const std::string& name, const winrt::Windows::UI::Color& color, GRAPHICS_EFFECT_PROPERTY_MAPPING mapping)
+	{
+		float values[] = { color.R / 255.0f, color.G / 255.0f, color.B / 255.0f, color.A / 255.0f };
+		SetProperty(name, values, mapping);
+	}
+
+	template<>
+	void SetProperty(const std::string& name, const winrt::Microsoft::Graphics::Canvas::Effects::Matrix5x4& value, GRAPHICS_EFFECT_PROPERTY_MAPPING mapping)
+	{
+		float mat[5 * 4];
+		memcpy(mat, &value, sizeof(mat));
+		SetProperty(name, mat, mapping);
+	}
+
+	template<>
+	void SetProperty(const std::string& name, const winrt::Windows::Foundation::Numerics::float3x2& value, GRAPHICS_EFFECT_PROPERTY_MAPPING mapping)
+	{
+		float mat[3 * 2];
+		memcpy(mat, &value, sizeof(mat));
+		SetProperty(name, mat, mapping);
+	}
+
+	void AddSource(const winrt::Windows::Graphics::Effects::IGraphicsEffectSource& source)
+	{
+		m_sources.push_back(source);
+	}
+
+	virtual HRESULT __stdcall GetEffectId(GUID* id) override
+	{
+		*id = m_effectId;
+		return S_OK;
+	}
+
+	virtual HRESULT __stdcall GetNamedPropertyMapping(LPCWSTR name, UINT* index, GRAPHICS_EFFECT_PROPERTY_MAPPING* mapping) override
+	{
+		auto nname = ToNarrow(name);
+
+		auto entry = std::find_if(m_properties.begin(), m_properties.end(), [&nname](const auto& property)
 		{
-			param::hstring const name{ name_of<Class>() };
-			impl::com_ref<Interface> object;
-			hresult const hr = ::DllGetActivationFactory((HSTRING)get_abi(name), (IActivationFactory**)put_abi(object));
+			return nname == std::get<0>(property);
+		});
 
-			check_hresult(hr);
-
-			return object;
+		if (entry != m_properties.end())
+		{
+			*index = entry - m_properties.begin();
+			*mapping = std::get<2>(*entry);
+			return S_OK;
 		}
 
-		template <typename Class>
-		struct factory_local_entry
-		{
-			template <typename F>
-			auto call(F&& callback)
-			{
-				{
-					count_guard const guard(m_value.count);
-
-					if (m_value.object)
-					{
-						return callback(*reinterpret_cast<com_ref<Windows::Foundation::IActivationFactory> const*>(&m_value.object));
-					}
-				}
-
-				auto object = get_local_activation_factory<Class>();
-
-				if (!object.template try_as<IAgileObject>())
-				{
-					return callback(object);
-				}
-
-				{
-					count_guard const guard(m_value.count);
-
-					if (nullptr == _InterlockedCompareExchangePointer((void**)& m_value.object, get_abi(object), nullptr))
-					{
-						// This thread successfully updated the entry to hold the factory object. We thus detach, since the
-						// factory_cache_entry now owns the reference, and add the entry to the cache list. The callback
-						// may be safely called using the cached object since the count guard is currently being held.
-						detach_abi(object);
-						get_factory_cache().add(reinterpret_cast<factory_cache_typeless_entry*>(this));
-						return callback(*reinterpret_cast<com_ref<Windows::Foundation::IActivationFactory> const*>(&m_value.object));
-					}
-					else
-					{
-						// This thread failed to update the entry since another thread managed to exchange pointers first.
-						// The callback must still be called and can simply use the temporary factory object before allowing
-						// it to be released. 
-						return callback(object);
-					}
-				}
-			}
-
-		private:
-
-			struct count_guard
-			{
-				count_guard(count_guard const&) = delete;
-				count_guard& operator=(count_guard const&) = delete;
-
-				explicit count_guard(size_t& count) noexcept : m_count(count)
-				{
-#ifdef _WIN64
-					_InterlockedIncrement64((int64_t*)& m_count);
-#else
-					_InterlockedIncrement((long*)& m_count);
-#endif
-				}
-
-				~count_guard() noexcept
-				{
-#ifdef _WIN64
-					_InterlockedDecrement64((int64_t*)& m_count);
-#else
-					_InterlockedDecrement((long*)& m_count);
-#endif
-				}
-
-			private:
-
-				size_t& m_count;
-			};
-
-			struct alignas(sizeof(void*) * 2) object_and_count
-			{
-				void* object;
-				size_t count;
-			};
-
-			object_and_count m_value;
-			alignas(memory_allocation_alignment) slist_entry m_next;
-		};
-
-		#define MAKE_LOCAL_AF(x) \
-			template <> \
-			struct factory_cache_entry<Microsoft::Graphics::Canvas::Effects::x, Windows::Foundation::IActivationFactory> : factory_local_entry<Microsoft::Graphics::Canvas::Effects::x> {};
-
-		MAKE_LOCAL_AF(ColorSourceEffect);
-		MAKE_LOCAL_AF(Transform2DEffect);
-		MAKE_LOCAL_AF(ColorMatrixEffect);
-		MAKE_LOCAL_AF(CompositeEffect);
+		return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
 	}
-}
 
-#include "winrt/Microsoft.Graphics.Canvas.Effects.h"
+	virtual HRESULT __stdcall GetPropertyCount(UINT* count) override
+	{
+		*count = m_properties.size();
+		return S_OK;
+	}
+
+	virtual HRESULT __stdcall GetProperty(UINT index, ABI::Windows::Foundation::IPropertyValue** value) override
+	{
+		std::get<1>(m_properties[index]).as<ABI::Windows::Foundation::IPropertyValue>().copy_to(value);
+		return S_OK;
+	}
+
+	virtual HRESULT __stdcall GetSource(UINT index, ABI::Windows::Graphics::Effects::IGraphicsEffectSource** source) override
+	{
+		m_sources[index].as<ABI::Windows::Graphics::Effects::IGraphicsEffectSource>().copy_to(source);
+		return S_OK;
+	}
+
+	virtual HRESULT __stdcall GetSourceCount(UINT* count) override
+	{
+		*count = UINT(m_sources.size());
+		return S_OK;
+	}
+
+private:
+	GUID m_effectId;
+
+	winrt::hstring m_name = L"";
+
+	std::vector<std::tuple<std::string, winrt::Windows::Foundation::IInspectable, GRAPHICS_EFFECT_PROPERTY_MAPPING>> m_properties;
+	std::vector<winrt::Windows::Graphics::Effects::IGraphicsEffectSource> m_sources;
+};
 
 static class DPIScaler
 {
@@ -196,7 +208,8 @@ struct TenUI
 	winrt::Windows::UI::Xaml::Controls::ProgressBar progressBar{ nullptr };
 };
 
-static thread_local struct  
+//static thread_local struct  
+static struct
 {
 	HWND rootWindow;
 	HWND topStatic;
@@ -263,7 +276,10 @@ static std::wstring g_mainXaml = LR"(
             </ThemeShadow>-->
         </Grid.Resources>
         <Grid x:Name="BackdropGrid" />
-        <StackPanel Orientation="Vertical" VerticalAlignment="Center">
+		<SwapChainPanel x:Name="Overlay" />
+        <StackPanel Orientation="Vertical" VerticalAlignment="Center">)"
+#if defined(GTA_FIVE)
+	R"(
             <Viewbox Height="150" Margin="0,0,0,15" RenderTransformOrigin="0.5,0.5">
                 <Path Data="F1 M 0,0 L 43.57,0 C 44.53,0 47.41,-9.44 52.22,-28.18 68.71,-85.82 78.32,-119.44 80.73,-129.21
         L 52.54,-156.91 51.74,-156.91 C 48.05,-145.22 30.43,-93.02 -0.8,-0.48 L 0,0 0,0 z
@@ -276,12 +292,43 @@ static std::wstring g_mainXaml = LR"(
         M 147.99,-77.01 L 148.47,-77.01 C 147.03,-83.74 143.83,-88.86 138.54,-92.54 122.69,-108.88 106.83,-124.73 90.98,-140.26
         L 90.5,-140.26 C 91.46,-134.65 93.7,-130.49 97.06,-127.61 L 147.99,-77.01 z
         M 173.62,0 L 174.58,-0.48 C 162.89,-35.22 156.64,-53.16 155.68,-54.28 L 99.46,-110.16 99.46,-109.68
-        C 101.55,-101.19 112.12,-64.52 130.86,0 L 173.62,0 173.62,0 z" Fill="#ffffffff" Stretch="Fill">
+        C 101.55,-101.19 112.12,-64.52 130.86,0 L 173.62,0 173.62,0 z" Fill="#f40552" Stretch="Fill">
                 </Path>
                 <Viewbox.RenderTransform>
                     <ScaleTransform ScaleX="-1" />
-                </Viewbox.RenderTransform>
-            </Viewbox>
+                </Viewbox.RenderTransform>)"
+#elif defined(IS_RDR3)
+	R"(
+			<Viewbox Height="150" Margin="0,0,0,15">
+				<Grid>
+				<Path Data="F1 M 38.56,38.56 L 779.52,38.56 779.52,1019.52 38.56,1019.52 z"  Fill="#00000000" />
+				<Path Data="F1 M 153.23,78.44 L 154.67,77.16 153.23,75.72 153.23,78.44 153.23,78.44 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 677.12,48.82 L 523.2,98.61 516.32,118.63 673.43,67.71 677.12,48.82 677.12,48.82 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 666.07,105.5 L 668.63,92.37 507.35,144.73 502.7,158.34 666.07,105.5 666.07,105.5 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 0,0 L -13.94,40.99 -32.52,105.83 -42.61,153.07 116.91,176.77 134.69,107.28 166.24,-53.8
+					 0,0 0.16,0 z" RenderTransform="1,0,0,1,496.62,175.63" Fill="#ffffffff" />
+				<Path Data="F1 M 670.55,38.73 L 543.7,38.73 527.85,84.84 670.55,38.73 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 311.47,167.46 L 152.43,218.86 151.95,224.46 151.95,236.79 310.51,185.55 311.47,167.46 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 308.91,221.26 L 309.55,209.09 151.95,260.01 151.95,272.18 308.91,221.26 308.91,221.26 z"  Fill="#ffffffff" />
+				<Path Data="F1 M 0,0 L -9.45,-0.96 19.22,-146.18 -133.89,-168.92 -144.78,-118.16 -164.64,-6.72 -266.82,-6.72
+					 -245.52,-296.05 -245.52,-404.93 -244.72,-425.59 -401.04,-375.15 -401.04,-265.63 -405.2,-256.34 -404.88,-247.7
+					 -409.05,-182.05 -412.09,-168.76 -411.77,-133.06 -411.77,358.34 94.18,358.34 94.18,326.48 116.76,-5.28
+					 34.44,0 0,0 0,0 z
+					M -25.14,211.04 L -272.27,211.04 -264.26,171.33 -264.26,143.31 -272.27,124.73 -25.14,124.73 -27.87,163.16
+					 -25.14,211.04 z" RenderTransform="1,0,0,1,552.99,662.7" Fill="#ffffffff" />
+				<Path Data="F1 M 0,0 L 2.88,-108.56 -156.31,-113.84 -155.83,-101.99 -157.12,-79.41 -157.12,37.47 -158.24,51.08
+					 0,0 0,0 z" RenderTransform="1,0,0,1,311.79,155.13" Fill="#ffffffff" />
+				</Grid>
+)"
+#elif defined(GTA_NY)
+								 R"(
+			<Viewbox Height="150" Margin="0,0,0,15">
+				<Grid>
+				<Path Data="M26,145L54.571,145C54.952,144.905 55.143,144.714 55.143,144.429L55.143,69C43.714,57.286 33.905,47.476 25.714,39.571L25.429,39.571L25.429,144.429C25.524,144.81 25.714,145 26,145ZM54.857,57.857L55.143,57.857L55.143,54.143C43.714,42.429 33.905,32.619 25.714,24.714L25.429,24.714L25.429,28.429C36.857,40.048 46.667,49.857 54.857,57.857ZM54.857,43L55.143,43L55.143,31.571C46.857,23 38,14.143 28.571,5L26,5C25.619,5 25.429,5.19 25.429,5.571L25.429,13.571C36.857,25.19 46.667,35 54.857,43ZM57.714,30.429L124,30.429C124.381,30.333 124.571,30.143 124.571,29.857L124.571,5.571C124.571,5.19 124.381,5 124,5L32.571,5L32.571,5.286C41.714,14.619 50.095,23 57.714,30.429Z"  Fill="#ffffffff" />
+				</Grid>
+)"
+#endif
+R"(         </Viewbox>
             <TextBlock x:Name="static1" Text=" " TextAlignment="Center" Foreground="#ffffffff" FontSize="24" />
 			<Grid Margin="0,15,0,15">
 				<ProgressBar x:Name="progressBar" Foreground="White" Width="250" />
@@ -306,8 +353,27 @@ void BackdropBrush::OnConnected()
 {
 	if (!CompositionBrush())
 	{
-		auto effect = winrt::Microsoft::Graphics::Canvas::Effects::ColorSourceEffect();
-		effect.Color(winrt::Windows::UI::ColorHelper::FromArgb(255, 229, 151, 74));
+		//
+		// !NOTE! if trying to change the following code (add extra effects, change effects, etc.)
+		// 
+		// CLSIDs and properties are from Win2D:
+		//   https://github.com/microsoft/Win2D/tree/99ce19f243c6a6332f0ea312cd29fc3c785a540b/winrt/lib/effects/generated
+		//
+		// The .h files show the CLSID used, the .cpp files the properties with names, type, mapping and default values.
+		// 
+		// Properties *have* to be set in the original order - initial deserialization (at least in wuceffects.dll 10.0.22000)
+		// will check all properties before checking the name mapping. Also, `Source` properties are mapped to the AddSource
+		// list, instead of being a real property.
+		//
+		auto effect = CompositionEffect(CLSID_D2D1Flood);
+
+#ifdef GTA_FIVE
+		effect.SetProperty("Color", winrt::Windows::UI::ColorHelper::FromArgb(255, 0x16, 0x19, 0x23));
+#elif defined(IS_RDR3)
+		effect.SetProperty("Color", winrt::Windows::UI::ColorHelper::FromArgb(255, 186, 2, 2));
+#elif defined(GTA_NY)
+		effect.SetProperty("Color", winrt::Windows::UI::ColorHelper::FromArgb(255, 0x4D, 0xA6, 0xD3));
+#endif
 
 		winrt::Windows::UI::Composition::CompositionEffectSourceParameter sp{ L"layer" };
 		winrt::Windows::UI::Composition::CompositionEffectSourceParameter sp2{ L"rawImage" };
@@ -318,26 +384,41 @@ void BackdropBrush::OnConnected()
 		auto matrix = XMMatrixTransformation2D(XMVectorSet(0.0f, 0.0f, 0.0f, 0.0f), 0.0f, XMVectorSet(1.0f, 1.0f, 1.0f, 1.0f), XMVectorSet(0.5f, 0.5f, 0.0f, 0.0f), 0.2, XMVectorSet(0.0f, 0.0f, 0.0f, 1.0f));
 		XMStoreFloat3x2(&mat2d, matrix);
 
-		auto layer = winrt::Microsoft::Graphics::Canvas::Effects::Transform2DEffect();
-		layer.Source(sp2);
+		auto layer = CompositionEffect(CLSID_D2D12DAffineTransform);
+		layer.AddSource(sp2);
 		layer.Name(L"xform");
-		layer.TransformMatrix(mat2d);
+
+		layer.SetProperty("InterpolationMode", uint32_t(D2D1_2DAFFINETRANSFORM_INTERPOLATION_MODE_LINEAR));
+		layer.SetProperty("BorderMode", uint32_t(D2D1_BORDER_MODE_SOFT));
+		layer.SetProperty("TransformMatrix", mat2d);
+		layer.SetProperty("Sharpness", 0.0f);
 
 		auto mat = winrt::Microsoft::Graphics::Canvas::Effects::Matrix5x4();
 		memset(&mat, 0, sizeof(mat));
 		mat.M44 = 1.0f;
 
-		mat.M11 = 241 / 255.f;
-		mat.M22 = 163 / 255.f;
-		mat.M33 = 85 / 255.f;
+#ifdef GTA_FIVE
+		mat.M11 = 1.0f;
+		mat.M22 = 1.0f;
+		mat.M33 = 1.0f;
+		mat.M44 = 0.03f;
+#elif defined(IS_RDR3) || defined(GTA_NY)
+		mat.M11 = 1.0f;
+		mat.M22 = 1.0f;
+		mat.M33 = 1.0f;
+		mat.M44 = 0.15f;
+#endif
 
-		auto layerColor = winrt::Microsoft::Graphics::Canvas::Effects::ColorMatrixEffect();
-		layerColor.Source(layer);
-		layerColor.ColorMatrix(mat);
+		auto layerColor = CompositionEffect(CLSID_D2D1ColorMatrix);
+		layerColor.AddSource(layer);
+		layerColor.SetProperty("ColorMatrix", mat);
+		layerColor.SetProperty("AlphaMode", uint32_t(D2D1_COLORMATRIX_ALPHA_MODE_PREMULTIPLIED), GRAPHICS_EFFECT_PROPERTY_MAPPING_COLORMATRIX_ALPHA_MODE);
+		layerColor.SetProperty("ClampOutput", false);
 
-		auto compEffect = winrt::Microsoft::Graphics::Canvas::Effects::CompositeEffect();
-		compEffect.Sources().Append(effect);
-		compEffect.Sources().Append(layerColor);
+		auto compEffect = CompositionEffect(CLSID_D2D1Composite);
+		compEffect.SetProperty("Mode", uint32_t(D2D1_COMPOSITE_MODE_SOURCE_OVER));
+		compEffect.AddSource(effect);
+		compEffect.AddSource(layerColor);
 
 		auto hRsc = FindResource(GetModuleHandle(NULL), MAKEINTRESOURCE(1010), L"MEOW");
 		auto resSize = SizeofResource(GetModuleHandle(NULL), hRsc);
@@ -406,6 +487,763 @@ void BackdropBrush::OnDisconnected()
 	}
 }
 
+#include <wrl.h>
+#include <d3d11.h>
+#include <dxgi1_4.h>
+
+#include <windows.ui.xaml.media.dxinterop.h>
+
+using Microsoft::WRL::ComPtr;
+
+const BYTE g_PixyShader[] =
+{
+     68,  88,  66,  67, 115,  61, 
+    165, 134, 202, 176,  67, 148, 
+    204, 160, 214, 207, 231, 188, 
+    224, 101,   1,   0,   0,   0, 
+     48,  10,   0,   0,   5,   0, 
+      0,   0,  52,   0,   0,   0, 
+     36,   1,   0,   0, 124,   1, 
+      0,   0, 176,   1,   0,   0, 
+    180,   9,   0,   0,  82,  68, 
+     69,  70, 232,   0,   0,   0, 
+      1,   0,   0,   0,  68,   0, 
+      0,   0,   1,   0,   0,   0, 
+     28,   0,   0,   0,   0,   4, 
+    255, 255,   0,   1,   0,   0, 
+    192,   0,   0,   0,  60,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   1,   0, 
+      0,   0,   1,   0,   0,   0, 
+     80, 115,  67,  98, 117, 102, 
+      0, 171,  60,   0,   0,   0, 
+      2,   0,   0,   0,  92,   0, 
+      0,   0,  16,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0, 140,   0,   0,   0, 
+      0,   0,   0,   0,   8,   0, 
+      0,   0,   0,   0,   0,   0, 
+    152,   0,   0,   0,   0,   0, 
+      0,   0, 168,   0,   0,   0, 
+      8,   0,   0,   0,   4,   0, 
+      0,   0,   2,   0,   0,   0, 
+    176,   0,   0,   0,   0,   0, 
+      0,   0, 105,  82, 101, 115, 
+    111, 108, 117, 116, 105, 111, 
+    110,   0,   1,   0,   3,   0, 
+      1,   0,   2,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+    105,  84, 105, 109, 101,   0, 
+    171, 171,   0,   0,   3,   0, 
+      1,   0,   1,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+     77, 105,  99, 114, 111, 115, 
+    111, 102, 116,  32,  40,  82, 
+     41,  32,  72,  76,  83,  76, 
+     32,  83, 104,  97, 100, 101, 
+    114,  32,  67, 111, 109, 112, 
+    105, 108, 101, 114,  32,  49, 
+     48,  46,  49,   0,  73,  83, 
+     71,  78,  80,   0,   0,   0, 
+      2,   0,   0,   0,   8,   0, 
+      0,   0,  56,   0,   0,   0, 
+      0,   0,   0,   0,   1,   0, 
+      0,   0,   3,   0,   0,   0, 
+      0,   0,   0,   0,  15,   0, 
+      0,   0,  68,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   3,   0,   0,   0, 
+      1,   0,   0,   0,   3,   3, 
+      0,   0,  83,  86,  95,  80, 
+     79,  83,  73,  84,  73,  79, 
+     78,   0,  84,  69,  88,  67, 
+     79,  79,  82,  68,   0, 171, 
+    171, 171,  79,  83,  71,  78, 
+     44,   0,   0,   0,   1,   0, 
+      0,   0,   8,   0,   0,   0, 
+     32,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      3,   0,   0,   0,   0,   0, 
+      0,   0,  15,   0,   0,   0, 
+     83,  86,  95,  84,  65,  82, 
+     71,  69,  84,   0, 171, 171, 
+     83,  72,  68,  82, 252,   7, 
+      0,   0,  64,   0,   0,   0, 
+    255,   1,   0,   0,  89,   0, 
+      0,   4,  70, 142,  32,   0, 
+      0,   0,   0,   0,   1,   0, 
+      0,   0,  98,  16,   0,   3, 
+     50,  16,  16,   0,   1,   0, 
+      0,   0, 101,   0,   0,   3, 
+    242,  32,  16,   0,   0,   0, 
+      0,   0, 104,   0,   0,   2, 
+      5,   0,   0,   0,  56,   0, 
+      0,  11,  50,   0,  16,   0, 
+      0,   0,   0,   0, 166, 138, 
+     32,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   2,  64, 
+      0,   0, 205, 204, 204,  61, 
+     66,  96, 101,  63,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+     77,   0,   0,   6,  18,   0, 
+     16,   0,   0,   0,   0,   0, 
+      0, 208,   0,   0,  10,   0, 
+     16,   0,   0,   0,   0,   0, 
+     50,   0,   0,  15, 194,   0, 
+     16,   0,   0,   0,   0,   0, 
+     86,  17,  16,   0,   1,   0, 
+      0,   0,   2,  64,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0, 128, 191, 
+      0,   0, 128,  63,   2,  64, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+    128,  63,   0,   0,   0,   0, 
+     54,   0,   0,   8,  50,   0, 
+     16,   0,   1,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,  48,   0,   0,   1, 
+     33,   0,   0,   7,  66,   0, 
+     16,   0,   1,   0,   0,   0, 
+     26,   0,  16,   0,   1,   0, 
+      0,   0,   1,  64,   0,   0, 
+     66,   0,   0,   0,   3,   0, 
+      4,   3,  42,   0,  16,   0, 
+      1,   0,   0,   0,  43,   0, 
+      0,   5,  66,   0,  16,   0, 
+      1,   0,   0,   0,  26,   0, 
+     16,   0,   1,   0,   0,   0, 
+     56,   0,   0,   7, 130,   0, 
+     16,   0,   1,   0,   0,   0, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,   1,  64,   0,   0, 
+     53, 165, 231,  64,  50,   0, 
+      0,  15, 114,   0,  16,   0, 
+      2,   0,   0,   0, 166,  10, 
+     16,   0,   1,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+      0,  63, 143, 194, 117,  60, 
+     10, 215,  35,  60,   0,   0, 
+      0,   0,   2,  64,   0,   0, 
+      0,   0, 128,  63,   0,   0, 
+    128,  63,   0,   0, 128,  63, 
+      0,   0,   0,   0,  56,   0, 
+      0,   7, 130,   0,  16,   0, 
+      2,   0,   0,   0,  42,   0, 
+     16,   0,   0,   0,   0,   0, 
+     10,   0,  16,   0,   2,   0, 
+      0,   0,  65,   0,   0,   5, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,  58,   0,  16,   0, 
+      1,   0,   0,   0,  50,   0, 
+      0,  10, 130,   0,  16,   0, 
+      1,   0,   0,   0,  42,   0, 
+     16,   0,   1,   0,   0,   0, 
+      1,  64,   0,   0,  53, 165, 
+    231,  64,  58,   0,  16, 128, 
+     65,   0,   0,   0,   1,   0, 
+      0,   0,  50,   0,   0,  10, 
+     18,   0,  16,   0,   3,   0, 
+      0,   0,  42, 128,  32,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   1,  64,   0,   0, 
+      0,   0,   0,  64,  42,   0, 
+     16,   0,   1,   0,   0,   0, 
+     77,   0,   0,   6,  18,   0, 
+     16,   0,   3,   0,   0,   0, 
+      0, 208,   0,   0,  10,   0, 
+     16,   0,   3,   0,   0,   0, 
+     50,   0,   0,  10, 130,   0, 
+     16,   0,   1,   0,   0,   0, 
+     10,   0,  16, 128,  65,   0, 
+      0,   0,   3,   0,   0,   0, 
+      1,  64,   0,   0, 205, 204, 
+    204,  61,  58,   0,  16,   0, 
+      1,   0,   0,   0,  56,   0, 
+      0,   7,  34,   0,  16,   0, 
+      3,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+     58,   0,  16,   0,   2,   0, 
+      0,   0,  14,   0,   0,   7, 
+     18,   0,  16,   0,   3,   0, 
+      0,   0,  26,   0,  16,   0, 
+      0,   0,   0,   0,  26,   0, 
+     16,   0,   2,   0,   0,   0, 
+     50,   0,   0,   9,  50,   0, 
+     16,   0,   2,   0,   0,   0, 
+    230,  10,  16,   0,   0,   0, 
+      0,   0,   6,   0,  16,   0, 
+      2,   0,   0,   0,  70,   0, 
+     16,   0,   3,   0,   0,   0, 
+     65,   0,   0,   5,  50,   0, 
+     16,   0,   3,   0,   0,   0, 
+     22,   5,  16,   0,   2,   0, 
+      0,   0,   0,   0,   0,   7, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,  42,   0,  16,   0, 
+      1,   0,   0,   0,   1,  64, 
+      0,   0,  18, 131, 249,  65, 
+     65,   0,   0,   5,  66,   0, 
+     16,   0,   3,   0,   0,   0, 
+     58,   0,  16,   0,   1,   0, 
+      0,   0,  50,   0,   0,  15, 
+    114,   0,  16,   0,   4,   0, 
+      0,   0,  70,   2,  16,   0, 
+      3,   0,   0,   0,   2,  64, 
+      0,   0, 172, 197,  39,  55, 
+    172, 197,  39,  55, 172, 197, 
+     39,  55,   0,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0, 137,  65,  62,   0,   0, 
+      0,   0,  50,   0,   0,  15, 
+    194,   0,  16,   0,   3,   0, 
+      0,   0,   6,   4,  16,   0, 
+      3,   0,   0,   0,   2,  64, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0, 172, 197, 
+     39,  55, 172, 197,  39,  55, 
+      2,  64,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+    205, 111, 245,  70, 205, 111, 
+    245,  70,  16,   0,   0,  10, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,   2,  64,   0,   0, 
+    130,  43,  85,  65, 240,  22, 
+    188,  65, 153, 176, 173,  65, 
+      0,   0,   0,   0,  70,   2, 
+     16,   0,   4,   0,   0,   0, 
+     16,   0,   0,  10, 130,   0, 
+     16,   0,   2,   0,   0,   0, 
+      2,  64,   0,   0,  56, 248, 
+    168,  65, 127, 217, 229,  65, 
+     50, 230,  62,  65,   0,   0, 
+      0,   0,  70,   2,  16,   0, 
+      4,   0,   0,   0,  26,   0, 
+      0,   5,  18,   0,  16,   0, 
+      4,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+     26,   0,   0,   5,  34,   0, 
+     16,   0,   4,   0,   0,   0, 
+     58,   0,  16,   0,   2,   0, 
+      0,   0,  14,   0,   0,   7, 
+    194,   0,  16,   0,   3,   0, 
+      0,   0, 166,  14,  16,   0, 
+      3,   0,   0,   0,   6,   4, 
+     16,   0,   4,   0,   0,   0, 
+     26,   0,   0,   5, 194,   0, 
+     16,   0,   3,   0,   0,   0, 
+    166,  14,  16,   0,   3,   0, 
+      0,   0,   0,   0,   0,   8, 
+     50,   0,  16,   0,   3,   0, 
+      0,   0,  22,   5,  16,   0, 
+      2,   0,   0,   0,  70,   0, 
+     16, 128,  65,   0,   0,   0, 
+      3,   0,   0,   0,   0,   0, 
+      0,  10,  50,   0,  16,   0, 
+      3,   0,   0,   0,  70,   0, 
+     16,   0,   3,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+      0, 191,   0,   0,   0, 191, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,  50,   0,   0,  12, 
+     50,   0,  16,   0,   3,   0, 
+      0,   0, 230,  10,  16,   0, 
+      3,   0,   0,   0,   2,  64, 
+      0,   0, 102, 102, 102,  63, 
+    102, 102, 102,  63,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+     70,   0,  16,   0,   3,   0, 
+      0,   0,   0,   0,   0,  10, 
+     50,   0,  16,   0,   3,   0, 
+      0,   0,  70,   0,  16,   0, 
+      3,   0,   0,   0,   2,  64, 
+      0,   0, 102, 102, 230, 190, 
+    102, 102, 230, 190,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+     56,   0,   0,  10,  50,   0, 
+     16,   0,   2,   0,   0,   0, 
+     70,   0,  16,   0,   2,   0, 
+      0,   0,   2,  64,   0,   0, 
+      0,   0,  32,  65,   0,   0, 
+     32,  65,   0,   0,   0,   0, 
+      0,   0,   0,   0,  26,   0, 
+      0,   5,  50,   0,  16,   0, 
+      2,   0,   0,   0,  70,   0, 
+     16,   0,   2,   0,   0,   0, 
+     50,   0,   0,  15,  50,   0, 
+     16,   0,   2,   0,   0,   0, 
+     70,   0,  16,   0,   2,   0, 
+      0,   0,   2,  64,   0,   0, 
+      0,   0,   0,  64,   0,   0, 
+      0,  64,   0,   0,   0,   0, 
+      0,   0,   0,   0,   2,  64, 
+      0,   0,   0,   0, 128, 191, 
+      0,   0, 128, 191,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+     50,   0,   0,  14,  50,   0, 
+     16,   0,   2,   0,   0,   0, 
+     70,   0,  16, 128, 129,   0, 
+      0,   0,   2,   0,   0,   0, 
+      2,  64,   0,   0,  10, 215, 
+     35,  60,  10, 215,  35,  60, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,  70,   0,  16, 128, 
+    129,   0,   0,   0,   3,   0, 
+      0,   0,   0,   0,   0,   8, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,  26,   0,  16, 128, 
+     65,   0,   0,   0,   2,   0, 
+      0,   0,  10,   0,  16,   0, 
+      2,   0,   0,   0,   0,   0, 
+      0,   7, 130,   0,  16,   0, 
+      2,   0,   0,   0,  26,   0, 
+     16,   0,   2,   0,   0,   0, 
+     10,   0,  16,   0,   2,   0, 
+      0,   0,  52,   0,   0,   7, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,  58,   0,  16,   0, 
+      1,   0,   0,   0,  58,   0, 
+     16,   0,   2,   0,   0,   0, 
+     52,   0,   0,   7,  18,   0, 
+     16,   0,   2,   0,   0,   0, 
+     26,   0,  16,   0,   2,   0, 
+      0,   0,  10,   0,  16,   0, 
+      2,   0,   0,   0,  50,   0, 
+      0,   9, 130,   0,  16,   0, 
+      1,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+      1,  64,   0,   0, 154, 153, 
+     25,  63,  10,   0,  16,   0, 
+      2,   0,   0,   0,  50,   0, 
+      0,  10,  66,   0,  16,   0, 
+      1,   0,   0,   0,  10,   0, 
+     16, 128,  65,   0,   0,   0, 
+      0,   0,   0,   0,   1,  64, 
+      0,   0,   0,   0, 160,  64, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,   0,   0,   0,  10, 
+    194,   0,  16,   0,   1,   0, 
+      0,   0, 166,  14,  16,   0, 
+      1,   0,   0,   0,   2,  64, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+    160, 192,  10, 215,  35, 188, 
+     56,   0,   0,   8,  66,   0, 
+     16,   0,   1,   0,   0,   0, 
+     42,   0,  16, 128, 129,   0, 
+      0,   0,   1,   0,   0,   0, 
+      1,  64,   0,   0,   0,   0, 
+      0,  63,  51,   0,   0,   7, 
+     66,   0,  16,   0,   1,   0, 
+      0,   0,  42,   0,  16,   0, 
+      1,   0,   0,   0,   1,  64, 
+      0,   0,   0,   0, 128,  63, 
+     50,   0,   0,   9,  66,   0, 
+     16,   0,   1,   0,   0,   0, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,   1,  64,   0,   0, 
+    205, 204,  76,  61,   1,  64, 
+      0,   0, 205, 204,  76,  61, 
+     56,   0,   0,   7,  18,   0, 
+     16,   0,   2,   0,   0,   0, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,   1,  64,   0,   0, 
+      0,   0,   0, 192,   0,   0, 
+      0,   8,  66,   0,  16,   0, 
+      1,   0,   0,   0,  42,   0, 
+     16, 128,  65,   0,   0,   0, 
+      1,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+     14,   0,   0,  10, 130,   0, 
+     16,   0,   1,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+    128,  63,   0,   0, 128,  63, 
+      0,   0, 128,  63,   0,   0, 
+    128,  63,  10,   0,  16,   0, 
+      2,   0,   0,   0,  56,  32, 
+      0,   7,  66,   0,  16,   0, 
+      1,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,  50,   0,   0,   9, 
+    130,   0,  16,   0,   1,   0, 
+      0,   0,  42,   0,  16,   0, 
+      1,   0,   0,   0,   1,  64, 
+      0,   0,   0,   0,   0, 192, 
+      1,  64,   0,   0,   0,   0, 
+     64,  64,  56,   0,   0,   7, 
+     66,   0,  16,   0,   1,   0, 
+      0,   0,  42,   0,  16,   0, 
+      1,   0,   0,   0,  42,   0, 
+     16,   0,   1,   0,   0,   0, 
+     56,   0,   0,   7,  66,   0, 
+     16,   0,   1,   0,   0,   0, 
+     42,   0,  16,   0,   1,   0, 
+      0,   0,  58,   0,  16,   0, 
+      1,   0,   0,   0,  14,   0, 
+      0,   7, 130,   0,  16,   0, 
+      1,   0,   0,   0,  42,   0, 
+     16,   0,   3,   0,   0,   0, 
+     42,   0,  16,   0,   2,   0, 
+      0,   0,  50,   0,   0,   9, 
+     18,   0,  16,   0,   1,   0, 
+      0,   0,  42,   0,  16,   0, 
+      1,   0,   0,   0,  58,   0, 
+     16,   0,   1,   0,   0,   0, 
+     10,   0,  16,   0,   1,   0, 
+      0,   0,  30,   0,   0,   7, 
+     34,   0,  16,   0,   1,   0, 
+      0,   0,  26,   0,  16,   0, 
+      1,   0,   0,   0,   1,  64, 
+      0,   0,   1,   0,   0,   0, 
+     22,   0,   0,   1,  54,   0, 
+      0,   5, 130,  32,  16,   0, 
+      0,   0,   0,   0,  10,   0, 
+     16,   0,   1,   0,   0,   0, 
+     54,   0,   0,   8, 114,  32, 
+     16,   0,   0,   0,   0,   0, 
+      2,  64,   0,   0,   0,   0, 
+    128,  63,   0,   0, 128,  63, 
+      0,   0, 128,  63,   0,   0, 
+      0,   0,  62,   0,   0,   1, 
+     83,  84,  65,  84, 116,   0, 
+      0,   0,  62,   0,   0,   0, 
+      5,   0,   0,   0,   0,   0, 
+      0,   0,   2,   0,   0,   0, 
+     52,   0,   0,   0,   2,   0, 
+      0,   0,   0,   0,   0,   0, 
+      1,   0,   0,   0,   1,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      3,   0,   0,   0,   0,   0, 
+      0,   0,   8,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0,   0,   0, 
+      0,   0,   0,   0
+};
+
+const BYTE g_VertyShader[] = {
+	68, 88, 66, 67, 76, 75,
+	108, 163, 29, 221, 215, 151,
+	233, 28, 62, 114, 145, 31,
+	52, 111, 1, 0, 0, 0,
+	176, 2, 0, 0, 5, 0,
+	0, 0, 52, 0, 0, 0,
+	128, 0, 0, 0, 180, 0,
+	0, 0, 12, 1, 0, 0,
+	52, 2, 0, 0, 82, 68,
+	69, 70, 68, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	28, 0, 0, 0, 0, 4,
+	254, 255, 0, 1, 0, 0,
+	28, 0, 0, 0, 77, 105,
+	99, 114, 111, 115, 111, 102,
+	116, 32, 40, 82, 41, 32,
+	72, 76, 83, 76, 32, 83,
+	104, 97, 100, 101, 114, 32,
+	67, 111, 109, 112, 105, 108,
+	101, 114, 32, 49, 48, 46,
+	49, 0, 73, 83, 71, 78,
+	44, 0, 0, 0, 1, 0,
+	0, 0, 8, 0, 0, 0,
+	32, 0, 0, 0, 0, 0,
+	0, 0, 6, 0, 0, 0,
+	1, 0, 0, 0, 0, 0,
+	0, 0, 1, 1, 0, 0,
+	83, 86, 95, 86, 69, 82,
+	84, 69, 88, 73, 68, 0,
+	79, 83, 71, 78, 80, 0,
+	0, 0, 2, 0, 0, 0,
+	8, 0, 0, 0, 56, 0,
+	0, 0, 0, 0, 0, 0,
+	1, 0, 0, 0, 3, 0,
+	0, 0, 0, 0, 0, 0,
+	15, 0, 0, 0, 68, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 3, 0,
+	0, 0, 1, 0, 0, 0,
+	3, 12, 0, 0, 83, 86,
+	95, 80, 79, 83, 73, 84,
+	73, 79, 78, 0, 84, 69,
+	88, 67, 79, 79, 82, 68,
+	0, 171, 171, 171, 83, 72,
+	68, 82, 32, 1, 0, 0,
+	64, 0, 1, 0, 72, 0,
+	0, 0, 96, 0, 0, 4,
+	18, 16, 16, 0, 0, 0,
+	0, 0, 6, 0, 0, 0,
+	103, 0, 0, 4, 242, 32,
+	16, 0, 0, 0, 0, 0,
+	1, 0, 0, 0, 101, 0,
+	0, 3, 50, 32, 16, 0,
+	1, 0, 0, 0, 104, 0,
+	0, 2, 1, 0, 0, 0,
+	54, 0, 0, 8, 194, 32,
+	16, 0, 0, 0, 0, 0,
+	2, 64, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	128, 63, 1, 0, 0, 7,
+	18, 0, 16, 0, 0, 0,
+	0, 0, 10, 16, 16, 0,
+	0, 0, 0, 0, 1, 64,
+	0, 0, 1, 0, 0, 0,
+	85, 0, 0, 7, 66, 0,
+	16, 0, 0, 0, 0, 0,
+	10, 16, 16, 0, 0, 0,
+	0, 0, 1, 64, 0, 0,
+	1, 0, 0, 0, 86, 0,
+	0, 5, 50, 0, 16, 0,
+	0, 0, 0, 0, 134, 0,
+	16, 0, 0, 0, 0, 0,
+	0, 0, 0, 10, 194, 0,
+	16, 0, 0, 0, 0, 0,
+	6, 4, 16, 0, 0, 0,
+	0, 0, 2, 64, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 191,
+	0, 0, 0, 191, 54, 0,
+	0, 5, 50, 32, 16, 0,
+	1, 0, 0, 0, 70, 0,
+	16, 0, 0, 0, 0, 0,
+	0, 0, 0, 7, 18, 32,
+	16, 0, 0, 0, 0, 0,
+	42, 0, 16, 0, 0, 0,
+	0, 0, 42, 0, 16, 0,
+	0, 0, 0, 0, 56, 0,
+	0, 7, 34, 32, 16, 0,
+	0, 0, 0, 0, 58, 0,
+	16, 0, 0, 0, 0, 0,
+	1, 64, 0, 0, 0, 0,
+	0, 192, 62, 0, 0, 1,
+	83, 84, 65, 84, 116, 0,
+	0, 0, 9, 0, 0, 0,
+	1, 0, 0, 0, 0, 0,
+	0, 0, 3, 0, 0, 0,
+	3, 0, 0, 0, 0, 0,
+	0, 0, 2, 0, 0, 0,
+	1, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	2, 0, 0, 0, 0, 0,
+	0, 0, 1, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0, 0, 0,
+	0, 0, 0, 0
+};
+
+#include <dwmapi.h>
+#include <mmsystem.h>
+
+#pragma comment(lib, "dwmapi")
+
+static void InitializeRenderOverlay(winrt::Windows::UI::Xaml::Controls::SwapChainPanel swapChainPanel, int w, int h)
+{
+	auto nativePanel = swapChainPanel.as<ISwapChainPanelNative>();
+
+	std::thread([w, h, swapChainPanel, nativePanel]()
+	{
+		auto loadSystemDll = [](auto dll)
+		{
+			wchar_t systemPath[512];
+			GetSystemDirectory(systemPath, _countof(systemPath));
+
+			wcscat_s(systemPath, dll);
+
+			return LoadLibrary(systemPath);
+		};
+
+		ComPtr<ID3D11Device> g_pd3dDevice = NULL;
+		ComPtr<ID3D11DeviceContext> g_pd3dDeviceContext = NULL;
+		ComPtr<IDXGISwapChain1> g_pSwapChain = NULL;
+		ComPtr<ID3D11RenderTargetView> g_mainRenderTargetView = NULL;
+
+		// Setup swap chain
+		DXGI_SWAP_CHAIN_DESC1 sd;
+		ZeroMemory(&sd, sizeof(sd));
+		sd.BufferCount = 2;
+		sd.Width = w;
+		sd.Height = h;
+		sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+		sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		sd.SampleDesc.Count = 1;
+		sd.SampleDesc.Quality = 0;
+		sd.Scaling = DXGI_SCALING_STRETCH;
+		sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+
+		UINT createDeviceFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+		//createDeviceFlags |= D3D11_CREATE_DEVICE_DEBUG;
+		D3D_FEATURE_LEVEL featureLevel;
+
+		// so we'll fail if FL11 isn't supported
+		const D3D_FEATURE_LEVEL featureLevelArray[1] = {
+			D3D_FEATURE_LEVEL_11_0,
+		};
+
+		auto d3d11 = loadSystemDll(L"\\d3d11.dll");
+		auto _D3D11CreateDevice = (decltype(&D3D11CreateDevice))GetProcAddress(d3d11, "D3D11CreateDevice");
+
+		if (_D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, createDeviceFlags, featureLevelArray, std::size(featureLevelArray), D3D11_SDK_VERSION, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+		{
+			return;
+		}
+
+		ComPtr<IDXGIDevice1> device1;
+		if (FAILED(g_pd3dDevice.As(&device1)))
+		{
+			return;
+		}
+
+		ComPtr<IDXGIAdapter> adapter;
+		if (FAILED(device1->GetAdapter(&adapter)))
+		{
+			return;
+		}
+
+		ComPtr<IDXGIFactory> parent;
+		if (FAILED(adapter->GetParent(__uuidof(IDXGIFactory), &parent)))
+		{
+			return;
+		}
+
+		ComPtr<IDXGIFactory3> factory3;
+		if (FAILED(parent.As(&factory3)))
+		{
+			return;
+		}
+
+		if (FAILED(factory3->CreateSwapChainForComposition(g_pd3dDevice.Get(), &sd, NULL, &g_pSwapChain)))
+		{
+			return;
+		}
+
+		{
+			ComPtr<ID3D11Texture2D> pBackBuffer;
+			g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+			g_pd3dDevice->CreateRenderTargetView(pBackBuffer.Get(), NULL, &g_mainRenderTargetView);
+		}
+
+		swapChainPanel.Dispatcher().TryRunAsync(
+		winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+		[g_pSwapChain, nativePanel]()
+		{
+			nativePanel->SetSwapChain(g_pSwapChain.Get());
+		});
+
+		ComPtr<ID3D11VertexShader> vs;
+		ComPtr<ID3D11PixelShader> ps;
+
+		g_pd3dDevice->CreatePixelShader(g_PixyShader, sizeof(g_PixyShader), NULL, &ps);
+		g_pd3dDevice->CreateVertexShader(g_VertyShader, sizeof(g_VertyShader), NULL, &vs);
+
+		ComPtr<ID3D11BlendState> bs;
+
+		{
+			D3D11_BLEND_DESC desc = { 0 };
+			desc.AlphaToCoverageEnable = false;
+			desc.RenderTarget[0].BlendEnable = true;
+			desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+			desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+			desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+			desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+			desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+			desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+			desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+
+			g_pd3dDevice->CreateBlendState(&desc, &bs);
+		}
+
+		struct CBuf
+		{
+			float res[2];
+			float sec;
+			float pad;
+		};
+
+		ComPtr<ID3D11Buffer> cbuf;
+
+		{
+			D3D11_BUFFER_DESC desc;
+			desc.ByteWidth = sizeof(CBuf);
+			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			desc.MiscFlags = 0;
+			g_pd3dDevice->CreateBuffer(&desc, NULL, &cbuf);
+		}
+
+		while (g_uui.ten)
+		{
+			// Setup viewport
+			D3D11_VIEWPORT vp;
+			memset(&vp, 0, sizeof(D3D11_VIEWPORT));
+			vp.Width = w;
+			vp.Height = h;
+			vp.MinDepth = 0.0f;
+			vp.MaxDepth = 1.0f;
+			vp.TopLeftX = vp.TopLeftY = 0;
+			g_pd3dDeviceContext->RSSetViewports(1, &vp);
+
+			auto rtv = g_mainRenderTargetView.Get();
+			g_pd3dDeviceContext->OMSetRenderTargets(1, &rtv, NULL);
+
+			float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+			g_pd3dDeviceContext->ClearRenderTargetView(rtv, clearColor);
+
+			g_pd3dDeviceContext->VSSetShader(vs.Get(), NULL, 0);
+			g_pd3dDeviceContext->PSSetShader(ps.Get(), NULL, 0);
+
+			auto cb = cbuf.Get();
+			g_pd3dDeviceContext->VSSetConstantBuffers(0, 1, &cb);
+			g_pd3dDeviceContext->PSSetConstantBuffers(0, 1, &cb);
+
+			g_pd3dDeviceContext->OMSetBlendState(bs.Get(), NULL, 0xFFFFFFFF);
+
+			static auto startTime = timeGetTime();
+
+			D3D11_MAPPED_SUBRESOURCE mapped_resource;
+			if (SUCCEEDED(g_pd3dDeviceContext->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_resource)))
+			{
+				auto c = (CBuf*)mapped_resource.pData;
+				c->res[0] = float(w);
+				c->res[1] = float(h);
+				c->sec = (timeGetTime() - startTime) / 1000.0f;
+				g_pd3dDeviceContext->Unmap(cb, 0);
+			}
+
+			g_pd3dDeviceContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+			g_pd3dDeviceContext->Draw(4, 0);
+
+			g_pSwapChain->Present(0, 0);
+			DwmFlush();
+		}
+
+		// prevent the thread from exiting (the CRT is broken and will crash on thread exit in some cases)
+		WaitForSingleObject(GetCurrentProcess(), INFINITE);
+	}).detach();
+}
+
 void UI_CreateWindow()
 {
 	g_uui.taskbarMsg = RegisterWindowMessage(L"TaskbarButtonCreated");
@@ -469,6 +1307,15 @@ void UI_CreateWindow()
 
 		auto bg = ui.FindName(L"BackdropGrid").as<winrt::Windows::UI::Xaml::Controls::Grid>();
 		bg.Background(winrt::make<BackdropBrush>());
+
+		{
+			auto sc = ui.FindName(L"Overlay").as<winrt::Windows::UI::Xaml::Controls::SwapChainPanel>();
+
+			if (_time64(NULL) < 1643670000)
+			{
+				InitializeRenderOverlay(sc, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight));
+			}
+		}
 
 		/*auto shadow = ui.FindName(L"SharedShadow").as<winrt::Windows::UI::Xaml::Media::ThemeShadow>();
 		shadow.Receivers().Append(bg);*/
@@ -628,76 +1475,14 @@ void UI_RegisterClass()
 	RegisterClassEx(&wndClass);
 }
 
-static HANDLE g_actCtx;
-
-bool GenManifest()
-{
-	if (g_actCtx)
-	{
-		return true;
-	}
-
-	auto hRsc = FindResource(GetModuleHandle(NULL), MAKEINTRESOURCE(1), RT_MANIFEST);
-
-	if (hRsc)
-	{
-		auto resSize = SizeofResource(GetModuleHandle(NULL), hRsc);
-		auto resData = LoadResource(GetModuleHandle(NULL), hRsc);
-
-		auto resPtr = static_cast<const char*>(LockResource(resData));
-
-		wchar_t pathInfo[1024];
-		GetModuleFileName(GetModuleHandle(NULL), pathInfo, std::size(pathInfo));
-
-		auto cRef = wcsrchr(pathInfo, L'\\');
-		cRef[0] = L'\0';
-
-		auto pathPtr = cRef + 1;
-
-		std::string manifestData{ resPtr, resSize };
-		std::wstring wideManifest = ToWide(manifestData);
-
-		boost::algorithm::replace_all(wideManifest, L"DELETE-->", "");
-		boost::algorithm::replace_all(wideManifest, L"<!--DELETE", "");
-		boost::algorithm::replace_all(wideManifest, L"FiveM_Ship.exe", std::wstring{ pathPtr });
-
-		manifestData = ToNarrow(wideManifest);
-
-		FILE* f = _wfopen(va(L"%s\\FiveM.manifest.xml", pathInfo), L"wb");
-		if (f)
-		{
-			fwrite(manifestData.c_str(), 1, manifestData.size(), f);
-			fclose(f);
-
-			ACTCTX ac;
-			ac.cbSize = sizeof(ac);
-			ac.dwFlags = 0;
-			ac.lpSource = va(L"%s\\FiveM.manifest.xml", pathInfo);
-
-			g_actCtx = CreateActCtx(&ac);
-			
-			if (g_actCtx)
-			{
-				ULONG_PTR cookie;
-				if (ActivateActCtx(g_actCtx, &cookie))
-				{
-					_wunlink(va(L"%s\\FiveM.manifest.xml", pathInfo));
-					return true;
-				}
-			}
-		}
-	}
-
-	return false;
-}
-
 struct TenUIStorage;
 
 static TenUIStorage* g_tenUI;
 
 struct TenUIStorage : public TenUIBase
 {
-	WindowsXamlManager manager{ nullptr };
+	// convoluted stuff to prevent WindowsXamlManager destruction weirdness
+	static inline thread_local WindowsXamlManager* gManager{ nullptr };
 
 	TenUIStorage()
 	{
@@ -706,29 +1491,31 @@ struct TenUIStorage : public TenUIBase
 
 	void InitManager()
 	{
-		if (!manager)
+		if (!gManager)
 		{
-			manager = WindowsXamlManager::InitializeForCurrentThread();
+			static thread_local WindowsXamlManager manager = WindowsXamlManager::InitializeForCurrentThread();
+			gManager = &manager;
 		}
 	}
 
 	virtual ~TenUIStorage() override
 	{
-		if (manager)
-		{
-			manager.Close();
-		}
-
 		ShowWindow(g_uui.tenWindow, SW_HIDE);
 
 		g_tenUI = nullptr;
+	}
+
+	static void ReallyBreakIt()
+	{
+		if (gManager)
+		{
+			gManager->Close();
+		}
 	}
 };
 
 std::unique_ptr<TenUIBase> UI_InitTen()
 {
-	bool mf = GenManifest();
-
 	// Windows 10 RS5+ gets a neat UI
 	DWORDLONG viMask = 0;
 	OSVERSIONINFOEXW osvi = { 0 };
@@ -737,7 +1524,25 @@ std::unique_ptr<TenUIBase> UI_InitTen()
 
 	VER_SET_CONDITION(viMask, VER_BUILDNUMBER, VER_GREATER_EQUAL);
 
-	if (mf && VerifyVersionInfoW(&osvi, VER_BUILDNUMBER, viMask))
+	bool forceOff = false;
+
+	static HostSharedData<CfxState> initState("CfxInitState");
+
+	if (initState->isReverseGame)
+	{
+		forceOff = true;
+	}
+
+	if (getenv("CitizenFX_NoTenUI"))
+	{
+		forceOff = true;
+	}
+
+#ifdef IS_LAUNCHER
+	forceOff = true;
+#endif
+
+	if (VerifyVersionInfoW(&osvi, VER_BUILDNUMBER, viMask) && !forceOff)
 	{
 		RO_REGISTRATION_COOKIE cookie;
 
@@ -753,6 +1558,11 @@ std::unique_ptr<TenUIBase> UI_InitTen()
 	}
 
 	return std::make_unique<TenUIBase>();
+}
+
+void UI_DestroyTen()
+{
+	TenUIStorage::ReallyBreakIt();
 }
 
 void UI_DoCreation(bool safeMode)
@@ -815,17 +1625,12 @@ void UI_DoCreation(bool safeMode)
 
 void UI_DoDestruction()
 {
-	if (g_uui.ten)
-	{
-		if (g_uui.ten->uiSource)
-		{
-			g_uui.ten->uiSource.Close();
-		}
-	}
+	static HostSharedData<CfxState> initState("CfxInitState");
+	AllowSetForegroundWindow((initState->gamePid) ? initState->gamePid : GetCurrentProcessId());
+
+	ShowWindow(g_uui.rootWindow, SW_HIDE);
 
 	g_uui.ten = {};
-
-	AllowSetForegroundWindow(GetCurrentProcessId());
 
 	DestroyWindow(g_uui.rootWindow);
 }
@@ -894,6 +1699,11 @@ bool UI_IsCanceled()
 	return g_uui.canceled;
 }
 
+void UI_DisplayError(const wchar_t* error)
+{
+	MessageBoxW(UI_GetWindowHandle(), error, L"Error", MB_OK | MB_ICONSTOP);
+}
+
 #include <wrl/module.h>
 
 extern "C" HRESULT __stdcall DllCanUnloadNow()
@@ -914,13 +1724,13 @@ extern "C" HRESULT __stdcall DllCanUnloadNow()
 	return 0; // S_OK
 }
 
-extern "C" DLL_EXPORT HRESULT WINRT_CALL DllGetActivationFactory(HSTRING classId, IActivationFactory** factory)
+extern "C" DLL_EXPORT HRESULT WINAPI DllGetActivationFactory(HSTRING classId, IActivationFactory** factory)
 {
 	try
 	{
 		*factory = nullptr;
 		uint32_t length{};
-		wchar_t const* const buffer = WINRT_WindowsGetStringRawBuffer(classId, &length);
+		wchar_t const* const buffer = WindowsGetStringRawBuffer(classId, &length);
 		std::wstring_view const name{ buffer, length };
 
 		auto requal = [](std::wstring_view const& left, std::wstring_view const& right) noexcept
@@ -942,8 +1752,4 @@ extern "C" DLL_EXPORT HRESULT WINRT_CALL DllGetActivationFactory(HSTRING classId
 	}
 	catch (...) { return winrt::to_hresult(); }
 }
-
-WrlCreatorMapIncludePragma(ColorSourceEffect);
-WrlCreatorMapIncludePragma(ColorMatrixEffect);
-WrlCreatorMapIncludePragma(Transform2DEffect);
-WrlCreatorMapIncludePragma(CompositeEffect);
+#endif

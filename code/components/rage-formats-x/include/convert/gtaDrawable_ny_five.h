@@ -269,14 +269,14 @@ five::grmShaderGroup* convert(ny::grmShaderGroup* shaderGroup)
 
 				if (newShader->GetParameter("specularIntensityMult"))
 				{
-					newShader->SetParameter("specularIntensityMult", &multiplier, sizeof(multiplier));
+					newShader->SetParameter("specularIntensityMult", &multiplier, 1.25);
 				}
 
-				multiplier[0] *= 125.0f;
+				multiplier[0] *= 12.5f;
 
 				if (newShader->GetParameter("SpecularFalloffMult"))
 				{
-					newShader->SetParameter("SpecularFalloffMult", &multiplier, sizeof(multiplier));
+					newShader->SetParameter("SpecularFalloffMult", &multiplier, 1.25);
 				}
 			}
 		}
@@ -284,13 +284,13 @@ five::grmShaderGroup* convert(ny::grmShaderGroup* shaderGroup)
 		if (auto emissiveMult = newShader->GetParameter("EmissiveMultiplier"); emissiveMult != nullptr)
 		{
 			float emissiveMultValue[] = { *(float*)emissiveMult->GetValue() / 4.0f, 0.0f, 0.0f, 0.0f };
-			memcpy(emissiveMult->GetValue(), emissiveMultValue, sizeof(emissiveMultValue));
+			memcpy(emissiveMult->GetValue(), emissiveMultValue, 4);
 		}
 
 		if (newShaderName == "trees")
 		{
 			float alphaValues[4] = { 0.5f, 0.0f, 0.0f, 0.0f };
-			newShader->SetParameter("AlphaTest", alphaValues, sizeof(alphaValues));
+			newShader->SetParameter("AlphaTest", alphaValues, 4);
 		}
 
 		if (newShader->GetResourceCount() != rescount)
@@ -523,16 +523,23 @@ inline void ConvertBaseDrawable(ny::rmcDrawable* drawable, five::gtaDrawable* ou
 
 	for (int i = 0; i < 4; i++)
 	{
-		auto oldModel = oldLodGroup.GetModel(i);
+		auto oldLod = oldLodGroup.GetLod(i);
 
-		if (oldModel)
+		if (oldLod)
 		{
-			auto newModel = convert<five::grmModel*>(oldModel);
+			size_t numModels = 0;
+			int drawBucketMask = 0;
+			rage::five::grmModel* newModels[64];
 
-			lodGroup.SetModel(i, newModel);
-			lodGroup.SetDrawBucketMask(i, newModel->CalcDrawBucketMask(out->GetShaderGroup())); // TODO: change this
-
+			for (auto mI = 0; mI < oldLod->GetCount(); mI++)
 			{
+				auto oldModel = oldLod->Get(mI);
+				auto newModel = convert<five::grmModel*>(oldModel);
+				newModels[mI] = newModel;
+				numModels++;
+
+				drawBucketMask |= newModel->CalcDrawBucketMask(out->GetShaderGroup());
+
 				Vector4* oldBounds = oldModel->GetGeometryBounds();
 
 				if (oldBounds)
@@ -555,11 +562,14 @@ inline void ConvertBaseDrawable(ny::rmcDrawable* drawable, five::gtaDrawable* ou
 					newModel->SetGeometryBounds(geometryBounds.size(), &geometryBounds[0]);
 				}
 			}
+
+			lodGroup.SetLod(i, newModels, numModels);
+			lodGroup.SetDrawBucketMask(i, drawBucketMask);
 		}
 	}
 
 	out->SetPrimaryModel();
-	out->SetName("lovely.#dr");
+	out->SetName("converted.#dr");
 }
 
 template<>

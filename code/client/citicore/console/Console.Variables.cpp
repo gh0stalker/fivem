@@ -35,9 +35,8 @@ ConsoleVariableManager::ConsoleVariableManager(console::Context* parentContext)
 		flags |= addFlags;
 
 		auto entry = CreateVariableEntry<std::string>(this, variable, "");
-		entry->SetValue(value);
-
 		Register(variable, flags, entry);
+		entry->SetValue(value);
 	};
 
 	m_setCommand = std::make_unique<ConsoleCommand>(m_parentContext, "set", [=](const std::string& variable, const std::string& value) {
@@ -59,6 +58,75 @@ ConsoleVariableManager::ConsoleVariableManager(console::Context* parentContext)
 	// set replicated
 	m_setrCommand = std::make_unique<ConsoleCommand>(m_parentContext, "setr", [=](const std::string& variable, const std::string& value) {
 		setCommand(ConVar_Replicated, variable, value);
+	});
+
+	auto toggleCommand = [=](const std::string& name, const std::string& value1, const std::string& value2)
+	{
+		auto var = FindEntryRaw(name);
+
+		if (var)
+		{
+			auto v = var->GetValue();
+
+			// hackaround for bool vars
+			if (v == "true")
+			{
+				v = "1";
+			}
+			else if (v == "false")
+			{
+				v = "0";
+			}
+
+			if (v == value1)
+			{
+				var->SetValue(value2);
+			}
+			else
+			{
+				var->SetValue(value1);
+			}
+		}
+	};
+
+	m_toggleCommand = std::make_unique<ConsoleCommand>(m_parentContext, "toggle", [=](const std::string& name)
+	{
+		toggleCommand(name, "1", "0");
+	});
+
+	m_toggleCommand2 = std::make_unique<ConsoleCommand>(m_parentContext, "toggle", [=](const std::string& name, const std::string& value1, const std::string& value2)
+	{
+		toggleCommand(name, value1, value2);
+	});
+
+	m_vstrCommand = std::make_unique<ConsoleCommand>(m_parentContext, "vstr", [=](const std::string& name)
+	{
+		auto var = FindEntryRaw(name);
+
+		if (var)
+		{
+			m_parentContext->AddToBuffer(var->GetValue() + "\n");
+		}
+	});
+
+	m_vstrHoldCommand = std::make_unique<ConsoleCommand>(m_parentContext, "+vstr", [=](const std::string& hold, const std::string& release)
+	{
+		auto var = FindEntryRaw(hold);
+
+		if (var)
+		{
+			m_parentContext->AddToBuffer(var->GetValue() + "\n");
+		}
+	});
+
+	m_vstrReleaseCommand = std::make_unique<ConsoleCommand>(m_parentContext, "-vstr", [=](const std::string& hold, const std::string& release)
+	{
+		auto var = FindEntryRaw(release);
+
+		if (var)
+		{
+			m_parentContext->AddToBuffer(var->GetValue() + "\n");
+		}
 	});
 }
 
@@ -98,6 +166,22 @@ void ConsoleVariableManager::Unregister(int token)
 	for (auto it = m_entries.begin(); it != m_entries.end(); it++)
 	{
 		if (it->second.token == token)
+		{
+			// erase and return immediately (so we won't increment a bad iterator)
+			m_entries.erase(it);
+			return;
+		}
+	}
+}
+
+void ConsoleVariableManager::Unregister(const std::string& name)
+{
+	std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+	// look through the list for a matching name
+	for (auto it = m_entries.begin(); it != m_entries.end(); it++)
+	{
+		if (it->first == name)
 		{
 			// erase and return immediately (so we won't increment a bad iterator)
 			m_entries.erase(it);
@@ -157,7 +241,7 @@ void ConsoleVariableManager::ForAllVariables(const TVariableCB& callback, int fl
 		for (auto& entry : m_entries)
 		{
 			// if flags match the mask
-			if ((entry.second.flags & flagMask) != 0)
+			if ((entry.second.flags & flagMask) != 0 || (entry.second.flags == 0 && flagMask == -1))
 			{
 				iterationList.push_back(std::make_tuple(entry.second.name, entry.second.flags, entry.second.variable));
 			}
@@ -197,7 +281,15 @@ void ConsoleVariableManager::RemoveVariablesWithFlag(int flagMask)
 void ConsoleVariableManager::SaveConfiguration(const TWriteLineCB& writeLineFunction)
 {
 	ForAllVariables([&](const std::string& name, int flags, const THandlerPtr& variable) {
-		writeLineFunction("seta \"" + name + "\" \"" + variable->GetValue() + "\"");
+		// Don't Save values set by a server
+		if (flags & ConVar_Replicated)
+		{
+			writeLineFunction("seta \"" + name + "\" \"" + variable->GetOfflineValue() + "\"");
+		}
+		else
+		{
+			writeLineFunction("seta \"" + name + "\" \"" + variable->GetValue() + "\"");		
+		}
 	},
 	    ConVar_Archive);
 }

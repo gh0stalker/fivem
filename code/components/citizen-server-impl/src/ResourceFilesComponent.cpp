@@ -51,6 +51,11 @@ public:
 		m_stream->Write(data);
 	}
 
+	inline void Write(const void* data, size_t size)
+	{
+		m_stream->Write(data, size);
+	}
+
 	inline void Align(size_t alignment)
 	{
 		size_t pos = Tell();
@@ -248,8 +253,23 @@ namespace fi
 					writer.WriteMark<uint32_t>("fLen_" + m_fullName, backingStream->GetLength());
 					writer.WriteMark<uint32_t>("fLen2_" + m_fullName, backingStream->GetLength());
 
-					// TODO(fxserver): optimize
-					writer.Write(backingStream->ReadToEnd());
+					std::array<uint8_t, 32768> buffer;
+					size_t read = 0;
+
+					do
+					{
+						read = backingStream->Read(buffer.data(), buffer.size());
+
+						if (read == -1)
+						{
+							break;
+						}
+						else if (read > 0)
+						{
+							writer.Write(buffer.data(), read);
+						}
+					} while (read == buffer.size());
+
 					writer.Align(2048);
 				}
 
@@ -511,6 +531,32 @@ namespace fx
 			{
 				fileEntries.emplace_back(file);
 			}
+
+			// filter file entries for .y* files in stream/
+			fileEntries.erase(std::remove_if(fileEntries.begin(), fileEntries.end(), [](const std::string& fileEntry)
+			{
+				if (fileEntry.find("stream/") == 0)
+				{
+					auto dotPos = fileEntry.find_first_of('.');
+
+					if (dotPos != std::string::npos)
+					{
+						auto ext = fileEntry.substr(dotPos);
+
+						// we **have** to allow .ytyp files to be added since dumb people for whatever-arse reason
+						// have the tendency to pretend hugging DLC_ITYP_REQUEST is a filename and not a streaming
+						// name trying to be a filename, and also have never heard of 'use a hugging .ymf manifest'
+						// so they glob data_file for these and that requires these to be present on client as for w/e
+						// reason we can't resolve globs server-side yet
+						if (ext.length() > 1 && ext[1] == 'y' && ext != ".ytyp")
+						{
+							return true;
+						}
+					}
+				}
+
+				return false;
+			}), fileEntries.end());
 
 			return fileEntries;
 		}

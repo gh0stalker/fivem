@@ -1,15 +1,19 @@
 -- global loader bits
+local msgpack = msgpack
+
 local _i, _f, _v, _r, _ri, _rf, _rl, _s, _rv, _ro, _in, _ii, _fi =
 	Citizen.PointerValueInt(), Citizen.PointerValueFloat(), Citizen.PointerValueVector(),
-	Citizen.ReturnResultAnyway(), Citizen.ResultAsInteger(), Citizen.ResultAsFloat(), Citizen.ResultAsLong(), Citizen.ResultAsString(), Citizen.ResultAsVector(), Citizen.ResultAsObject(),
+	Citizen.ReturnResultAnyway(), Citizen.ResultAsInteger(), Citizen.ResultAsFloat(), Citizen.ResultAsLong(), Citizen.ResultAsString(), Citizen.ResultAsVector(), Citizen.ResultAsObject2(msgpack.unpack),
 	Citizen.InvokeNative, Citizen.PointerValueIntInitialized, Citizen.PointerValueFloatInitialized
+
+local _in2, _gn = Citizen.InvokeNative2, Citizen.GetNative
 
 local g = _G
 local rg = rawget
 local rs = rawset
 local _ln = Citizen.LoadNative
 local load = load
-local msgpack = msgpack
+local msgpack_pack = msgpack.pack
 local _tostring = tostring
 local type = type
 local function _ts(num)
@@ -17,6 +21,10 @@ local function _ts(num)
 		return nil
 	end
 	return _tostring(num)
+end
+local function _obj(obj)
+    local s = msgpack_pack(obj)
+    return s, #s
 end
 local function _ch(hash)
 	if g.type(hash) == 'string' then
@@ -39,6 +47,7 @@ end})
 local nativeEnv = {
     Global = Global,
     _mfr = _mfr,
+    _obj = _obj,
     _ch = _ch,
     _ts = _ts,
     msgpack = msgpack,
@@ -54,6 +63,8 @@ local nativeEnv = {
     _rv = _rv,
     _ro = _ro,
     _in = _in,
+    _in2 = _in2,
+    _gn = _gn,
     _ii = _ii,
     _fi = _fi
 }

@@ -7,6 +7,8 @@
 
 #include "StdInc.h"
 
+#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+
 int wmain(int argc, const wchar_t** argv)
 {
 	SetEnvironmentVariable(L"CitizenFX_ToolMode", L"1");
@@ -46,4 +48,12 @@ int wmain(int argc, const wchar_t** argv)
 	}
 
 	return 0;
+}
+
+extern "C" DLL_EXPORT void AsyncTrace(const char* string)
+{
+	if (std::string_view{ string }.find("Error:") == 0)
+	{
+		fprintf(stderr, "%s", string);
+	}
 }

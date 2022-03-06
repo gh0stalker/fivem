@@ -10,6 +10,7 @@
 #include <bitset>
 #include <functional>
 #include <thread>
+#include <ppltasks.h>
 #include <WS2tcpip.h>
 #include "HttpClient.h"
 #include "CrossLibraryInterfaces.h"
@@ -23,11 +24,13 @@
 // hacky include path to not conflict with our own NetBuffer.h
 #include <../../components/net-base/include/NetBuffer.h>
 
+#ifdef COMPILING_NET
 #include <enet/enet.h>
+#endif
 
 #include <concurrent_queue.h>
 
-#define NETWORK_PROTOCOL 5
+#define NETWORK_PROTOCOL 12
 
 enum NetAddressType
 {
@@ -56,7 +59,11 @@ public:
 	NetAddress(const sockaddr* addr);
 	NetAddress(const sockaddr_in* addr) : NetAddress((const sockaddr*)addr) {}
 	NetAddress(const sockaddr_in6* addr) : NetAddress((const sockaddr*)addr) {}
+
+#ifdef COMPILING_NET
 	NetAddress(const ENetAddress* addr);
+#endif
+
 	NetAddress(const char* address, uint16_t port);
 
 	bool operator==(const NetAddress& right) const;
@@ -68,44 +75,14 @@ public:
 
 	void GetSockAddr(sockaddr_storage* addr, int* addrLen) const;
 
+#ifdef COMPILING_NET
 	ENetAddress GetENetAddress() const;
+#endif
 };
 
 #include "NetBuffer.h"
 
 class NetLibrary;
-
-#define FRAGMENT_SIZE (uint32_t)1300
-
-class NetChannel
-{
-private:
-	int m_fragmentSequence;
-	int m_fragmentLength;
-	char* m_fragmentBuffer;
-	std::bitset<65536 / FRAGMENT_SIZE> m_fragmentValidSet;
-	int m_fragmentLastBit;
-
-	uint32_t m_inSequence;
-	uint32_t m_outSequence;
-
-	NetAddress m_targetAddress;
-	NetLibraryImplBase* m_netLibrary;
-
-private:
-	void SendFragmented(NetBuffer& buffer);
-
-public:
-	NetChannel();
-
-	void Reset(NetAddress& target, NetLibraryImplBase* netLibrary);
-
-	void Send(NetBuffer& buffer);
-
-	bool Process(const char* message, size_t size, NetBuffer** buffer);
-};
-
-#define MAX_RELIABLE_COMMANDS 64
 
 struct NetLibraryClientInfo
 {
@@ -183,6 +160,10 @@ private:
 
 	std::string m_infoString;
 
+	std::string m_targetContext;
+
+	std::string m_richError;
+
 	HANDLE m_receiveEvent;
 
 	concurrency::concurrent_queue<std::function<void()>> m_mainFrameQueue;
@@ -228,11 +209,9 @@ public:
 
 	virtual void RunFrame() override;
 
-	virtual void ConnectToServer(const std::string& rootUrl);
+	virtual concurrency::task<void> ConnectToServer(const std::string& rootUrl);
 
-	virtual void Disconnect(const char* reason) override;
-
-	virtual void FinalizeDisconnect() override;
+	virtual void Disconnect(const char* reason = "[not set]") override;
 
 	virtual bool DequeueRoutedPacket(char* buffer, size_t* length, uint16_t* netID) override;
 
@@ -281,6 +260,8 @@ public:
 
 	void SendNetEvent(const std::string& eventName, const std::string& argsSerialized, int target);
 
+	void SetRichError(const std::string& data = "{}");
+
 	inline uint32_t GetServerBase() { return m_serverBase; }
 
 	inline bool IsDisconnected() { return m_connectionState == CS_IDLE; }
@@ -325,6 +306,15 @@ public:
 		return m_serverTime;
 	}
 
+	inline const std::string& GetTargetContext()
+	{
+		return m_targetContext;
+	}
+
+	int32_t GetPing();
+
+	int32_t GetVariance();
+
 	void SetMetricSink(fwRefContainer<INetMetricSink>& sink);
 
 	virtual void AddReceiveTick() override;
@@ -341,6 +331,8 @@ public:
 #endif
 		fwEvent<NetLibrary*> OnNetLibraryCreate;
 
+	fwEvent<int> OnRequestBuildSwitch;
+
 	fwEvent<const char*> OnAttemptDisconnect;
 
 	fwEvent<NetAddress> OnInitReceived;
@@ -349,7 +341,11 @@ public:
 
 	fwEvent<NetAddress> OnFinalizeDisconnect;
 
-	fwEvent<const char*> OnConnectionError;
+	fwEvent<const char*> OnConnectionErrorEvent;
+
+	fwEvent<const std::string&, const std::string&> OnConnectionErrorRichEvent;
+
+	virtual void OnConnectionError(const std::string& errorString, const std::string& metaData = "{}");
 
 	// a1: adaptive card JSON
 	// a2: connection token
@@ -358,7 +354,8 @@ public:
 	// a1: status message
 	// a2: current progress
 	// a3: total progress
-	fwEvent<const std::string&, int, int> OnConnectionProgress;
+	// a4: cancelable/closable UI
+	fwEvent<const std::string&, int, int, bool> OnConnectionProgress;
 
 	// a1: detailed progress message
 	fwEvent<const std::string&> OnConnectionSubProgress;
@@ -374,7 +371,8 @@ public:
 	fwEvent<const std::string&, const std::function<void()>&> OnInterceptConnection;
 
 	// same as the other routine, except it's for authentication
-	fwEvent<const std::string&, const std::function<void(bool success, const std::map<std::string, std::string>& additionalPostData)>&> OnInterceptConnectionForAuth;
+	// a2 -> license key token
+	fwEvent<const std::string&, const std::string&, const std::function<void(bool success, const std::map<std::string, std::string>& additionalPostData)>&> OnInterceptConnectionForAuth;
 
 	// event to intercept server events for debugging
 	// a1: event name
@@ -392,6 +390,11 @@ public:
 	// a1: new connection state
 	// a2: previous connection state
 	fwEvent<ConnectionState, ConnectionState> OnStateChanged;
+
+	// a1: the info.json data, raw
+	// a2: callback when completed
+	// #TODO: fxSingleEvent maybe?
+	fwEvent<std::string_view, const std::function<void()>&> OnInfoBlobReceived;
 
 	// for use from high-level code calling down to lower-level code
 	fwEvent<const NetLibraryClientInfo&> OnClientInfoReceived;

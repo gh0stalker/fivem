@@ -14,6 +14,11 @@
 
 #include <HttpServerImpl.h>
 
+#include <CfxState.h>
+#include <HostSharedData.h>
+
+#include <CoreConsole.h>
+
 void EndpointMapper::AddPrefix(const std::string& routeOrigin, fwRefContainer<net::HttpHandler> handler)
 {
 	m_prefixes.insert({ routeOrigin, handler });
@@ -26,7 +31,7 @@ void EndpointMapper::AddGameService(const std::string& serviceName, const TGameS
 
 bool EndpointMapper::HandleRequest(fwRefContainer<net::HttpRequest> request, fwRefContainer<net::HttpResponse> response)
 {
-	trace(__FUNCTION__ ": %s %s\n", request->GetRequestMethod().c_str(), request->GetPath().c_str());
+	console::DPrintf("ros", __FUNCTION__ ": %s %s\n", request->GetRequestMethod().c_str(), request->GetPath().c_str());
 
 	for (auto& prefixEntry : m_prefixes)
 	{
@@ -55,6 +60,8 @@ boost::optional<TGameServiceHandler> EndpointMapper::GetGameServiceHandler(const
 	return boost::optional<TGameServiceHandler>();
 }
 
+DLL_EXPORT fwEvent<net::TcpServer*> OnConfigureWebSocket;
+
 static InitFunction initFunction([] ()
 {
 	// create the endpoint mapper
@@ -70,68 +77,97 @@ static InitFunction initFunction([] ()
 	httpServer->AddRef();
 	httpServer->RegisterHandler(endpointMapper);
 
-	if (wcsstr(GetCommandLine(), L"ros:legit") == nullptr)
+	if (wcsstr(GetCommandLine(), L"ros:legit") == nullptr && wcsstr(GetCommandLine(), L"ros:steam") == nullptr && wcsstr(GetCommandLine(), L"ros:epic") == nullptr)
 	{
-		// create the HTTP (non-TLS) backend server
-		fwRefContainer<LoopbackTcpServer> insecureServer = tcpServerManager->RegisterTcpServer("prod.ros.rockstargames.com");
-		insecureServer->AddRef();
-		insecureServer->SetPort(80);
+		auto domains = {
+			"prod.ros.rockstargames.com",
+			"auth-prod.ros.rockstargames.com",
+			"auth-gta5-prod.ros.rockstargames.com",
+#ifndef GTA_NY
+			"rgl-prod.ros.rockstargames.com",
+			"auth-rgl-prod.ros.rockstargames.com",
+			"ps-rgl-prod.ros.rockstargames.com",
+			"prs-rgl-prod.ros.rockstargames.com",
+			"app-rgl-prod.ros.rockstargames.com",
+#endif
+			"prs-gta4-prod.ros.rockstargames.com",
+			"gta4-prod.ros.rockstargames.com",
+			"auth-gta4-prod.ros.rockstargames.com",
+#ifdef IS_RDR3
+			"crews-rdr2-prod.ros.rockstargames.com",
+			"prs-rdr2-prod.ros.rockstargames.com",
+			"ugc-rdr2-prod.ros.rockstargames.com",
+			"inbox-rdr2-prod.ros.rockstargames.com",
+			"tm-rdr2-prod.ros.rockstargames.com",
+			"posse-rdr2-prod.ros.rockstargames.com",
+			"feed-rdr2-prod.ros.rockstargames.com",
+			"conductor-rdr2-prod.ros.rockstargames.com",
+			"challenges-rdr2-prod.ros.rockstargames.com",
+#endif
+			"prod-locator-cloud.rockstargames.com",
+			"www.google-analytics.com",
+		};
 
-		// create the TLS backend server
-		fwRefContainer<LoopbackTcpServer> secureServer = tcpServerManager->RegisterTcpServer("prod.ros.rockstargames.com");
-		secureServer->AddRef();
-		secureServer->SetPort(443);
+		for (auto& domain : domains)
+		{
+			// create the HTTP (non-TLS) backend server
+			fwRefContainer<LoopbackTcpServer> insecureServer = tcpServerManager->RegisterTcpServer(domain);
+			insecureServer->AddRef();
+			insecureServer->SetPort(80);
 
-		// create auth-prod TLS servers
-		fwRefContainer<LoopbackTcpServer> insecureServer2 = tcpServerManager->RegisterTcpServer("auth-prod.ros.rockstargames.com");
-		insecureServer2->AddRef();
-		insecureServer2->SetPort(80);
+			// create the TLS backend server
+			fwRefContainer<LoopbackTcpServer> secureServer = tcpServerManager->RegisterTcpServer(domain);
+			secureServer->AddRef();
+			secureServer->SetPort(443);
 
-		// create the TLS backend server
-		fwRefContainer<LoopbackTcpServer> secureServer2 = tcpServerManager->RegisterTcpServer("auth-prod.ros.rockstargames.com");
-		secureServer2->AddRef();
-		secureServer2->SetPort(443);
+			// test if TLS cert exists, verify game files if not
+			if (GetFileAttributesW(MakeRelativeCitPath("citizen/ros/ros.crt").c_str()) == INVALID_FILE_ATTRIBUTES ||
+				GetFileAttributesW(MakeRelativeCitPath("citizen/ros/ros.key").c_str()) == INVALID_FILE_ATTRIBUTES)
+			{
+				_wunlink(MakeRelativeCitPath("content_index.xml").c_str());
+			}
 
-		// create auth-gta5-prod TLS servers
-		fwRefContainer<LoopbackTcpServer> insecureServer3 = tcpServerManager->RegisterTcpServer("auth-gta5-prod.ros.rockstargames.com");
-		insecureServer3->AddRef();
-		insecureServer3->SetPort(80);
+			// create the TLS wrapper for the TLS backend
+			net::TLSServer* tlsWrapper = new net::TLSServer(secureServer, "citizen/ros/ros.crt", "citizen/ros/ros.key");
+			tlsWrapper->AddRef();
 
-		// create the TLS backend server
-		fwRefContainer<LoopbackTcpServer> secureServer3 = tcpServerManager->RegisterTcpServer("auth-gta5-prod.ros.rockstargames.com");
-		secureServer3->AddRef();
-		secureServer3->SetPort(443);
+			// attach the endpoint mappers
+			httpServer->AttachToServer(tlsWrapper);
+			httpServer->AttachToServer(insecureServer);
+		}
 
-		// create the TLS wrapper for the TLS backend
-		net::TLSServer* tlsWrapper = new net::TLSServer(secureServer, "citizen/ros/ros.crt", "citizen/ros/ros.key");
-		tlsWrapper->AddRef();
+		{
+			static fwRefContainer<LoopbackTcpServer> wsServer = tcpServerManager->RegisterTcpServer("cfx-web-rdr2-prod.ros.rockstargames.com");
+			wsServer->AddRef();
+			wsServer->SetPort(80);
 
-		net::TLSServer* tlsWrapper2 = new net::TLSServer(secureServer2, "citizen/ros/ros.crt", "citizen/ros/ros.key");
-		tlsWrapper2->AddRef();
-
-		net::TLSServer* tlsWrapper3 = new net::TLSServer(secureServer3, "citizen/ros/ros.crt", "citizen/ros/ros.key");
-		tlsWrapper3->AddRef();
-
-		// attach the endpoint mappers
-		httpServer->AttachToServer(tlsWrapper);
-		httpServer->AttachToServer(tlsWrapper2);
-		httpServer->AttachToServer(tlsWrapper3);
-		httpServer->AttachToServer(insecureServer);
-		httpServer->AttachToServer(insecureServer2);
-		httpServer->AttachToServer(insecureServer3);
+			static HookFunction hf([]()
+			{
+				OnConfigureWebSocket(wsServer.GetRef());
+			});
+		}
 	}
 
-	// create the local socket server, if enabled
-	if (wcsstr(GetCommandLine(), L"ros:legit") != nullptr)
+	// create the local socket server, if this is the master process
+	static HostSharedData<CfxState> initState("CfxInitState");
+
+#ifndef IS_RDR3
+	if (initState->IsGameProcess() || wcsstr(GetCommandLineW(), L"ros:legit"))
+#else
+	if (!wcsstr(GetCommandLineW(), L"ros:epic") && !wcsstr(GetCommandLineW(), L"ros:steam"))
+#endif
 	{
-		net::PeerAddress address = net::PeerAddress::FromString("localhost:32891").get();
+		net::PeerAddress address = net::PeerAddress::FromString("127.0.0.1:32891", 32891, net::PeerAddress::LookupType::NoResolution).get();
 
 		fwRefContainer<net::TcpServerFactory> manager = new net::TcpServerManager();
 		fwRefContainer<net::TcpServer> tcpServer = manager->CreateServer(address);
 
-		manager->AddRef();
-		tcpServer->AddRef();
+		if (tcpServer.GetRef())
+		{
+			manager->AddRef();
+			tcpServer->AddRef();
 
-		httpServer->AttachToServer(tcpServer);
+			httpServer->AttachToServer(tcpServer);
+		}
 	}
 }, -500);

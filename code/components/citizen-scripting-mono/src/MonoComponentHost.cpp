@@ -8,11 +8,15 @@
 #include "StdInc.h"
 #include <om/OMComponent.h>
 
-#include <Resource.h>
+#include <ResourceManager.h>
 
 #include <fxScripting.h>
 
+#include <CoreConsole.h>
+
 #include <Error.h>
+
+#include <EASTL/fixed_hash_map.h>
 
 #include <mono/jit/jit.h>
 #include <mono/utils/mono-logger.h>
@@ -99,7 +103,6 @@ static int CoreClrCallback(const char* imageName)
 
 		if (_wcsicmp(platformPath.c_str(), fullPath) != 0)
 		{
-			trace("%s %s is not a platform image.\n", ToNarrow(fullPath), ToNarrow(filePart));
 			return FALSE;
 		}
 	}
@@ -111,8 +114,6 @@ static int CoreClrCallback(const char* imageName)
 			return TRUE;
 		}
 	}
-
-	trace("%s %s is not a platform image (even though the dir matches).\n", ToNarrow(fullPath), ToNarrow(filePart));
 
 	return FALSE;
 }
@@ -149,13 +150,17 @@ static void OutputExceptionDetails(MonoObject* exc, bool fatal = true)
 	}
 }
 
-static void GI_PrintLogCall(MonoString* str)
+static void GI_PrintLogCall(MonoString* channel, MonoString* str)
 {
-	trace("%s", mono_string_to_utf8(str));
+	console::Printf(mono_string_to_utf8(channel), "%s", mono_string_to_utf8(str));
 }
 
 static void
-gc_resize(MonoProfiler *profiler, int64_t new_size)
+#ifdef IS_FXSERVER
+gc_resize(MonoProfiler *profiler, uintptr_t new_size)
+#else
+gc_resize(MonoProfiler* profiler, int64_t new_size)
+#endif
 {
 }
 
@@ -171,63 +176,57 @@ struct _MonoProfiler
 
 MonoProfiler _monoProfiler;
 
-#ifdef _WIN32
-// custom heap so we won't end up depending on any suspended threads
-// (we need to be safe even if the GC suspended the world)
-static HANDLE g_heap = HeapCreate(0, 0, 0);
-
-template<typename T>
-struct StaticHeapAllocator
-{
-	using value_type = T;
-
-	T* allocate(size_t n)
-	{
-		return (T*)HeapAlloc(g_heap, 0, n * sizeof(T));
-	}
-
-	void deallocate(T* p, size_t n)
-	{
-		HeapFree(g_heap, 0, p);
-	}
-};
-
-static std::map<MonoDomain*, uint64_t, std::less<>, StaticHeapAllocator<std::pair<MonoDomain* const, uint64_t>>> g_memoryUsages;
-#else
-static std::map<MonoDomain*, uint64_t> g_memoryUsages;
-#endif
-
+static eastl::fixed_hash_map<int32_t, uint64_t, 4096, 4096 + 1, false> g_memoryUsages;
+static std::array<uint64_t, 128> g_memoryUsagesById;
 static std::shared_mutex g_memoryUsagesMutex;
 
 static bool g_requestedMemoryUsage;
+static bool g_enableMemoryUsage = true;
 
 #ifndef IS_FXSERVER
 static void gc_event(MonoProfiler *profiler, MonoGCEvent event, int generation)
 #else
-static void gc_event(MonoProfiler *profiler, MonoProfilerGCEvent event, int generation)
+static void gc_event(MonoProfiler* profiler, MonoProfilerGCEvent event, uint32_t generation, mono_bool is_serial)
 #endif
 {
+#if defined(_WIN32)
 	switch (event) {
+	// a comment above mono_gc_walk_heap says the following:
+	// 'heap walking is only valid in the pre-stop-world event callback'
+	// however, this is actually wrong: pre-stop-world isn't locked, and walking the heap there is not thread-safe
+	// more importantly, mono itself uses this in MONO_GC_EVENT_PRE_START_WORLD:
+	// https://github.com/mono/mono/blob/bdd772531d379b4e78593587d15113c37edd4a64/mono/profiler/log.c#L1456
+	//
+	// therefore, we assume the comment is wrong (a typo?) and the implementation is correct, and this should indeed be pre-start-world
 	case MONO_GC_EVENT_PRE_START_WORLD:
-#ifndef IS_FXSERVER
-		if (g_requestedMemoryUsage)
+		if (g_requestedMemoryUsage && g_enableMemoryUsage)
 		{
 			std::unique_lock<std::shared_mutex> lock(g_memoryUsagesMutex);
 
 			g_memoryUsages.clear();
+			memset(g_memoryUsagesById.data(), 0, g_memoryUsagesById.size() * sizeof(uint64_t));
 
 			mono_gc_walk_heap(0, [](MonoObject *obj, MonoClass *klass, uintptr_t size, uintptr_t num, MonoObject **refs, uintptr_t *offsets, void *data) -> int
 			{
-				g_memoryUsages[mono_object_get_domain(obj)] += size;
+				auto did = mono_domain_get_id(mono_object_get_domain(obj));
+
+				if (did < 0 || did >= std::size(g_memoryUsagesById))
+				{
+					g_memoryUsages[did] += size;
+				}
+				else
+				{
+					g_memoryUsagesById[did] += size;
+				}
 
 				return 0;
 			}, nullptr);
 
 			g_requestedMemoryUsage = false;
 		}
-#endif
 		break;
 	}
+#endif
 }
 
 static uint64_t GI_GetMemoryUsage()
@@ -237,7 +236,16 @@ static uint64_t GI_GetMemoryUsage()
 	g_requestedMemoryUsage = true;
 
 	std::shared_lock<std::shared_mutex> lock(g_memoryUsagesMutex);
-	return g_memoryUsages[monoDomain];
+	auto did = mono_domain_get_id(monoDomain);
+
+	if (did < 0 || did >= std::size(g_memoryUsagesById))
+	{
+		return g_memoryUsages[did];
+	}
+	else
+	{
+		return g_memoryUsagesById[did];
+	}
 }
 
 static bool GI_SnapshotStackBoundary(MonoArray** blob)
@@ -433,6 +441,9 @@ static void InitMono()
 	std::string citizenClrLibPath = MakeRelativeNarrowPath("citizen/clr2/lib/mono/4.5/");
 
 	putenv(const_cast<char*>(va("MONO_PATH=%s", citizenClrLibPath)));
+
+	mono_set_crash_chaining(true);
+	mono_set_signal_chaining(true);
 #endif
 
 	mono_assembly_setrootdir(citizenClrPath.c_str());
@@ -444,7 +455,12 @@ static void InitMono()
 	// API isn't exposed, and it's clearly not meant for embedding, we just switch to the old non-coop suspender.
 	putenv("MONO_THREADS_SUSPEND=preemptive");
 
-	putenv("MONO_DEBUG=casts");
+	// unsure why this is there
+	//putenv("MONO_DEBUG=casts");
+
+	// low-pause GC mode (with 5ms target pause duration), quadruple default nursery size to ensure first-phase allocs
+	// see https://www.mono-project.com/docs/advanced/garbage-collector/sgen/working-with-sgen/
+	putenv("MONO_GC_PARAMS=mode=pause:5,nursery-size=16m");
 
 #ifndef IS_FXSERVER
 	mono_security_enable_core_clr();
@@ -454,6 +470,13 @@ static void InitMono()
 	mono_profiler_install(&_monoProfiler, profiler_shutdown);
 	mono_profiler_install_gc(gc_event, gc_resize);
 	mono_profiler_set_events(MONO_PROFILE_GC);
+#endif
+
+#if defined(_WIN32) && defined(IS_FXSERVER)
+	auto monoProfilerHandle = mono_profiler_create(&_monoProfiler);
+
+	mono_profiler_set_gc_event_callback(monoProfilerHandle, gc_event);
+	mono_profiler_set_gc_resize_callback(monoProfilerHandle, gc_resize);
 #endif
 
 	char* args[2];
@@ -559,13 +582,23 @@ struct MonoAttachment
 	}
 };
 
-DLL_EXPORT void MonoEnsureThreadAttached()
+extern "C" DLL_EXPORT void MonoEnsureThreadAttached()
 {
+	if (!g_rootDomain)
+	{
+		return;
+	}
+
 	static thread_local MonoAttachment attachment;
 }
 
 result_t MonoCreateObjectInstance(const guid_t& guid, const guid_t& iid, void** objectRef)
 {
+	if (!g_rootDomain)
+	{
+		return FX_E_NOINTERFACE;
+	}
+
 	MonoEnsureThreadAttached();
 
 	MonoObject* exc = nullptr;
@@ -596,6 +629,11 @@ result_t MonoCreateObjectInstance(const guid_t& guid, const guid_t& iid, void** 
 
 std::vector<guid_t> MonoGetImplementedClasses(const guid_t& iid)
 {
+	if (!g_rootDomain)
+	{
+		return {};
+	}
+
 	MonoEnsureThreadAttached();
 
 	void* args[1];
@@ -617,9 +655,9 @@ std::vector<guid_t> MonoGetImplementedClasses(const guid_t& iid)
 
 static InitFunction initFunction([] ()
 {
-	// should've been ResourceManager but ResourceManager OnTick happens _after_ individual resource ticks
-	// which is too early for on-start Mono resources to have run
-	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* instance)
+	static ConVar<bool> memoryUsageVar("mono_enableMemoryUsageTracking", ConVar_None, true, &g_enableMemoryUsage);
+
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* instance)
 	{
 		instance->OnTick.Connect([]()
 		{

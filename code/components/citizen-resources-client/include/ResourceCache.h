@@ -10,23 +10,34 @@
 #include <leveldb/db.h>
 #include <array>
 
-#include <boost/optional.hpp>
+#include <optional>
+#include <shared_mutex>
 
 #include <Resource.h>
 
+#include <boost/algorithm/string.hpp>
+#include <tbb/concurrent_unordered_map.h>
+
+#include <msgpack.hpp>
+
 struct IgnoreCaseLess
 {
-	inline bool operator()(const std::string& left, const std::string& right) const
+	using is_transparent = int;
+
+	template< class T, class U>
+	inline auto operator()(T&& lhs, U&& rhs) const
+		-> decltype(std::forward<T>(lhs) < std::forward<U>(rhs))
 	{
-		return _stricmp(left.c_str(), right.c_str()) < 0;
+		return boost::ilexicographical_compare(lhs, rhs);
 	}
 };
 
 class
 #ifdef COMPILING_CITIZEN_RESOURCES_CLIENT
-	DLL_EXPORT
+DLL_EXPORT
 #endif
-ResourceCacheEntryList: public fwRefCountable, public fx::IAttached<fx::Resource>
+ResourceCacheEntryList : public fwRefCountable,
+						 public fx::IAttached<fx::Resource>
 {
 public:
 	struct Entry
@@ -40,20 +51,22 @@ public:
 
 		inline Entry()
 		{
-
 		}
 
 		inline Entry(const std::string& resourceName, const std::string& basename, const std::string& remoteUrl, const std::string& referenceHash, size_t size, const std::map<std::string, std::string>& extData = {})
 			: resourceName(resourceName), basename(basename), remoteUrl(remoteUrl), referenceHash(referenceHash), size(size), extData(extData)
 		{
-
 		}
+
+		MSGPACK_DEFINE_ARRAY(resourceName, basename, remoteUrl, referenceHash, size, extData);
 	};
 
 private:
 	fx::Resource* m_parentResource;
 
 	std::map<std::string, Entry, IgnoreCaseLess> m_entries;
+
+	std::string m_initUrl;
 
 public:
 	virtual void AttachToObject(fx::Resource* resource) override;
@@ -63,22 +76,32 @@ public:
 		return m_entries;
 	}
 
-	inline boost::optional<Entry> GetEntry(const std::string& baseName)
+	inline std::optional<std::reference_wrapper<const Entry>> GetEntry(std::string_view baseName)
 	{
 		auto it = m_entries.find(baseName);
 
 		if (it == m_entries.end())
 		{
-			return boost::optional<Entry>();
+			return {};
 		}
 
-		return boost::optional<Entry>(it->second);
+		return it->second;
 	}
 
 	inline void AddEntry(const Entry& entry)
 	{
 		m_entries[entry.basename] = entry;
 		m_entries[entry.basename].resourceName = m_parentResource->GetName();
+	}
+
+	inline const std::string& GetInitUrl()
+	{
+		return m_initUrl;
+	}
+
+	inline void SetInitUrl(const std::string& url)
+	{
+		m_initUrl = url;
 	}
 };
 
@@ -138,11 +161,11 @@ public:
 
 	void AddEntry(const std::string& localFileName, const std::array<uint8_t, 20>& hashData, const std::map<std::string, std::string>& metaData);
 
-	boost::optional<Entry> GetEntryFor(const ResourceCacheEntryList::Entry& entry);
+	std::optional<Entry> GetEntryFor(const ResourceCacheEntryList::Entry& entry);
 
-	boost::optional<Entry> GetEntryFor(const std::string& hashString);
+	std::optional<Entry> GetEntryFor(const std::string& hashString);
 
-	boost::optional<Entry> GetEntryFor(const std::array<uint8_t, 20>& hash);
+	std::optional<Entry> GetEntryFor(const std::array<uint8_t, 20>& hash);
 
 	inline const std::string& GetCachePath()
 	{
@@ -156,4 +179,7 @@ public:
 
 private:
 	void OpenDatabase();
+
+	std::unordered_map<std::string, std::optional<std::optional<Entry>>> m_entryCache;
+	std::shared_mutex m_entryCacheMutex;
 };

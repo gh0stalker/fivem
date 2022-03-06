@@ -1,48 +1,139 @@
 #pragma once
 
+#include <HostSharedData.h>
 #include <windows.h>
 
 struct CfxState
 {
-	int initialPid;
+	int initialLauncherPid;
+	int initialGamePid;
 	int gamePid;
 
 	bool inJobObject;
 	bool running;
+	bool ranPastInstaller;
+	bool isReverseGame;
 
-	wchar_t initPath[1024];
+	wchar_t initPathGame[1024];
+	wchar_t initPathLauncher[1024];
+	
+	wchar_t gameDirectory[1024];
+
+	wchar_t gameExePath[1024];
+
+	wchar_t initCommandLine[2048];
 
 	CfxState()
 	{
+		memset(initPathGame, 0, sizeof(initPathGame));
+		memset(initPathLauncher, 0, sizeof(initPathLauncher));
+		memset(gameExePath, 0, sizeof(gameExePath));
+		memset(gameDirectory, 0, sizeof(gameDirectory));
+		memset(initCommandLine, 0, sizeof(initCommandLine));
+
+		initialGamePid = 0;
+		initialLauncherPid = 0;
+
 		running = true;
-		initialPid = GetCurrentProcessId();
 		gamePid = 0;
+		ranPastInstaller = false;
+		inJobObject = false;
+		isReverseGame = false;
 
-		// get the init path
-		wchar_t modulePath[512];
-		GetModuleFileName(GetModuleHandle(nullptr), modulePath, sizeof(modulePath) / sizeof(wchar_t));
+		// initialize the game PID
+		gamePid = 0;
+	}
 
-		// re-root to a real path
-		wchar_t realModulePath[512];
+	inline std::wstring GetInitPath()
+	{
+		wchar_t* pathRef =
+#ifdef IS_LAUNCHER
+			initPathLauncher;
+#else
+			initPathGame;
+#endif
 
-		GetFullPathName(modulePath, _countof(realModulePath), realModulePath, nullptr);
+		if (!pathRef[0])
+		{
+			// get the init path
+			wchar_t modulePath[512];
+			GetModuleFileName(GetModuleHandle(nullptr), modulePath, sizeof(modulePath) / sizeof(wchar_t));
 
-		wchar_t* dirPtr = wcsrchr(realModulePath, L'\\');
+			// re-root to a real path
+			wchar_t realModulePath[512];
 
-		// we do not check if dirPtr happens to be 0, as any valid absolute Win32 file path contains at least one backslash
-		dirPtr[1] = '\0';
+			GetFullPathName(modulePath, _countof(realModulePath), realModulePath, nullptr);
 
-		// copy the init path
-		wcscpy_s(initPath, realModulePath);
+			wchar_t* dirPtr = wcsrchr(realModulePath, L'\\');
+
+			// we do not check if dirPtr happens to be 0, as any valid absolute Win32 file path contains at least one backslash
+			dirPtr[1] = '\0';
+
+			// copy the init path
+			wcscpy_s(pathRef, std::size(initPathGame), realModulePath);
+		}
+
+		return pathRef;
+	}
+
+	inline void SetInitialPid(int pid)
+	{
+#ifdef IS_LAUNCHER
+		initialLauncherPid = pid;
+#else
+		initialGamePid = pid;
+#endif
+	}
+
+	inline int GetInitialPid()
+	{
+#ifdef IS_LAUNCHER
+		if (!initialLauncherPid)
+		{
+			initialLauncherPid = GetCurrentProcessId();
+		}
+#else
+		if (!initialGamePid)
+		{
+			initialGamePid = GetCurrentProcessId();
+		}
+#endif
+
+#ifdef IS_LAUNCHER
+		return initialLauncherPid;
+#else
+		return initialGamePid;
+#endif
 	}
 
 	inline bool IsMasterProcess()
 	{
-		return (initialPid == GetCurrentProcessId());
+#ifdef IS_LAUNCHER
+		if (!initialLauncherPid)
+		{
+			initialLauncherPid = GetCurrentProcessId();
+		}
+#else
+		if (!initialGamePid)
+		{
+			initialGamePid = GetCurrentProcessId();
+		}
+#endif
+
+#ifdef IS_LAUNCHER
+		return (initialLauncherPid == GetCurrentProcessId());
+#else
+		return (initialGamePid == GetCurrentProcessId());
+#endif
 	}
 
 	inline bool IsGameProcess()
 	{
 		return (gamePid == GetCurrentProcessId());
+	}
+
+	inline static auto Get()
+	{
+		return HostSharedData<CfxState>{ "CfxInitState" };
 	}
 };

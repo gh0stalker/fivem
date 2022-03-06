@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
@@ -6,6 +7,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Security;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 using CitizenFX.Core.Native;
@@ -14,19 +16,82 @@ namespace CitizenFX.Core
 {
 	public abstract class BaseScript
 	{
-		private Dictionary<Delegate, Task> CurrentTaskList { get; set; }
+		private string m_typeName;
+
+		// based on answer from
+		// https://stackoverflow.com/a/6624385
+		private class DelegateEqualityComparer : IEqualityComparer<Delegate>
+		{
+			public bool Equals(Delegate del1, Delegate del2)
+			{
+				return (del1 != null) && del1.Equals(del2);
+			}
+
+			public int GetHashCode(Delegate obj)
+			{
+				if (obj == null)
+					return 0;
+				int result = obj.Method.GetHashCode() ^ obj.GetType().GetHashCode();
+				if (obj.Target != null)
+					result ^= RuntimeHelpers.GetHashCode(obj.Target);
+				return result;
+			}
+		}
+
+		private class TickHandler
+		{
+			public Func<Task> tick;
+			public int hashCode;
+			public string name;
+		}
+
+		private ConcurrentDictionary<int, Task> CurrentTaskList { get; set; }
+
+		private DelegateEqualityComparer m_dec = new DelegateEqualityComparer();
+
+		private List<TickHandler> m_tickList = new List<TickHandler>();
 
 		/// <summary>
 		/// An event containing callbacks to attempt to schedule on every game tick.
 		/// A callback will only be rescheduled once the associated task completes.
 		/// </summary>
-		protected event Func<Task> Tick;
+		protected event Func<Task> Tick
+		{
+			add
+			{
+				if (m_typeName == null)
+				{
+					m_typeName = GetType().Name;
+				}
+
+				m_tickList.Add(new TickHandler()
+				{
+					tick = value,
+					hashCode = m_dec.GetHashCode(value),
+					name = value.GetMethodInfo().Name
+				});
+			}
+			remove
+			{
+				var hc = m_dec.GetHashCode(value);
+				m_tickList.RemoveAll(th => th.hashCode == hc);
+			}
+		}
 
 		protected internal EventHandlerDictionary EventHandlers { get; private set; }
 
 		protected ExportDictionary Exports { get; private set; }
 
-#if !IS_FXSERVER
+		[ThreadStatic]
+		private static string ms_curName = null;
+
+		internal static string CurrentName
+		{
+			get => ms_curName;
+			set => ms_curName = value;
+		}
+
+#if !IS_FXSERVER && !IS_RDR3 && !GTA_NY
 		private Player m_player;
 
 		protected Player LocalPlayer
@@ -45,27 +110,31 @@ namespace CitizenFX.Core
 		}
 #endif
 
+#if !IS_RDR3 && !GTA_NY
 		protected PlayerList Players { get; private set; }
+#endif
+
+		protected StateBag GlobalState { get; private set; }
 
 		protected BaseScript()
 		{
 			EventHandlers = new EventHandlerDictionary();
 			Exports = new ExportDictionary();
-			CurrentTaskList = new Dictionary<Delegate, Task>();
-
+			CurrentTaskList = new ConcurrentDictionary<int, Task>();
+			GlobalState = new StateBag("global");
+#if !IS_RDR3 && !GTA_NY
 			Players = new PlayerList();
+#endif
 		}
 
+		[SecuritySafeCritical]
 		internal void ScheduleRun()
 		{
-			if (Tick != null)
-			{
-				var calls = Tick.GetInvocationList();
+			var calls = m_tickList;
 
-				foreach (var call in calls)
-				{
-					ScheduleTick(call);
-				}
+			foreach (var call in calls)
+			{
+				ScheduleTick(call);
 			}
 		}
 
@@ -79,19 +148,55 @@ namespace CitizenFX.Core
 			EventHandlers[eventName] += callback;
 		}
 
-		internal void ScheduleTick(Delegate call)
+		private string GetCurName(TickHandler callWrap)
 		{
-			if (!CurrentTaskList.ContainsKey(call))
-			{
-				CurrentTaskList.Add(call, CitizenTaskScheduler.Factory.StartNew((Func<Task>)call).Unwrap().ContinueWith(a =>
-				{
-					if (a.IsFaulted)
-					{
-						Debug.WriteLine($"Failed to run a tick for {GetType().Name}: {a.Exception?.InnerExceptions.Aggregate("", (b, s) => s + b.ToString() + "\n")}");
-					}
+			return $"{m_typeName} -> tick {callWrap.name}";
+		}
 
-					CurrentTaskList.Remove(call);
-				}));
+		private void ScheduleTick(TickHandler callWrap)
+		{
+			if (!CurrentTaskList.ContainsKey(callWrap.hashCode))
+			{
+				var call = callWrap.tick;
+
+				try
+				{
+					ms_curName = callWrap.name;
+
+					using (var scope = new ProfilerScope(() => ms_curName = GetCurName(callWrap)))
+					{
+						CurrentTaskList.TryAdd(callWrap.hashCode, CitizenTaskScheduler.Factory.StartNew(() =>
+						{
+							try
+							{
+								ms_curName = callWrap.name;
+
+								using (var innerScope = new ProfilerScope(() => ms_curName = GetCurName(callWrap)))
+								{
+									var t = call();
+
+									return t;
+								}
+							}
+							finally
+							{
+								ms_curName = null;
+							}
+						}).Unwrap().ContinueWith(a =>
+						{
+							if (a.IsFaulted)
+							{
+								Debug.WriteLine($"Failed to run a tick for {GetType().Name}: {a.Exception?.InnerExceptions.Aggregate("", (b, s) => s + b.ToString() + "\n")}");
+							}
+
+							CurrentTaskList.TryRemove(callWrap.hashCode, out _);
+						}));
+					}
+				}
+				finally
+				{
+					ms_curName = null;
+				}
 			}
 		}
 
@@ -105,7 +210,7 @@ namespace CitizenFX.Core
 		/// <returns>An awaitable task.</returns>
 		public static Task Delay(int msecs)
 		{
-			return CitizenTaskScheduler.Factory.FromAsync(BeginDelay, EndDelay, msecs, CitizenTaskScheduler.Instance);
+			return CitizenTaskScheduler.Factory.FromAsync(BeginDelay, EndDelay, msecs, null);
 		}
 
 		[SecuritySafeCritical]
@@ -239,7 +344,7 @@ namespace CitizenFX.Core
 
 		private static IAsyncResult BeginDelay(int delay, AsyncCallback callback, object state)
 		{
-			InternalManager.AddDelay(delay, callback);
+			InternalManager.AddDelay(delay, callback, ms_curName);
 
 			return new DummyAsyncResult();
 		}
@@ -352,6 +457,7 @@ namespace CitizenFX.Core
 						}
 					}
 					// Player
+#if !IS_RDR3 && !GTA_NY
 					else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 1)
 					{
 #if IS_FXSERVER
@@ -373,6 +479,7 @@ namespace CitizenFX.Core
 						Debug.WriteLine("Client commands with parameter type Player not supported");
 #endif
 					}
+#endif
 					// string[]
 					else if (parameters.Length == 1)
 					{
@@ -392,6 +499,7 @@ namespace CitizenFX.Core
 						}
 					}
 					// Player, string[]
+#if !IS_RDR3 && !GTA_NY
 					else if (parameters.Any(p => p.ParameterType == typeof(Player)) && parameters.Length == 2)
 					{
 #if IS_FXSERVER
@@ -413,6 +521,7 @@ namespace CitizenFX.Core
 						Debug.WriteLine("Client commands with parameter type Player not supported");
 #endif
 					}
+#endif
 					// legacy --> int, List<object>, string
 					else
 					{

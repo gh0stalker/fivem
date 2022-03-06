@@ -198,6 +198,11 @@ void MultiplexTcpChildServerStream::CloseInternal()
 	SetReadCallback(TReadCallback());
 
 	m_server->CloseStream(this);
+
+	{
+		std::unique_lock<std::shared_mutex> _(m_baseStreamMutex);
+		m_baseStream = nullptr;
+	}
 }
 
 void MultiplexTcpChildServerStream::Close()
@@ -205,38 +210,81 @@ void MultiplexTcpChildServerStream::Close()
 	// keep a reference to ourselves
 	fwRefContainer<MultiplexTcpChildServerStream> thisRef = this;
 
-	if (m_baseStream.GetRef())
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
 	{
-		m_baseStream->Close();
+		bs->Close();
+	}
+
+	{
+		std::unique_lock<std::shared_mutex> _(m_baseStreamMutex);
 		m_baseStream = nullptr;
 	}
 
 	CloseInternal();
 }
 
-void MultiplexTcpChildServerStream::Write(const std::vector<uint8_t>& data)
+void MultiplexTcpChildServerStream::Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete)
 {
-	m_baseStream->Write(data);
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		bs->Write(data, std::move(onComplete));
+	}
 }
 
-void MultiplexTcpChildServerStream::Write(const std::string& data)
+void MultiplexTcpChildServerStream::Write(const std::string& data, TCompleteCallback&& onComplete)
 {
-	m_baseStream->Write(data);
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		bs->Write(data, std::move(onComplete));
+	}
 }
 
-void MultiplexTcpChildServerStream::Write(std::vector<uint8_t>&& data)
+void MultiplexTcpChildServerStream::Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete)
 {
-	m_baseStream->Write(std::move(data));
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		bs->Write(std::move(data), std::move(onComplete));
+	}
 }
 
-void MultiplexTcpChildServerStream::Write(std::string&& data)
+void MultiplexTcpChildServerStream::Write(std::string&& data, TCompleteCallback&& onComplete)
 {
-	m_baseStream->Write(std::move(data));
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		bs->Write(std::move(data), std::move(onComplete));
+	}
+}
+
+void MultiplexTcpChildServerStream::Write(std::unique_ptr<char[]> data, size_t len, TCompleteCallback&& onComplete)
+{
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		bs->Write(std::move(data), len, std::move(onComplete));
+	}
 }
 
 PeerAddress MultiplexTcpChildServerStream::GetPeerAddress()
 {
-	return m_baseStream->GetPeerAddress();
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
+	{
+		return bs->GetPeerAddress();
+	}
+
+	return {};
 }
 
 void MultiplexTcpChildServerStream::SetInitialData(const std::vector<uint8_t>& initialData)
@@ -244,11 +292,13 @@ void MultiplexTcpChildServerStream::SetInitialData(const std::vector<uint8_t>& i
 	m_initialData = initialData;
 }
 
-void MultiplexTcpChildServerStream::ScheduleCallback(const TScheduledCallback& callback)
+void MultiplexTcpChildServerStream::ScheduleCallback(TScheduledCallback&& callback, bool performInline)
 {
-	if (m_baseStream.GetRef())
+	auto bs = GetBaseStream();
+
+	if (bs.GetRef())
 	{
-		m_baseStream->ScheduleCallback(callback);
+		bs->ScheduleCallback(std::move(callback), performInline);
 	}
 }
 

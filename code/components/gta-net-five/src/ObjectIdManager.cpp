@@ -35,6 +35,7 @@ static uint32_t AssignObjectId(void* objectIds)
 	auto objectId = *it;
 
 	g_objectIds.erase(it);
+	g_stolenObjectIds.erase(objectId);
 	g_usedObjectIds.insert(objectId);
 
 	TheClones->Log("%s: id %d\n", __func__, objectId);
@@ -61,7 +62,10 @@ static bool ReturnObjectId(void* objectIds, uint16_t objectId)
 		// (and only use this for network protocol version 0x201903031957 or above - otherwise server bookkeeping will go out of sync)
 		if (Instance<ICoreGameInit>::Get()->NetProtoVersion < 0x201903031957 || g_stolenObjectIds.find(objectId) == g_stolenObjectIds.end())
 		{
-			g_objectIds.push_back(objectId);
+			if (!TheClones->IsRemovingObjectId(objectId))
+			{
+				g_objectIds.push_back(objectId);
+			}
 		}
 
 		g_stolenObjectIds.erase(objectId);
@@ -114,7 +118,36 @@ void ObjectIds_AddObjectId(int objectId)
 		g_stolenObjectIds.insert(objectId);
 	}
 
+	TheClones->Log("%s: id %d (wasOurs: %s)\n", __func__, objectId, wasOurs ? "true" : "false");
+}
+
+void ObjectIds_ConfirmObjectId(int objectId)
+{
 	TheClones->Log("%s: id %d\n", __func__, objectId);
+
+	g_objectIds.push_back(objectId);
+}
+
+void ObjectIds_StealObjectId(int objectId)
+{
+	TheClones->Log("%s: id %d\n", __func__, objectId);
+
+	if (g_usedObjectIds.find(objectId) != g_usedObjectIds.end())
+	{
+		g_stolenObjectIds.insert(objectId);
+	}
+	else
+	{
+		// remove this object ID from our free list (it was already returned, but server doesn't want it to be ours anymore)
+		for (auto it = g_objectIds.begin(); it != g_objectIds.end(); it++)
+		{
+			if (*it == objectId)
+			{
+				g_objectIds.erase(it);
+				break;
+			}
+		}
+	}
 }
 
 void ObjectIds_RemoveObjectId(int objectId)
@@ -180,7 +213,14 @@ static HookFunction hookFunction([]()
 			return;
 		}
 
-		if (g_objectIds.size() < 16)
+		int reqCount = 16;
+
+		if (Instance<ICoreGameInit>::Get()->HasVariable("onesync_big"))
+		{
+			reqCount = 4;
+		}
+
+		if (g_objectIds.size() < reqCount)
 		{
 			if (!g_requestedIds)
 			{
@@ -198,13 +238,23 @@ static HookFunction hookFunction([]()
 	{
 		g_objectIds.clear();
 		g_usedObjectIds.clear();
+		g_stolenObjectIds.clear();
 
 		g_requestedIds = false;
 	});
 
 	MH_Initialize();
+
+
+#ifdef GTA_FIVE
 	MH_CreateHook(hook::get_pattern("FF 89 C4 3E 00 00 33 D2", -12), AssignObjectId, (void**)&g_origAssignObjectId);
 	MH_CreateHook(hook::get_pattern("44 8B 91 C4 3E 00 00", -0x14), ReturnObjectId, (void**)&g_origReturnObjectId);
 	MH_CreateHook(hook::get_pattern("48 83 EC 20 8B B1 C4 3E 00 00", -0xB), HasSpaceForObjectId, (void**)&g_origHasSpaceForObjectId);
+#elif IS_RDR3
+	MH_CreateHook(hook::get_pattern("0F B7 08 66 FF C9 66 3B CA 76", -0x1C), AssignObjectId, (void**)&g_origAssignObjectId);
+	MH_CreateHook(hook::get_pattern("45 8B D9 85 DB 7E ? 8B B9", -0x1A), ReturnObjectId, (void**)&g_origReturnObjectId);
+	MH_CreateHook(hook::get_pattern("48 83 EC 20 8B B9 ? ? ? ? 8B DA", -0x6), HasSpaceForObjectId, (void**)&g_origHasSpaceForObjectId);
+#endif
+
 	MH_EnableHook(MH_ALL_HOOKS);
 });

@@ -8,12 +8,16 @@
 #include "StdInc.h"
 #include <ResourceCache.h>
 
-#include <SHA1.h>
+#include <openssl/sha.h>
 #include <VFSManager.h>
 
 #include <msgpack.hpp>
 
 #include <Error.h>
+
+#include <tbb/concurrent_unordered_map.h>
+
+tbb::concurrent_unordered_map<std::string, bool> g_stuffWritten;
 
 ResourceCache::ResourceCache(const std::string& cachePath, const std::string& physCachePath)
 	: m_cachePath(cachePath), m_physCachePath(physCachePath)
@@ -119,23 +123,21 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::map<st
 	{
 		// calculate a hash of the file
 		std::vector<uint8_t> data(8192);
-		sha1nfo sha1;
+		SHA_CTX sha1;
 		size_t numRead;
 
 		// initialize context
-		sha1_init(&sha1);
+		SHA1_Init(&sha1);
 
 		// read from the stream
 		while ((numRead = stream->Read(data)) > 0)
 		{
-			sha1_write(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+			SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 		}
 
 		// get the hash result and convert it to a string
-		uint8_t* hash = sha1_result(&sha1);
-
 		std::array<uint8_t, 20> h;
-		memcpy(h.data(), hash, 20);
+		SHA1_Final(h.data(), &sha1);
 
 		stream = {};
 
@@ -167,6 +169,8 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 	device->RemoveFile(targetFileName);
 	device->RenameFile(localFileName, targetFileName);
 
+	g_stuffWritten.emplace(targetFileName, true);
+
 	// serialize the data for placement in the database
 	msgpack::sbuffer buffer;
 	msgpack::packer<msgpack::sbuffer> packer(buffer);
@@ -183,16 +187,22 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 	packer.pack("m");
 	packer.pack(metaData);
 
+	static std::atomic<uint32_t> writeCount;
 
 	leveldb::WriteOptions options;
-	options.sync = true;
+	options.sync = (writeCount++ % 20) == 0;
 
 	{
 		// add an entry to the database
 		std::string key = "cache:v1:" + std::string(reinterpret_cast<const char*>(hash.data()), 20);
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+
+		std::unique_lock _(m_entryCacheMutex);
+		m_entryCache[key] = {};
 	}
+
+	options.sync = false;
 
 	{
 		// add a URL entry as well
@@ -201,22 +211,40 @@ void ResourceCache::AddEntry(const std::string& localFileName, const std::array<
 		std::string key = "cache:v1:url:" + fromIt->second;
 
 		m_indexDatabase->Put(options, key, leveldb::Slice(buffer.data(), buffer.size()));
+
+		std::unique_lock _(m_entryCacheMutex);
+		m_entryCache[key] = {};
 	}
 
 	trace("ResourceCache::AddEntry: Saved cache:v1:%s to the index cache.\n", hashString);
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::array<uint8_t, 20>& hash)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::array<uint8_t, 20>& hash)
 {
 	// attempt a database get
 	std::string key = "cache:v1:" + std::string(reinterpret_cast<const char*>(&hash[0]), hash.size());
 	std::string value;
 
+	{
+		std::shared_lock _(m_entryCacheMutex);
+		auto fetchIt = m_entryCache.find(key);
+
+		if (fetchIt != m_entryCache.end() && fetchIt->second)
+		{
+			return *fetchIt->second;
+		}
+	}
+
 	leveldb::Status status = m_indexDatabase->Get(leveldb::ReadOptions{}, key, &value);
 
 	if (status.ok())
 	{
-		return boost::optional<Entry>(Entry(value));
+		Entry e{ value };
+
+		std::unique_lock _(m_entryCacheMutex);
+		m_entryCache[key] = std::optional<Entry>(e);
+
+		return std::optional<Entry>(e);
 	}
 
 	if (!status.IsNotFound())
@@ -228,15 +256,17 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::arra
 #endif
 	}
 
-	return boost::optional<Entry>();
+	std::unique_lock _(m_entryCacheMutex);
+	m_entryCache[key] = { std::optional<Entry>{} };
+	return std::optional<Entry>();
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::string& hashString)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const std::string& hashString)
 {
 	return GetEntryFor(ParseHexString<20>(hashString.c_str()));
 }
 
-boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceCacheEntryList::Entry& entry)
+std::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceCacheEntryList::Entry& entry)
 {
 	if (entry.referenceHash.empty())
 	{
@@ -248,7 +278,7 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceC
 
 		if (status.ok())
 		{
-			return boost::optional<Entry>(Entry(value));
+			return std::optional<Entry>(Entry(value));
 		}
 
 		if (!status.IsNotFound())
@@ -260,7 +290,7 @@ boost::optional<ResourceCache::Entry> ResourceCache::GetEntryFor(const ResourceC
 #endif
 		}
 
-		return boost::optional<Entry>();
+		return std::optional<Entry>();
 	}
 
 	return GetEntryFor(entry.referenceHash);

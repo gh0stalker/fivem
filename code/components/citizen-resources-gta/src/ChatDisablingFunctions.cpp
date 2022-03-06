@@ -6,12 +6,15 @@
  */
 
 #include <StdInc.h>
+
+#if defined(GTA_FIVE)
 #include <ScriptEngine.h>
 
 #include <Resource.h>
 #include <fxScripting.h>
 
 #include <DisableChat.h>
+#include <nutsnbolts.h>
 
 #include <ICoreGameInit.h>
 
@@ -22,6 +25,27 @@ static InitFunction initFunction([] ()
 	Instance<ICoreGameInit>::Get()->OnGameRequestLoad.Connect([]()
 	{
 		g_textChatDisableResources.clear();
+	});
+
+	// disable legacy text chat by default, for it is confusing
+	OnMainGameFrame.Connect([]()
+	{
+		if (Instance<ICoreGameInit>::Get()->HasVariable("storyMode"))
+		{
+			return;
+		}
+
+		static bool chatOff = false;
+
+		if (!chatOff && Instance<ICoreGameInit>::Get()->HasVariable("gameSettled"))
+		{
+			game::SetTextChatEnabled(false);
+			chatOff = true;
+		}
+		else if (chatOff && !Instance<ICoreGameInit>::Get()->HasVariable("gameSettled"))
+		{
+			chatOff = false;
+		}
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_TEXT_CHAT_ENABLED", [] (fx::ScriptContext& context)
@@ -90,3 +114,4 @@ static InitFunction initFunction([] ()
 		context.SetResult<bool>(g_textChatDisableResources.empty());
 	});
 });
+#endif

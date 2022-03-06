@@ -6,6 +6,10 @@
 			targetname(libc and "shared_libc" or "shared")
 			language "C++"
 			kind "StaticLib"
+			
+			if os.istarget('windows') then
+				dependson { 'CfxPrebuild' }
+			end
 
 			if libc then
 				staticruntime "On"
@@ -16,7 +20,7 @@
 			
 			add_dependencies { 'vendor:utfcpp' }
 
-			if os.is('windows') then
+			if os.istarget('windows') then
 				links { libc and 'fmtlib-crt' or 'fmtlib' }
 			end
 
@@ -33,8 +37,12 @@
 				"../../shared/**.cpp", "../../shared/**.h", "**.cpp", "**.h"
 			}
 
-			configuration "not windows"
-				excludes { "Hooking.*" }
+			if _OPTIONS["game"] ~= "ny" then
+				files("**.asm")
+			end
+
+			filter { "system:not windows" }
+				excludes { "Hooking.*", "*.asm" }
 	end
 
 	do_shared(false)

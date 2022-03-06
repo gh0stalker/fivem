@@ -6,7 +6,11 @@
 */
 
 #include "StdInc.h"
+
+#if defined(LAUNCHER_PERSONALITY_MAIN) || defined(COMPILING_GLUE)
 #undef interface
+
+#include <CfxLocale.h>
 
 #include "InstallerExtraction.h"
 
@@ -17,10 +21,87 @@
 
 #include <sstream>
 
+class MergedFileStream
+{
+public:
+	MergedFileStream(const std::vector<FILE*>& files, const std::vector<size_t>& sizes)
+		: m_files(files), m_sizes(sizes), m_offset(0)
+	{
+		m_offsets.resize(m_sizes.size());
+
+		size_t o = 0;
+		for (int i = 0; i < m_offsets.size(); i++)
+		{
+			m_offsets[i] = o;
+			o += m_sizes[i];
+		}
+	}
+
+	size_t Read(void* out, size_t length)
+	{
+		size_t toRead = length;
+		size_t didRead = 0;
+
+		while (toRead > 0)
+		{
+			auto fileIdx = GetFileFor(m_offset);
+			size_t thisRead = std::min(toRead, (m_offsets[fileIdx] + m_sizes[fileIdx]) - m_offset);
+
+			fseek(m_files[fileIdx], m_offset - m_offsets[fileIdx], SEEK_SET);
+			size_t r = fread((char*)out + didRead, 1, thisRead, m_files[fileIdx]);
+			didRead += r;
+			m_offset += r;
+			toRead -= r;
+
+			if (r != thisRead)
+			{
+				break;
+			}
+		}
+
+		return didRead;
+	}
+
+	size_t Tell()
+	{
+		return m_offset;
+	}
+
+	void Set(size_t off)
+	{
+		m_offset = off;
+	}
+
+private:
+	int GetFileFor(size_t offset)
+	{
+		int file = 0;
+
+		for (size_t off : m_offsets)
+		{
+			if (offset >= off && offset < (off + m_sizes[file]))
+			{
+				return file;
+			}
+
+			file++;
+		}
+
+		return -1;
+	}
+
+private:
+	std::vector<FILE*> m_files;
+	std::vector<size_t> m_sizes;
+	std::vector<size_t> m_offsets;
+
+	size_t m_offset;
+};
+
 class LzmaStreamWrapper
 {
 private:
-	FILE* m_file;
+	MergedFileStream* m_file;
 
 	lzma_stream m_stream;
 
@@ -30,7 +111,7 @@ private:
 	size_t m_cursor;
 
 public:
-	LzmaStreamWrapper(FILE* baseFile);
+	LzmaStreamWrapper(MergedFileStream* baseFile);
 
 	~LzmaStreamWrapper();
 
@@ -41,7 +122,7 @@ public:
 	size_t Read(void* buffer, size_t bytes);
 };
 
-LzmaStreamWrapper::LzmaStreamWrapper(FILE* baseFile)
+LzmaStreamWrapper::LzmaStreamWrapper(MergedFileStream* baseFile)
 	: m_file(baseFile), m_buffer(32768), m_inBuffer(32768), m_cursor(0)
 {
 	memset(&m_stream, 0, sizeof(m_stream));
@@ -54,7 +135,7 @@ LzmaStreamWrapper::LzmaStreamWrapper(FILE* baseFile)
 
 	// decode the base file header + a fake uncompressed size (as NSIS doesn't have one)
 	uint8_t lzmaHeader[5 + 8];
-	fread(&lzmaHeader[0], 1, 5, baseFile);
+	baseFile->Read(&lzmaHeader[0], 5);
 	
 	*(uint64_t*)&lzmaHeader[5] = UINT64_MAX;
 
@@ -90,7 +171,7 @@ size_t LzmaStreamWrapper::Read(void* buffer, size_t bytes)
 		if (m_stream.avail_in == 0)
 		{
 			m_stream.next_in = &m_inBuffer[0];
-			m_stream.avail_in = fread(&m_inBuffer[0], 1, m_inBuffer.size(), m_file);
+			m_stream.avail_in = m_file->Read(&m_inBuffer[0], m_inBuffer.size());
 
 			if (m_stream.avail_in == 0)
 			{
@@ -129,7 +210,7 @@ void LzmaStreamWrapper::SeekAhead(size_t bytes)
 		if (m_stream.avail_in == 0)
 		{
 			m_stream.next_in = &m_inBuffer[0];
-			m_stream.avail_in = fread(&m_inBuffer[0], 1, m_inBuffer.size(), m_file);
+			m_stream.avail_in = m_file->Read(&m_inBuffer[0], m_inBuffer.size());
 		}
 
 		int res = lzma_code(&m_stream, LZMA_RUN);
@@ -152,19 +233,41 @@ void LzmaStreamWrapper::SeekAhead(size_t bytes)
 
 bool ExtractInstallerFile(const std::wstring& installerFile, const std::function<void(const InstallerInterface&)>& fileFindCallback)
 {
-	// open the installer file
-	FILE* f = _wfopen(installerFile.c_str(), L"rb");
+	std::vector<FILE*> files;
 
-	if (!f)
+	if (installerFile.find(L"_1604") != std::string::npos)
 	{
-		return false;
+		for (int i = 0; i <= 9; i++)
+		{
+			files.push_back(_wfopen(va(L"%s.%d", installerFile, i), L"rb"));
+		}
 	}
+	else
+	{
+		files.push_back(_wfopen(installerFile.c_str(), L"rb"));
+	}
+
+	std::vector<size_t> sizes;
+
+	for (int i = 0; i < files.size(); i++)
+	{
+		if (!files[i])
+		{
+			return false;
+		}
+
+		fseek(files[i], 0, SEEK_END);
+		sizes.push_back(ftell(files[i]));
+		fseek(files[i], 0, SEEK_SET);
+	}
+
+	MergedFileStream fstream(files, sizes);
 
 	// update UI
 	std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
 	std::wstring entryPathWide = installerFile;
 
-	UI_UpdateText(1, va(L"Extracting %s (scanning)", entryPathWide.c_str()));
+	UI_UpdateText(1, va(gettext(L"Extracting %s (scanning)"), entryPathWide.c_str()));
 	UI_UpdateProgress(0.0);
 
 	// try finding the position of the firstheader structure
@@ -175,16 +278,19 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 	
 	while (!found)
 	{
-		// if the file ended, return false
-		if (feof(f))
+		// read from the file
+		int firstPos = fstream.Tell();
+		int left = fstream.Read(byteBuffer, sizeof(byteBuffer));
+
+		if (left == 0)
 		{
-			fclose(f);
+			for (auto& f : files)
+			{
+				fclose(f);
+			}
+
 			return false;
 		}
-
-		// read from the file
-		int firstPos = ftell(f);
-		int left = fread(byteBuffer, 1, sizeof(byteBuffer), f);
 
 		// compare through the buffer to see if we found firstheader
 		for (int i = 0; i < sizeof(byteBuffer) - sizeof(firstheader); i++)
@@ -199,7 +305,7 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 				fh.nsinst[0] == FH_INT1)
 			{
 				// seek back to the end of firstheader in the file
-				fseek(f, firstPos + i + sizeof(firstheader), SEEK_SET);
+				fstream.Set(firstPos + i + sizeof(firstheader));
 
 				// we found it.
 				found = true;
@@ -217,7 +323,7 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 	}
 
 	// V's NSIS installers are NSIS_COMPRESS_WHOLE, so we'll need to pack our bags into a meta-LZMA stream...
-	LzmaStreamWrapper stream(f);
+	LzmaStreamWrapper stream(&fstream);
 
 	uint32_t headerLength;
 	stream.Read(&headerLength, sizeof(headerLength));
@@ -398,7 +504,11 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 
 	if (filesToExtract.empty())
 	{
-		fclose(f);
+		for (auto& f : files)
+		{
+			fclose(f);
+		}
+
 		return false;
 	}
 
@@ -421,7 +531,7 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 		auto nameStr = getString(data.first.offsets[1]);
 		int lastSlash = nameStr.find_last_of(L'/');
 
-		UI_UpdateText(1, va(L"Extracting %s", nameStr.substr(lastSlash + 1).c_str()));
+		UI_UpdateText(1, va(gettext(L"Extracting %s"), nameStr.substr(lastSlash + 1).c_str()));
 		UI_UpdateProgress(0.0);
 
 		// open the output file
@@ -431,12 +541,18 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 
 		if (!of)
 		{
-			fclose(f);
+			for (auto& f : files)
+			{
+				fclose(f);
+			}
+
 			return false;
 		}
 
 		char buffer[8192];
 		uint32_t bytesWritten = 0;
+
+		uint32_t ticks = 0;
 
 		while (bytesWritten < fileLength)
 		{
@@ -447,19 +563,28 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 			toRead = stream.Read(buffer, toRead);
 			bytesWritten += fwrite(buffer, 1, toRead, of);
 
-			UI_UpdateProgress((bytesWritten / (double)fileLength) * 100.0);
-
-			// poll message loop
-			while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+			if ((ticks % 100) == 0)
 			{
-				TranslateMessage(&msg);
-				DispatchMessage(&msg);
+				UI_UpdateProgress((bytesWritten / (double)fileLength) * 100.0);
+
+				// poll message loop
+				while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+				{
+					TranslateMessage(&msg);
+					DispatchMessage(&msg);
+				}
 			}
+
+			ticks++;
 
 			if (UI_IsCanceled())
 			{
 				fclose(of);
-				fclose(f);
+
+				for (auto& f : files)
+				{
+					fclose(f);
+				}
 
 				return false;
 			}
@@ -473,7 +598,11 @@ bool ExtractInstallerFile(const std::wstring& installerFile, const std::function
 		_wrename(tmpFile.c_str(), data.second.c_str());
 	}
 
-	fclose(f);
+	for (auto& f : files)
+	{
+		fclose(f);
+	}
 
 	return true;
 }
+#endif

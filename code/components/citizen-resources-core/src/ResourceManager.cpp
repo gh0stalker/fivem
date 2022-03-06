@@ -12,8 +12,6 @@
 
 #include <skyr/url.hpp>
 
-#include <ETWProviders/etwprof.h>
-
 static fx::ResourceManager* g_globalManager;
 static thread_local fx::ResourceManager* g_currentManager;
 
@@ -46,7 +44,7 @@ fwRefContainer<ResourceMounter> ResourceManagerImpl::GetMounterForUri(const std:
 	}
 	else
 	{
-		trace("%s: %s\n", __func__, parsed.error().message());
+		trace("%s: %s\n", __func__, skyr::make_error_code(parsed.error()).message());
 	}
 
 	return mounter;
@@ -54,36 +52,47 @@ fwRefContainer<ResourceMounter> ResourceManagerImpl::GetMounterForUri(const std:
 
 pplx::task<fwRefContainer<Resource>> ResourceManagerImpl::AddResource(const std::string& uri)
 {
+	return AddResourceWithError(uri)
+		.then([](tl::expected<fwRefContainer<Resource>, ResourceManagerError> result)
+	{
+		return result.value_or(nullptr);
+	});
+}
+
+pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> ResourceManagerImpl::AddResourceWithError(const std::string& uri)
+{
 	// find a valid mounter for this scheme
 	auto mounter = GetMounterForUri(uri);
 
 	// and forward to the mounter, if any.
 	if (mounter.GetRef())
 	{
-		pplx::task_completion_event<fwRefContainer<Resource>> completionEvent;
+		pplx::task_completion_event<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> completionEvent;
 
 		// set a completion event, as well
-		mounter->LoadResource(uri).then([=] (fwRefContainer<Resource> resource)
+		mounter->LoadResourceWithError(uri).then([=] (tl::expected<fwRefContainer<Resource>, ResourceManagerError> resourceRef)
 		{
-			if (resource.GetRef())
+			if (resourceRef)
 			{
+				std::unique_lock<std::recursive_mutex> lock(m_resourcesMutex);
+				auto resource = resourceRef.value();
+
 				// handle provides
 				auto md = resource->GetComponent<ResourceMetaDataComponent>();
 
 				for (const auto& entry : md->GetEntries("provide"))
 				{
-					std::unique_lock<std::recursive_mutex> lock(m_resourcesMutex);
 					m_resourceProvides.emplace(entry.second, resource);
 				}
 			}
 
-			completionEvent.set(resource);
+			completionEvent.set(resourceRef);
 		});
 
-		return pplx::task<fwRefContainer<Resource>>(completionEvent);
+		return pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>>(completionEvent);
 	}
 
-	return pplx::task_from_result<fwRefContainer<Resource>>(nullptr);
+	return pplx::task_from_result<tl::expected<fwRefContainer<Resource>, ResourceManagerError>>(tl::make_unexpected(ResourceManagerError{ "No mounter for resource URI." }));
 }
 
 void ResourceManagerImpl::AddResourceInternal(fwRefContainer<Resource> resource)
@@ -95,7 +104,7 @@ void ResourceManagerImpl::AddResourceInternal(fwRefContainer<Resource> resource)
 	}
 }
 
-fwRefContainer<Resource> ResourceManagerImpl::GetResource(const std::string& identifier)
+fwRefContainer<Resource> ResourceManagerImpl::GetResource(const std::string& identifier, bool withProvides /* = true */)
 {
 	fwRefContainer<Resource> resource;
 	std::unique_lock<std::recursive_mutex> lock(m_resourcesMutex);
@@ -104,7 +113,7 @@ fwRefContainer<Resource> ResourceManagerImpl::GetResource(const std::string& ide
 	resource = (it == m_resources.end()) ? nullptr : it->second;
 
 	// if non-existent, or stopped
-	if (!resource.GetRef() || resource->GetState() == ResourceState::Stopped)
+	if (withProvides && (!resource.GetRef() || resource->GetState() == ResourceState::Stopped))
 	{
 		auto provides = m_resourceProvides.equal_range(identifier);
 
@@ -138,9 +147,15 @@ void ResourceManagerImpl::ForAllResources(const std::function<void(const fwRefCo
 			currentResources.resize(m_resources.size());
 		}
 
-		for (auto& resource : m_resources)
+		for (const auto& resource : m_resources)
 		{
-			currentResources[resCount] = resource.second;
+			// avoid having to do a ref count increment/decrement (lock add/sub) at the cost
+			// of a compare-branch (which might be predicted away)
+			if (currentResources[resCount].GetRef() != resource.second.GetRef())
+			{
+				currentResources[resCount] = resource.second;
+			}
+
 			++resCount;
 		}
 	}
@@ -182,6 +197,8 @@ void ResourceManagerImpl::ResetResources()
 
 	m_resources["_cfx_internal"] = cfxInternal;
 
+	OnAfterReset();
+
 	g_currentManager = lastManager;
 }
 
@@ -208,9 +225,14 @@ void ResourceManagerImpl::AddMounter(fwRefContainer<ResourceMounter> mounter)
 	m_mounters.push_back(mounter);
 }
 
-fwRefContainer<Resource> ResourceManagerImpl::CreateResource(const std::string& resourceName)
+fwRefContainer<Resource> ResourceManagerImpl::CreateResource(const std::string& resourceName, const fwRefContainer<ResourceMounter>& mounter)
 {
 	fwRefContainer<ResourceImpl> resource = new ResourceImpl(resourceName, this);
+
+	if (mounter.GetRef())
+	{
+		resource->SetComponent(mounter);
+	}
 
 	AddResourceInternal(resource);
 
@@ -221,13 +243,6 @@ void ResourceManagerImpl::Tick()
 {
 	auto lastManager = g_currentManager;
 	g_currentManager = this;
-
-	// execute resource tick functions
-	ForAllResources([] (fwRefContainer<Resource> resource)
-	{
-		CETWScope etwScope(va("%s tick", resource->GetName()));
-		resource->Tick();
-	});
 
 	// execute tick events
 	OnTick();

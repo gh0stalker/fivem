@@ -5,10 +5,13 @@
 
 #include <MinHook.h>
 
+#include <jitasm.h>
 #include <Hooking.h>
 
 #include <Streaming.h>
 #include <nutsnbolts.h>
+
+#include <GameInit.h>
 
 #include <queue>
 
@@ -30,6 +33,7 @@ static std::vector<std::string> g_fontIds = {
 };
 
 static std::set<std::string> g_fontLoadQueue;
+static std::set<std::string> g_loadedFonts;
 
 namespace sf
 {
@@ -50,7 +54,13 @@ namespace sf
 
 	void RegisterFontLib(const std::string& swfName)
 	{
+		if (g_loadedFonts.find(swfName) != g_loadedFonts.end())
+		{
+			return;
+		}
+
 		g_fontLoadQueue.insert(swfName);
+		g_loadedFonts.insert(swfName);
 	}
 }
 
@@ -151,36 +161,47 @@ struct GFxMovieRoot
 static GFxMovieDef* g_md;
 static GFxMovieRoot* g_movie;
 
+static uint32_t g_idx = 0;
+static void** g_scaleformMgr;
+
+static void InitEarlyLoading()
+{
+	if (g_idx != 0)
+	{
+		return;
+	}
+
+	if (!*g_scaleformMgr)
+	{
+		return;
+	}
+
+	uint32_t fileId = 0;
+	streaming::RegisterRawStreamingFile(&fileId, "citizen:/font_lib_cfx.gfx", true, "font_lib_cfx.gfx", false);
+
+	g_idx = fileId;
+
+	auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
+	auto pool = (atPoolBase*)((char*)gfxStore + 56);
+	auto refBase = pool->GetAt<char>(g_idx - gfxStore->baseIdx);
+	refBase[50] = true; // 'create movie once loaded' flag
+
+	// '7' flag so the game won't try unloading it
+	streaming::Manager::GetInstance()->RequestObject(g_idx, 7);
+
+	// we should load *now*
+	streaming::LoadObjectsNow(false);
+}
+
 template<typename TFn>
 static void HandleEarlyLoading(TFn&& cb)
 {
-	static uint32_t idx = 0;
-
-	if (idx == 0)
-	{
-		uint32_t fileId = 0;
-		streaming::RegisterRawStreamingFile(&fileId, "citizen:/font_lib_cfx.gfx", true, "font_lib_cfx.gfx", false);
-
-		idx = fileId;
-
-		auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
-		auto pool = (atPoolBase*)((char*)gfxStore + 56);
-		auto refBase = pool->GetAt<char>(idx - gfxStore->baseIdx);
-		refBase[50] = true; // 'create movie once loaded' flag
-
-		// '7' flag so the game won't try unloading it
-		streaming::Manager::GetInstance()->RequestObject(idx, 7);
-
-		// we should load *now*
-		streaming::LoadObjectsNow(false);
-	}
-
-	if (idx != 0)
+	if (g_idx != 0)
 	{
 		auto gfxStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("gfx");
 
 		auto pool = (atPoolBase*)((char*)gfxStore + 56);
-		auto refBase = pool->GetAt<char*>(idx - gfxStore->baseIdx);
+		auto refBase = pool->GetAt<char*>(g_idx - gfxStore->baseIdx);
 
 		auto ref = *refBase;
 
@@ -523,6 +544,16 @@ static HookFunction hookFunction([]()
 		hook::call(location + 32, AssignFontLibWrap);
 	}
 
+	{
+		auto location = hook::get_pattern<char>("74 1A 80 3D ? ? ? ? 00 74 11 E8 ? ? ? ? 48 8B");
+		g_scaleformMgr = hook::get_address<void**>(location + 19);
+	}
+
+	OnLookAliveFrame.Connect([]()
+	{
+		InitEarlyLoading();
+	});
+
 	OnMainGameFrame.Connect([]()
 	{
 		UpdateFontLoading();
@@ -711,17 +742,71 @@ static HookFunction hookFunction([]()
 
 	hook::call(hook::get_pattern("F3 0F 58 55 34 F3 0F 11 4D C0 F3 0F 11 55 CC", 24), lineBufferStub.GetCode());
 
+	// fix bug when img tag is last in a text formatting tag (https://github.com/citizenfx/fivem/issues/1112)
+	static void (*origPopBack)(void* vec, size_t len);
+
+	struct TextFormat
+	{
+		char pad[66];
+		uint16_t presentMask;
+		char pad2[12];
+	};
+
+	struct ElemDesc
+	{
+		char pad[32];
+		TextFormat fmt;
+		char paraFmt[24];
+	};
+
+	static struct : jitasm::Frontend
+	{
+		void InternalMain() override
+		{
+			lea(r8, qword_ptr[rbp + 0x300]);
+			mov(rax, (uint64_t)ParseHtmlReset);
+			jmp(rax);
+		}
+
+		static void ParseHtmlReset(ElemDesc** vec, size_t len, TextFormat* format)
+		{
+			if (len > 0)
+			{
+				(*vec)[len - 1].fmt.presentMask |= (*vec)[len].fmt.presentMask;
+			}
+			else
+			{
+				format->presentMask |= (*vec)[len].fmt.presentMask;
+			}
+
+			origPopBack(vec, len);
+		}
+	} parseHtmlStub;
+
+	{
+		auto location = hook::get_pattern<char>("49 8D 54 24 FF 48 8D 4D 80 E8", 9);
+		hook::set_call(&origPopBack, location);
+		hook::call(location, parseHtmlStub.GetCode());
+		hook::call(location + 0x62, parseHtmlStub.GetCode());
+	}
+
 	// formerly debuggability for GFx heap, but as it seems now this is required to not get memory corruption
 	// (memory locking, maybe? GFx allows disabling thread safety of its heap)
 	// TODO: figure this out
 	auto memoryHeapPt = hook::get_address<void**>(hook::get_call(hook::get_pattern<char>("41 F6 06 04 75 03 83 CD 20", 12)) + 0x19);
-	memoryHeapPt[9] = Alloc_Align;
-	memoryHeapPt[10] = Alloc;
-	memoryHeapPt[11] = Realloc;
-	memoryHeapPt[12] = Free;
-	memoryHeapPt[13] = AllocAuto_Align;
-	memoryHeapPt[14] = AllocAuto;
-	memoryHeapPt[15] = GetHeap;
+	hook::put(&memoryHeapPt[9], Alloc_Align);
+	hook::put(&memoryHeapPt[10], Alloc);
+	hook::put(&memoryHeapPt[11], Realloc);
+	hook::put(&memoryHeapPt[12], Free);
+	hook::put(&memoryHeapPt[13], AllocAuto_Align);
+	hook::put(&memoryHeapPt[14], AllocAuto);
+	hook::put(&memoryHeapPt[15], GetHeap);
+
+	// undo fonts if reloading
+	OnKillNetworkDone.Connect([]()
+	{
+		g_loadedFonts.clear();
+	});
 
 	// always enable locking for GFx heap
 	// doesn't fix it, oddly - probably singlethreaded non-atomic reference counts?

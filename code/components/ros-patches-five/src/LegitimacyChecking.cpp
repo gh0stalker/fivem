@@ -20,6 +20,8 @@ __declspec(dllexport) void IDidntDoNothing()
 
 }
 
+extern std::string GetROSEmail();
+
 // {E091E21C-C61F-49F6-8560-CEF64DC42002}
 #define INITGUID
 #include <guiddef.h>
@@ -28,19 +30,48 @@ __declspec(dllexport) void IDidntDoNothing()
 DEFINE_GUID(CfxStorageGuid,
 	0x38d8f400, 0xaa8a, 0x4784, 0xa9, 0xf0, 0x26, 0xa0, 0x86, 0x28, 0x57, 0x7e);
 
+// {45ACDD04-ECA8-4C35-9622-4FAB4CA16E14}
+DEFINE_GUID(CfxStorageGuidRDR,
+	0x45acdd04, 0xeca8, 0x4c35, 0x96, 0x22, 0x4f, 0xab, 0x4c, 0xa1, 0x6e, 0x14);
+
+// {86219F24-F0E4-47C3-9D1F-4C7B156087EE}
+DEFINE_GUID(CfxStorageGuidNY,
+	0x86219f24, 0xf0e4, 0x47c3, 0x9d, 0x1f, 0x4c, 0x7b, 0x15, 0x60, 0x87, 0xee);
+
+
 #pragma comment(lib, "rpcrt4.lib")
 
 std::string GetOwnershipPath()
 {
     PWSTR appDataPath;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &appDataPath))) {
+	HRESULT hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &appDataPath);
+
+    if (SUCCEEDED(hr))
+	{
         std::string cfxPath = ToNarrow(appDataPath) + "\\DigitalEntitlements";
-        CreateDirectory(ToWide(cfxPath).c_str(), nullptr);
+		if (!CreateDirectory(ToWide(cfxPath).c_str(), nullptr))
+		{
+			auto error = GetLastError();
+
+			if (error != ERROR_ALREADY_EXISTS)
+			{
+				FatalError("CreateDirectory for %s failed: GetLastError = 0x%x\n\nMake sure your AppData folder is not write-protected.", cfxPath, error);
+			}
+		}
 
         CoTaskMemFree(appDataPath);
 
         RPC_CSTR str;
+
+#ifdef GTA_FIVE
         UuidToStringA(&CfxStorageGuid, &str);
+#elif defined(IS_RDR3)
+		UuidToStringA(&CfxStorageGuidRDR, &str);
+#elif defined(GTA_NY)
+		UuidToStringA(&CfxStorageGuidNY, &str);
+#else
+#error No entitlement GUID?
+#endif
 
         cfxPath += "\\";
         cfxPath += (char*)str;
@@ -50,6 +81,7 @@ std::string GetOwnershipPath()
         return cfxPath;
     }
 
+	FatalError("SHGetKnownFolderPath for FOLDERID_LocalAppData failed: HRESULT = 0x%08x\n\nMake sure your AppData folder is not write-protected.", hr);
     return "";
 }
 
@@ -122,7 +154,11 @@ bool LoadOwnershipTicket()
 			if (doc.IsObject())
 			{
 				g_entitlementSource = doc["guid"].GetString();
-				return true;
+
+				if (!g_entitlementSource.empty())
+				{
+					return true;
+				}
 			}
 		}
     }
@@ -190,68 +226,63 @@ void tohex(unsigned char* in, size_t insz, char* out, size_t outsz)
     pout[0] = 0;
 }
 
-bool VerifySteamOwnership()
+std::string GetAuthSessionTicket(uint32_t appID)
 {
-    // init Steam
-    SetEnvironmentVariable(L"SteamAppId", L"271590");
+	// init Steam
+	SetEnvironmentVariable(L"SteamAppId", fmt::sprintf(L"%d", appID).c_str());
 
-    {
-        struct deleter
-        {
-            ~deleter()
-            {
-                _unlink("steam_appid.txt");
-            }
-        } deleter;
-
-        FILE* f = fopen("steam_appid.txt", "w");
-
-        if (f)
-        {
-            fprintf(f, "%d", 271590);
-            fclose(f);
-        }
-
-        if (!SteamAPI_Init())
-        {
-            return false;
-        }
-    }
-
-    struct shutdown
-    {
-        ~shutdown()
-        {
-            SteamAPI_Shutdown();
-        }
-    } shutdown;
-
-    // get local ownership
-    if (!SteamApps()->BIsSubscribedApp(271590))
-    {
-        return false;
-    }
-
-    // verify remote ownership
-    uint8_t ticket[16384] = { 0 };
-    uint32_t ticketLength;
-    SteamUser()->GetAuthSessionTicket(ticket, sizeof(ticket), &ticketLength);
-
-    char outHex[16384];
-    tohex(ticket, ticketLength, outHex, sizeof(outHex));
-
-    std::string s = outHex;
-
-    // call into remote validation API
-	auto r = cpr::Post(cpr::Url{ "https://lambda.fivem.net/api/validate/entitlement/steam" },
-                       cpr::Payload{ {"ticket", s } });
-
-	if (r.status_code == 200)
 	{
-		g_entitlementSource = r.text;
-		return true;
+		struct deleter
+		{
+			~deleter()
+			{
+				_unlink("steam_appid.txt");
+			}
+		} deleter;
+
+		FILE* f = fopen("steam_appid.txt", "w");
+
+		if (f)
+		{
+			fprintf(f, "%d", appID);
+			fclose(f);
+		}
+
+		if (!SteamAPI_Init())
+		{
+			return "";
+		}
 	}
 
+	struct shutdown
+	{
+		~shutdown()
+		{
+			SteamAPI_Shutdown();
+		}
+	} shutdown;
+
+	// get local ownership
+	if (!SteamApps()->BIsSubscribed() ||
+		SteamApps()->GetAppOwner() != SteamUser()->GetSteamID())
+	{
+		return "";
+	}
+
+	// verify remote ownership
+	static uint8_t ticket[16384] = { 0 };
+	uint32_t ticketLength;
+	SteamUser()->GetAuthSessionTicket(ticket, sizeof(ticket), &ticketLength);
+
+	static char outHex[16384];
+	tohex(ticket, ticketLength, outHex, sizeof(outHex));
+
+	return outHex;
+}
+
+bool VerifySteamOwnership()
+{
+	// unsupported
 	return false;
 }
 
@@ -515,106 +546,150 @@ std::shared_ptr<EntitlementBlock> EntitlementBlock::Read(const uint8_t* buffer, 
 		rsaPubKey = rsa_pub;
 	}
 
-    const uint8_t* start = buffer;
+	const uint8_t* start = buffer;
 
-    uint32_t length = BigLong(*(uint32_t*)buffer);
-    buffer += 4;
+	uint32_t length = BigLong(*(uint32_t*)buffer);
+	buffer += 4;
 
-    uint64_t rockstarId = BigLongLong(*(uint64_t*)buffer);
-    buffer += 8;
+	uint64_t rockstarId = BigLongLong(*(uint64_t*)buffer);
+	buffer += 8;
 
-    uint32_t machineHashSize = BigLong(*(uint32_t*)buffer);
-    buffer += 4;
+	uint32_t machineHashSize = BigLong(*(uint32_t*)buffer);
+	buffer += 4;
 
-    std::string machineHash((const char*)buffer, machineHashSize);
-    buffer += machineHashSize;
+	std::string machineHash((const char*)buffer, machineHashSize);
+	buffer += machineHashSize;
 
-    uint32_t dateSize = BigLong(*(uint32_t*)buffer);
-    buffer += 4;
+	uint32_t dateSize = BigLong(*(uint32_t*)buffer);
+	buffer += 4;
 
-    std::string date((const char*)buffer, dateSize);
-    buffer += dateSize;
+	std::string date((const char*)buffer, dateSize);
+	buffer += dateSize;
 
-    uint32_t xmlSize = BigLong(*(uint32_t*)buffer);
-    buffer += 4;
+	uint32_t xmlSize = BigLong(*(uint32_t*)buffer);
+	buffer += 4;
 
-    std::string xml((const char*)buffer, xmlSize);
-    buffer += xmlSize;
+	std::string xml((const char*)buffer, xmlSize);
+	buffer += xmlSize;
 
-    uint32_t sigSize = BigLong(*(uint32_t*)buffer);
-    buffer += 4;
+	uint32_t sigSize = BigLong(*(uint32_t*)buffer);
+	buffer += 4;
 
-    std::vector<uint8_t> sig(sigSize);
-    memcpy(sig.data(), buffer, sigSize);
+	std::vector<uint8_t> sig(sigSize);
+	memcpy(sig.data(), buffer, sigSize);
 
-    // verify sig
-    Botan::SHA_160 hashFunction;
-    auto result = hashFunction.process(&start[4], length);
+	// verify sig
+	Botan::SHA_160 hashFunction;
+	auto result = hashFunction.process(&start[4], length);
 
-    std::vector<uint8_t> msg(result.size() + 1);
-    msg[0] = 2;
-    memcpy(&msg[1], &result[0], result.size());
+	std::vector<uint8_t> msg(result.size() + 1);
+	msg[0] = 2;
+	memcpy(&msg[1], &result[0], result.size());
 
-    Botan::BigInt n, e;
+	Botan::BigInt n, e;
 
-    Botan::BER_Decoder(rsaPubKey, rsa_pub_len)
-        .start_cons(Botan::SEQUENCE)
-            .decode(n)
-            .decode(e)
-        .end_cons();
+	Botan::BER_Decoder(rsaPubKey, rsa_pub_len)
+	.start_cons(Botan::SEQUENCE)
+	.decode(n)
+	.decode(e)
+	.end_cons();
 
-    Botan::AutoSeeded_RNG rng;
-    auto pk = Botan::RSA_PublicKey(n, e);
+	Botan::AutoSeeded_RNG rng;
+	auto pk = Botan::RSA_PublicKey(n, e);
 
-    auto signer = std::make_unique<Botan::PK_Verifier>(pk, "EMSA_PKCS1(SHA-1)");
-    
-    bool valid = signer->verify_message(msg, sig);
-    
-    auto rv = std::make_shared<EntitlementBlock>();
-    rv->m_machineHash = std::move(machineHash);
-    rv->m_rockstarId = rockstarId;
-    rv->m_xml = std::move(xml);
+	auto signer = std::make_unique<Botan::PK_Verifier>(pk, "EMSA_PKCS1(SHA-1)");
 
-    std::istringstream ss(date);
-    tm time;
-    ss >> std::get_time(&time, "%Y-%m-%dT%H:%M:%S");
+	bool valid = signer->verify_message(msg, sig);
 
-    rv->m_date = mktime(&time);
+	auto rv = std::make_shared<EntitlementBlock>();
+	rv->m_machineHash = std::move(machineHash);
+	rv->m_rockstarId = rockstarId;
+	rv->m_xml = std::move(xml);
 
-    rv->m_valid = valid;
+	std::istringstream ss(date);
+	tm time;
+	ss >> std::get_time(&time, "%Y-%m-%dT%H:%M:%S");
 
-    return rv;
+	rv->m_date = mktime(&time);
+
+	rv->m_valid = valid;
+
+	return rv;
 }
 
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/xml_parser.hpp>
 
 HRESULT RunCor(PCWSTR pszVersion, PCWSTR pszAssemblyName,
-    PCWSTR pszClassName, std::string* outArg);
+	PCWSTR pszClassName, std::string* outArg);
 
 void RunLegitimacyNui();
 
 std::string g_rosData;
+bool g_oldAge;
 
-bool VerifyRetailOwnership()
+#include <array>
+#if defined(IS_RDR3) || defined(GTA_FIVE) || defined(GTA_NY)
+bool GetMTLSessionInfo(std::string& ticket, std::string& sessionTicket, std::array<uint8_t, 16>& sessionKey, uint64_t& accountId);
+#endif
+
+extern std::string GetExternalSteamTicket();
+
+bool VerifyRetailOwnershipInternal(int pass)
 {
-	RunLegitimacyNui();
+	std::string ticket;
+	std::string sessionKey;
+	Botan::secure_vector<uint8_t> machineHash;
+	std::array<uint8_t, 16> sessionKeyArray;
+	std::string sessionTicket;
+	uint64_t accountId = 0;
 
-	if (g_rosData.empty())
+#ifndef IS_RDR3
+	if (pass == 2)
 	{
-		return false;
+		trace(__FUNCTION__ ": Running legitimacy NUI.\n");
+
+		RunLegitimacyNui();
+
+		trace(__FUNCTION__ ": Returned from legitimacy NUI.\n");
+
+		if (g_rosData.empty())
+		{
+			trace(__FUNCTION__ ": No ROS data received, exiting.\n");
+			return false;
+		}
+
+		rapidjson::Document doc;
+		doc.Parse(g_rosData.c_str());
+
+		ticket = doc["Ticket"].GetString();
+		sessionKey = doc["SessionKey"].GetString();
+		sessionTicket = doc["SessionTicket"].GetString();
+
+		Botan::AutoSeeded_RNG rng;
+		machineHash = rng.random_vec(32);
+		*(uint64_t*)&machineHash[4] = atoi(doc["RockstarId"].GetString()) ^ 0xDEADCAFEBABEFEED;
+		accountId = atoi(doc["RockstarId"].GetString());
+
+		trace(__FUNCTION__ ": Caught machine hash details from NUI.\n");
 	}
+#endif
 
-	rapidjson::Document doc;
-	doc.Parse(g_rosData.c_str());
+	if (pass == 1)
+	{
+		if (!GetMTLSessionInfo(ticket, sessionTicket, sessionKeyArray, accountId))
+		{
+			return false;
+		}
 
-	std::string ticket = doc["Ticket"].GetString();
-	std::string sessionKey = doc["SessionKey"].GetString();
-	std::string sessionTicket = doc["SessionTicket"].GetString();
+		Botan::AutoSeeded_RNG rng;
+		machineHash = rng.random_vec(32);
+		*(uint64_t*)&machineHash[4] = accountId ^ 0xDEADCAFEBABEFEED;
 
-	Botan::AutoSeeded_RNG rng;
-	auto machineHash = rng.random_vec(32);
-	*(uint64_t*)& machineHash[4] = atoi(doc["RockstarId"].GetString()) ^ 0xDEADCAFEBABEFEED;
+		sessionKey = Botan::base64_encode(sessionKeyArray.data(), 16);
+
+		trace(__FUNCTION__ ": Caught machine hash details from MTL.\n");
+	}
 
 	rapidjson::Document doc2;
 	doc2.SetObject();
@@ -629,12 +704,17 @@ bool VerifyRetailOwnership()
 
 	doc2.Accept(w);
 
+#ifdef GTA_FIVE
+	trace(__FUNCTION__ ": Going to call /ros/validate.\n");
+
 	auto b = cpr::Post(cpr::Url{ "http://localhost:32891/ros/validate" },
 		cpr::Body{ std::string(sb.GetString(), sb.GetLength()) });
 
 	if (!b.error && b.status_code == 200)
 	{
 		auto blob = Botan::base64_decode(b.text);
+
+		trace(__FUNCTION__ ": Decrypting result.\n");
 
 		auto cbc = new Botan::CBC_Decryption(new EntitlementBlockCipher(), new Botan::Null_Padding());
 		cbc->start(&blob[4], 16);
@@ -643,12 +723,20 @@ bool VerifyRetailOwnership()
 
 		auto entitlementBlock = EntitlementBlock::Read(&blob[20]);
 
+		trace(__FUNCTION__ ": Fetched and decrypted result from CPR.\n");
+
 		if (entitlementBlock->IsValid())
 		{
+			trace(__FUNCTION__ ": Valid entitlement block.\n");
+
 			if (time(nullptr) < entitlementBlock->GetExpirationDate())
 			{
+				trace(__FUNCTION__ ": Valid expiration date.\n");
+
 				if (entitlementBlock->GetMachineHash() == Botan::base64_encode(machineHash))
 				{
+					trace(__FUNCTION__ ": Valid account ID.\n");
+
 					// if (entitlementBlock->GetRockstarId() == someID)
 					{
 						std::istringstream stream(entitlementBlock->GetXml());
@@ -662,12 +750,51 @@ bool VerifyRetailOwnership()
 							{
 								try
 								{
-									std::string friendlyName = p.second.get<std::string>("<xmlattr>.FriendlyName");
+									bool valid = false;
+									std::string match;
 
-									if (friendlyName == "Access to Grand Theft Auto V for PC" || friendlyName == "Access to Grand Theft Auto V for PC Steam")
+#ifdef GTA_FIVE
+									std::string entitlementCode = p.second.get<std::string>("<xmlattr>.EntitlementCode");
+
+									// epic
+									if (entitlementCode == "04541FB36991EF2C43B38659B204EC3B941649666404498FB2CAD04B29E64A33" || entitlementCode == "F17551269FFD860D9749C30B21BDD96BF2613D26FEB3CCAFDC1D5AC9A1DE65F4")
 									{
-										auto r = cpr::Post(cpr::Url{ "https://lambda.fivem.net/api/validate/entitlement/ros" },
-											cpr::Payload{ { "rosData", b.text } });
+										if (!g_oldAge)
+										{
+											valid = true;
+											match = entitlementCode;
+										}
+									}
+#endif
+
+									if (!valid)
+									{
+										std::string friendlyName = p.second.get<std::string>("<xmlattr>.FriendlyName");
+
+#ifdef GTA_FIVE
+										if (friendlyName == "Access to Grand Theft Auto V for PC" || friendlyName == "Access to Grand Theft Auto V for PC Steam")
+#else
+										if (friendlyName.find("Red Dead Redemption 2") == 0)
+#endif
+										{
+											valid = true;
+											match = friendlyName;
+										}
+									}
+
+									if (valid)
+									{
+										trace(__FUNCTION__ ": Found matching entitlement for %s - creating token.\n", match);
+
+										auto r = cpr::Post(cpr::Url{ "https://lambda.fivem.net/api/validate/entitlement/rosfive" },
+											cpr::Payload{
+												{ "rosData", b.text },
+												{
+													"gameName",
+													"gta5"
+												},
+												{ "steamSource", GetExternalSteamTicket() }
+											});
 
 										if (r.error)
 										{
@@ -683,6 +810,8 @@ bool VerifyRetailOwnership()
 
 										if (r.status_code == 200)
 										{
+											trace(__FUNCTION__ ": Got a token and saved it.\n");
+
 											g_entitlementSource = r.text;
 											return true;
 										}
@@ -699,22 +828,80 @@ bool VerifyRetailOwnership()
 			}
 		}
 
+#ifdef GTA_FIVE
 		// create a thread as CEF does something odd to the current thread's win32k functionality leading to a crash as it's already shut down
 		// we pass using & since we join
-		std::thread([&doc]()
+		if (pass == 2)
 		{
-			MessageBox(nullptr, va(L"The Social Club account specified (%s) does not own a valid license to Grand Theft Auto V.", ToWide(doc["OrigNickname"].GetString())), L"Authentication error", MB_OK | MB_ICONWARNING);
-		}).join();
+			std::thread([&]()
+			{
+				MessageBox(nullptr, va(L"The Social Club account specified (%s) does not own a valid license to Grand Theft Auto V.", ToWide(GetROSEmail())), L"Authentication error", MB_OK | MB_ICONWARNING);
+			})
+			.join();
+		}
+#endif
 	}
 	else if (!b.error)
 	{
+		trace(__FUNCTION__ ": Obtained error from CPR: %s - %d - %s.\n", b.error.message, b.status_code, b.text);
+
 		std::thread([&b]()
 		{
 			MessageBox(nullptr, ToWide(b.text).c_str(), L"Authentication error", MB_OK | MB_ICONWARNING);
 		}).join();
 	}
+#else
+	auto r = cpr::Post(cpr::Url{ "https://lambda.fivem.net/api/validate/entitlement/ros2" },
+		cpr::Payload{
+			{ "ticket", ticket },
+			{ "gameName",
+#ifdef GTA_NY
+				"gta4"
+#else
+				"rdr3"
+#endif
+			},
+			{ "sessionKey", sessionKey },
+			{ "sessionTicket", sessionTicket },
+			{ "rosId", fmt::sprintf("%d", accountId) },
+		});
+
+	if (r.error)
+	{
+		FatalError("Error generating ROS entitlement token: %d (%s)", (int)r.error.code, r.error.message);
+		return false;
+	}
+
+	if (r.status_code >= 500)
+	{
+		FatalError("Error generating ROS entitlement token: %d (%s)", (int)r.status_code, r.text);
+		return false;
+	}
+
+	if (r.status_code == 200)
+	{
+		trace(__FUNCTION__ ": Got a token and saved it.\n");
+
+		g_entitlementSource = r.text;
+		return true;
+	}
+#endif
 
 	return false;
+}
+
+bool VerifyRetailOwnership()
+{
+	if (!VerifyRetailOwnershipInternal(1))
+	{
+#ifndef IS_RDR3
+		return VerifyRetailOwnershipInternal(2);
+#else
+		return false;
+#endif
+	}
+
+	return true;
 }
 
 #include <coreconsole.h>
@@ -744,7 +931,7 @@ namespace ros
 	}
 }
 
-static InitFunction initFunction([]()
+void LoadOwnershipEarly()
 {
 	tokenVar = new ConVar<std::string>("cl_ownershipTicket", ConVar_None, "");
 
@@ -752,6 +939,11 @@ static InitFunction initFunction([]()
 	{
 		SaveOwnershipTicket(tokenVar->GetValue());
 	}
+}
+
+static InitFunction initFunction([]()
+{
+	LoadOwnershipTicket();
 });
 
 static HookFunction hookFunction([]()

@@ -10,7 +10,12 @@
 #include <DrawCommands.h>
 #include <grcTexture.h>
 #include <ICoreGameInit.h>
+#include <CoreConsole.h>
 #include <LaunchMode.h>
+#include <CrossBuildRuntime.h>
+#include <utf8.h>
+#include <Hooking.h>
+#include <CL2LaunchMode.h>
 
 #include "memdbgon.h"
 
@@ -74,36 +79,20 @@ FontRendererTexture* GtaGameInterface::CreateTexture(int width, int height, Font
 {
 	if (!IsRunningTests())
 	{
-#if defined(GTA_NY)
-		// odd NY-specific stuff to force DXT5
-		*(uint32_t*)0x10C45F8 = D3DFMT_DXT5;
-		rage::grcTexture* texture = rage::grcTextureFactory::getInstance()->createManualTexture(width, height, (format == FontRendererTextureFormat::ARGB) ? FORMAT_A8R8G8B8 : 0, 0, nullptr);
-		*(uint32_t*)0x10C45F8 = 0;
-
-		int pixelSize = (format == FontRendererTextureFormat::ARGB) ? 4 : 1;
-
-		// copy texture data
-		D3DLOCKED_RECT lockedRect;
-		texture->m_pITexture->LockRect(0, &lockedRect, nullptr, D3DLOCK_DISCARD);
-
-		memcpy(lockedRect.pBits, pixelData, width * height * pixelSize);
-
-		texture->m_pITexture->UnlockRect(0);
-
-		// store pixel data so the game can reload the texture
-		texture->m_pixelData = pixelData;
-#else
 		rage::grcTextureReference reference;
 		memset(&reference, 0, sizeof(reference));
 		reference.width = width;
 		reference.height = height;
 		reference.depth = 1;
-		reference.stride = width;
-		reference.format = 3; // dxt5?
+		reference.stride = width * 4;
+#ifdef GTA_NY
+		reference.format = 1;
+#else
+		reference.format = 11;
+#endif
 		reference.pixelData = (uint8_t*)pixelData;
 
 		rage::grcTexture* texture = rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr);
-#endif
 
 		return new GtaFontTexture(texture);
 	}
@@ -141,11 +130,18 @@ void GtaGameInterface::SetTexture(FontRendererTexture* texture)
 void GtaGameInterface::DrawIndexedVertices(int numVertices, int numIndices, FontRendererVertex* vertices, uint16_t* indices)
 {
 #if GTA_NY
-	IDirect3DDevice9* d3dDevice = *(IDirect3DDevice9**)0x188AB48;
+	IDirect3DDevice9* d3dDevice = GetD3D9Device();
 
 	d3dDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 	d3dDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 #endif
+
+	/*for (int i = 0; i < numVertices; i++)
+	{
+		trace("before: %f %f\n", vertices[i].x, vertices[i].y);
+		TransformToScreenSpace((float*)&vertices[i], 1);
+		trace("aft: %f %f\n", vertices[i].x, vertices[i].y);
+	}*/
 
 	rage::grcBegin(3, numIndices);
 
@@ -154,11 +150,10 @@ void GtaGameInterface::DrawIndexedVertices(int numVertices, int numIndices, Font
 		auto vertex = &vertices[indices[j]];
 		uint32_t color = *(uint32_t*)&vertex->color;
 
+#if GTA_NY
 		// this swaps ABGR (as CRGBA is ABGR in little-endian) to ARGB by rotating left
-		if (!rage::grcTexture::IsRenderSystemColorSwapped())
-		{
-			color = (color & 0xFF00FF00) | _rotl(color & 0x00FF00FF, 16);
-		}
+		color = (color & 0xFF00FF00) | _rotl(color & 0x00FF00FF, 16);
+#endif
 
 		rage::grcVertex(vertex->x, vertex->y, 0.0, 0.0, 0.0, -1.0, color, vertex->u, vertex->v);
 	}
@@ -284,12 +279,32 @@ FontRendererGameInterface* CreateGameInterface()
 
 #include <random>
 
-static InitFunction initFunction([] ()
+static std::wstring GetUpdateChannel()
 {
+	wchar_t resultPath[1024];
+
+	static std::wstring fpath = MakeRelativeCitPath(L"CitizenFX.ini");
+	GetPrivateProfileString(L"Game", L"UpdateChannel", L"production", resultPath, std::size(resultPath), fpath.c_str());
+
+	return resultPath;
+}
+
+#if GTA_NY
+static HookFunction hookFunc([]()
+#else
+static InitFunction initFunction([] ()
+#endif
+{
+	static ConVar<std::string> customBrandingEmoji("ui_customBrandingEmoji", ConVar_Archive, "");
+
 	static std::random_device random_core;
 	static std::mt19937 random(random_core());
 
 	static bool shouldDraw = false;
+
+#ifdef GTA_NY
+	shouldDraw = true;
+#endif
 
 	if (!CfxIsSinglePlayer() && !getenv("CitizenFX_ToolMode"))
 	{
@@ -308,7 +323,7 @@ static InitFunction initFunction([] ()
 		shouldDraw = true;
 	}
 
-#ifdef _HAVE_GRCORE_NEWSTATES
+#if defined(_HAVE_GRCORE_NEWSTATES) && defined(GTA_FIVE)
 	OnGrcCreateDevice.Connect([] ()
 	{
 		D3D11_SAMPLER_DESC samplerDesc = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
@@ -317,21 +332,32 @@ static InitFunction initFunction([] ()
 
 		g_gtaGameInterface.SetPointSamplerState(CreateSamplerState(&samplerDesc));
 	});
+#elif defined(IS_RDR3)
+	OnGrcCreateDevice.Connect([]()
+	{
+		g_gtaGameInterface.SetPointSamplerState(GetStockStateIdentifier(SamplerStatePoint));
+	});
 #endif
+
+	srand(GetTickCount());
 
 	OnPostFrontendRender.Connect([=] ()
 	{
-#if defined(GTA_FIVE)
-		int x, y;
-		GetGameResolution(x, y);
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
+		int gameWidth, gameHeight;
+		GetGameResolution(gameWidth, gameHeight);
+
+		static auto updateChannel = GetUpdateChannel();
 
 		std::wstring brandingString = L"";
+		std::wstring brandingEmoji = L"";
+		std::wstring brandName = L"";
 
 		if (shouldDraw) {
 			SYSTEMTIME systemTime;
 			GetLocalTime(&systemTime);
 
-			std::wstring brandingEmoji;
+			brandName = L"FiveM";
 
 			switch (systemTime.wHour)
 			{
@@ -369,30 +395,205 @@ static InitFunction initFunction([] ()
 					break;
 			}
 
-			std::wstring brandName = L"FiveM";
-
 			if (!CfxIsSinglePlayer() && !getenv("CitizenFX_ToolMode"))
 			{
+#if !defined(IS_RDR3) && !defined(GTA_NY)
+				auto emoji = customBrandingEmoji.GetValue();
+
+				if (!emoji.empty())
+				{
+					if (Instance<ICoreGameInit>::Get()->HasVariable("endUserPremium"))
+					{
+						try
+						{
+							auto it = emoji.begin();
+							utf8::advance(it, 1, emoji.end());
+
+							std::vector<uint16_t> uchars;
+							uchars.reserve(2);
+
+							utf8::utf8to16(emoji.begin(), it, std::back_inserter(uchars));
+
+							brandingEmoji = std::wstring{ uchars.begin(), uchars.end() };
+						}
+						catch (const utf8::exception& e)
+						{
+
+						}
+					}
+				}
+
 				if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
 				{
-					brandName = L"FiveM/OneSync-ALPHA";
+					brandName += L"*";
+				}
+
+				if (Is2060())
+				{
+					brandName += L" (b2060)";
+				}
+
+				if (Is2189())
+				{
+					brandName += L" (b2189)";
+				}
+
+				if (Is2372())
+				{
+					brandName += L" (b2372)";
+				}
+
+				if (Is2545())
+				{
+					brandName += L" (b2545)";
+				}
+#endif 
+
+#if defined(IS_RDR3)
+				brandName = L"RedM";
+
+				if (Instance<ICoreGameInit>::Get()->OneSyncEnabled)
+				{
+					brandName += L"*";
+				}
+
+				if (Is1355())
+				{
+					brandName += L" (b1355)";
+				}
+
+				if (Is1436())
+				{
+					brandName += L" (b1436)";
+				}
+#endif
+
+#if defined(GTA_NY)
+				brandName = L"LibertyM";
+				brandingEmoji = L"\U0001F5FD";
+#endif
+
+				if (launch::IsSDKGuest())
+				{
+					brandName += L" (SDK)";
+				}
+				else if (updateChannel == L"canary")
+				{
+					brandName += L" (Canary)";
+				}
+				else if (updateChannel == L"beta")
+				{
+					brandName += L" (Beta)";
 				}
 			}
-
-			brandingString = fmt::sprintf(L"%s %s", brandName, brandingEmoji);
 		}
-
-		static CRect metrics;
-		
-		if (metrics.Width() <= 0.1f)
+		else
 		{
-			g_fontRenderer.GetStringMetrics(brandingString, 22.0f, 1.0f, "Segoe UI", metrics);
+			static auto version = ([]()
+			{
+				FILE* f = _wfopen(MakeRelativeCitPath(L"citizen/release.txt").c_str(), L"r");
+				int version = -1;
+
+				if (f)
+				{
+					char ver[128];
+
+					fgets(ver, sizeof(ver), f);
+					fclose(f);
+
+					version = atoi(ver);
+				}
+				else
+				{
+					version = 0;
+				}
+
+				return version;
+			})();
+
+			static auto updateChannelTag = ([]() -> std::wstring
+			{
+				if (updateChannel != L"production")
+				{
+					return fmt::sprintf(L"/%s", updateChannel);
+				}
+
+				return L"";
+			})();
+
+			brandName = fmt::sprintf(L"Ver. %d%s", version, updateChannelTag);
 		}
 
-		CRect drawRect(x - metrics.Width() - 10.0f, 10.0f, x, y);
-		CRGBA color(180, 180, 180);
+		static int anchorPosBase = ([]()
+		{
+			if (launch::IsSDKGuest())
+			{
+				return 1;
+			}
+			else
+			{
+				std::random_device rd;
+				std::mt19937 gen(rd());
+				std::uniform_int_distribution<> dis(0, 2);
 
-		g_fontRenderer.DrawText(brandingString, drawRect, color, 22.0f, 1.0f, "Segoe UI");
+				return dis(gen);
+			}
+		})();
+
+		int anchorPos = anchorPosBase;
+
+		if (!shouldDraw)
+		{
+			anchorPos = 1;
+		}
+
+		// If anchor position is on left-side, make the emoji go on the left side.
+		if (anchorPos < 2) {
+			brandingString = fmt::sprintf(L"%s %s", brandName, brandingEmoji);
+		} else
+		{
+			brandingString = fmt::sprintf(L"%s %s", brandingEmoji, brandName);
+		}
+
+		
+		static CRect metrics;
+		static fwWString lastString;
+		static float lastHeight;
+
+		float gameWidthF = static_cast<float>(gameWidth);
+		float gameHeightF = static_cast<float>(gameHeight);
+		
+		if (metrics.Width() <= 0.1f || lastString != brandingString || lastHeight != gameHeightF)
+		{
+			g_fontRenderer.GetStringMetrics(brandingString, 22.0f * (gameHeightF / 1440.0f), 1.0f, "Segoe UI", metrics);
+
+			lastString = brandingString;
+			lastHeight = gameHeightF;
+		}
+
+		CRect drawRect;
+
+		switch (anchorPos)
+		{
+		case 0: // TR
+			drawRect = { gameWidthF - metrics.Width() - 10.0f, 10.0f, gameWidthF, gameHeightF };
+			break;
+		case 1: // BR
+			drawRect = { gameWidthF - metrics.Width() - 10.0f, gameHeightF - metrics.Height() - 10.0f, gameWidthF, gameHeightF };
+			break;
+		case 2: // TL
+			drawRect = { 10.0f, 10.0f, gameWidthF, gameHeightF };
+			break;
+		}
+
+		CRGBA color(180, 180, 180, 120);
+
+		if (!shouldDraw)
+		{
+			color = CRGBA(255, 108, 0, 255);
+		}
+
+		g_fontRenderer.DrawText(brandingString, drawRect, color, 22.0f * (gameHeightF / 1440.0f), 1.0f, "Segoe UI");
 #endif
 
 		g_fontRenderer.DrawPerFrame();

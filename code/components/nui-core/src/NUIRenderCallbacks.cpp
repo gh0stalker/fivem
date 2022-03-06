@@ -1,172 +1,198 @@
 #include "StdInc.h"
 #include "CefOverlay.h"
 #include "NUIWindowManager.h"
+#include <CL2LaunchMode.h>
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
 
-#include <DrawCommands.h>
+extern nui::GameInterface* g_nuiGi;
 
 #include "memdbgon.h"
 
 extern bool g_hasCursor;
+extern bool g_shouldHideCursor;
 extern POINT g_cursorPos;
 
 extern bool g_isDragging;
 
-extern rage::grcTexture* g_cursorTexture;
+extern fwRefContainer<nui::GITexture> g_cursorTexture;
+extern fwEvent<std::chrono::microseconds, std::chrono::microseconds> OnVSync;
 
-static InitFunction initFunction([] ()
+#ifdef USE_NUI_ROOTLESS
+extern std::shared_mutex g_nuiFocusStackMutex;
+extern std::list<std::string> g_nuiFocusStack;
+#endif
+
+HCURSOR g_defaultCursor;
+extern HCURSOR InitDefaultCursor();
+
+static HookFunction initFunction([] ()
 {
-	OnD3DPostReset.Connect([] ()
+#ifndef IS_RDR3
+	OnVSync.Connect([](std::chrono::microseconds, std::chrono::microseconds)
 	{
-		Instance<NUIWindowManager>::Get()->ForAllWindows([=] (fwRefContainer<NUIWindow> window)
+		Instance<NUIWindowManager>::Get()->ForAllWindows([=](fwRefContainer<NUIWindow> window)
 		{
-			window->Invalidate();
-		});
-	});
-
-#if defined(GTA_NY)
-	DoWeIgnoreTheFrontend.Connect([] (bool& dw)
-	{
-		if (nui::HasMainUI())
-		{
-			dw = true;
-		}
-	});
-#endif
-
-	OnPostFrontendRender.Connect([] ()
-	{
-		if (nui::HasMainUI())
-		{
-			nui::GiveFocus(true);
-		}
-
-#if defined(GTA_NY)
-		void(*rendCB)() = [] ()
-		{
-#else
-		uintptr_t a1;
-		uintptr_t a2;
-
-		EnqueueGenericDrawCommand([] (uintptr_t, uintptr_t)
-		{
-#endif
-			if (nui::HasMainUI())
+			if (window->GetPaintType() != NUIPaintTypePostRender)
 			{
-				ClearRenderTarget(true, -1, true, 1.0f, true, -1);
+				return;
 			}
 
-			nui::OnDrawBackground(nui::HasMainUI());
+			window->SendBeginFrame();
+		});
+	});
+#endif
 
-			Instance<NUIWindowManager>::Get()->ForAllWindows([] (fwRefContainer<NUIWindow> window)
+	g_nuiGi->OnRender.Connect([]()
+	{
+		static auto initCursor = ([]()
+		{
+			g_defaultCursor = InitDefaultCursor();
+			g_nuiGi->SetHostCursor(g_defaultCursor);
+
+			return true;
+		})();
+
+		// if we're in the main UI, make sure it has focus
+		if (nui::HasMainUI())
+		{
+			nui::GiveFocus("mpMenu", true);
+		}
+
+		// draw background
+		nui::OnDrawBackground(nui::HasMainUI());
+
+		// update windows from a render context
+		Instance<NUIWindowManager>::Get()->ForAllWindows([](fwRefContainer<NUIWindow> window)
+		{
+			window->UpdateFrame();
+		});
+
+		// collect all post-render windows
+		std::map<std::string, fwRefContainer<NUIWindow>> renderWindows;
+
+		Instance<NUIWindowManager>::Get()->ForAllWindows([&renderWindows](fwRefContainer<NUIWindow> window)
+		{
+			if (window->GetPaintType() != NUIPaintTypePostRender)
 			{
-				window->UpdateFrame();
-			});
+				return;
+			}
 
-			Instance<NUIWindowManager>::Get()->ForAllWindows([=] (fwRefContainer<NUIWindow> window)
+			renderWindows.insert({ window->GetName(), window });
+		});
+
+		std::list<std::string> windowOrder =
+#ifndef USE_NUI_ROOTLESS
+		{
+			"nui_mpMenu",
+			"root",
+		}
+#else
+		g_nuiFocusStack
+#endif
+		;
+
+		// show on top = render last
+		std::reverse(windowOrder.begin(), windowOrder.end());
+
+		for (const auto& windowName : windowOrder)
+		{
+			auto& window = renderWindows[windowName];
+
+			if (!window.GetRef())
 			{
-				if (window->GetPaintType() != NUIPaintTypePostRender)
-				{
-					return;
-				}
+				continue;
+			}
 
-#ifndef _HAVE_GRCORE_NEWSTATES
-				// set the render state to account for premultiplied alpha
-				SetRenderState(2, 13);
-#else
-				auto oldBlendState = GetBlendState();
-				SetBlendState(GetStockStateIdentifier(BlendStatePremultiplied));
-#endif
+			// does the window have a full-screen surface? if so, draw it
+			if (window->GetTexture().GetRef())
+			{
+				g_nuiGi->SetTexture(window->GetTexture(), true);
 
-				if (window->GetTexture())
-				{
-					SetTextureGtaIm(window->GetTexture());
+				int resX, resY;
+				g_nuiGi->GetGameResolution(&resX, &resY);
 
-					int resX, resY;
-					GetGameResolution(resX, resY);
+				nui::ResultingRectangle rr;
+				rr.color = CRGBA(0xff, 0xff, 0xff, 0xff);
 
-					// we need to subtract 0.5f from each vertex coordinate (half a pixel after scaling) due to the usual half-pixel/texel issue
-					uint32_t color = 0xFFFFFFFF;
+				// the texture is usually upside down (GL->DX coord system), so we draw it as such
+				rr.rectangle = CRect(0, resY, resX, 0);
 
-#ifndef GTA_FIVE
-					DrawImSprite(-0.5f, -0.5f, resX - 0.5f, resY - 0.5f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, &color, 0);
-#else
-					DrawImSprite(0, 0, resX, resY, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, &color, 0);
-#endif
-				}
+				g_nuiGi->DrawRectangles(1, &rr);
 
-				if (window->GetPopupTexture())
-				{
-					SetTextureGtaIm(window->GetPopupTexture());
+				g_nuiGi->UnsetTexture();
+			}
 
-					uint32_t color = 0xFFFFFFFF;
-					const CefRect& rect = window->GetPopupRect();
-					DrawImSprite(rect.x, rect.y, rect.x + rect.width, rect.y + rect.height, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, &color, 0);
-				}
+			// a popup (e.g. select dropdowns) has to be drawn separately
+			if (window->GetPopupTexture().GetRef())
+			{
+				g_nuiGi->SetTexture(window->GetPopupTexture(), true);
 
-#ifdef _HAVE_GRCORE_NEWSTATES
-				SetBlendState(oldBlendState);
-#endif
-			});
+				const CefRect& rect = window->GetPopupRect();
 
-			if (nui::HasMainUI() || g_hasCursor)
+				nui::ResultingRectangle rr;
+				rr.color = CRGBA(0xff, 0xff, 0xff, 0xff);
+
+				// also upside down here
+				rr.rectangle = CRect(rect.x, rect.y + rect.height, rect.x + rect.width, rect.y);
+
+				g_nuiGi->DrawRectangles(1, &rr);
+
+				g_nuiGi->UnsetTexture();
+			}
+		}
+
+		// are we in any situation where we need a cursor?
+		bool needsNuiCursor = (nui::HasMainUI() || g_hasCursor) && !g_shouldHideCursor;
+		g_nuiGi->SetHostCursorEnabled(needsNuiCursor);
+
+		// we set the host cursor above unconditionally- this is for cases where the host cursor isn't sufficient
+		if (needsNuiCursor)
+		{
+			// do we need to draw a non-host cursor?
+			bool shouldDrawCursorTexture = false;
+
+			// if the game doesn't support a host cursor, draw the cursor texture
+			if (!g_nuiGi->CanDrawHostCursor())
+			{
+				shouldDrawCursorTexture = true;
+			}
+			// if we're SDK guest, also draw the cursor texture
+			else if (launch::IsSDKGuest())
+			{
+				shouldDrawCursorTexture = true;
+			}
+
+			// draw the cursor if we should, and if the texture exists
+			if (g_cursorTexture.GetRef() && shouldDrawCursorTexture)
 			{
 				POINT cursorPos = g_cursorPos;
 
-				GetCursorPos(&cursorPos);
-				ScreenToClient(FindWindow(L"grcWindow", nullptr), &cursorPos);
-
-#if defined(GTA_NY)
-				if (true)//!GameInit::GetGameLoaded())
+				// SDK wants to get cursor data from RGD
+				if (launch::IsSDKGuest())
 				{
-					SetTextureGtaIm(*(rage::grcTexture**)(0x10C8310));
+					static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+					cursorPos.x = rgd->mouseAbsX;
+					cursorPos.y = rgd->mouseAbsY;
 				}
 				else
 				{
-					SetTextureGtaIm(*(rage::grcTexture**)(0x18AAC20));
+					// if not SDK, our cursor follows the host cursor
+					GetCursorPos(&cursorPos);
+					ScreenToClient(g_nuiGi->GetHWND(), &cursorPos);
 				}
 
-				uint32_t color = 0xFFFFFFFF;
-				DrawImSprite((float)cursorPos.x, (float)cursorPos.y, (float)cursorPos.x + 40.0f, (float)cursorPos.y + 40.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, &color, 0);
-#else
-#if defined(_HAVE_GRCORE_NEWSTATES)
-				auto oldBlendState = GetBlendState();
-				SetBlendState(GetStockStateIdentifier(BlendStateDefault));
-#endif
+				g_nuiGi->SetTexture(g_cursorTexture);
 
-				if (g_cursorTexture)
-				{
-					SetTextureGtaIm(g_cursorTexture);
+				nui::ResultingRectangle rr;
+				rr.color = (g_isDragging) ? CRGBA(0xaa, 0xaa, 0xaa, 0xff) : CRGBA(0xff, 0xff, 0xff, 0xff);
+				rr.rectangle = CRect(cursorPos.x, cursorPos.y, cursorPos.x + 32.0f, cursorPos.y + 32.0f);
 
-					uint32_t color = 0xFFFFFFFF;
+				g_nuiGi->DrawRectangles(1, &rr);
 
-					if (g_isDragging)
-					{
-						color = 0xFFAAAAAA;
-					}
-
-					DrawImSprite(cursorPos.x, cursorPos.y, cursorPos.x + 32.0f, cursorPos.y + 32.0f, 0.0f, 0.0f, 0.0f, 1.0f, 1.0f, &color, 0);
-				}
-
-#if defined(_HAVE_GRCORE_NEWSTATES)
-				SetBlendState(oldBlendState);
-#endif
-#endif
+				g_nuiGi->UnsetTexture();
 			}
-#if defined(GTA_NY)
-		};
-
-		if (!IsOnRenderThread())
-		{
-			auto dc = new(0) CGenericDC(rendCB);
-
-			dc->Enqueue();
 		}
-		else
-		{
-			rendCB();
-		}
-#else
-		}, &a1, &a2);
-#endif
 	});
 });

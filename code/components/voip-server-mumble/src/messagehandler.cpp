@@ -44,6 +44,8 @@
 #include "voicetarget.h"
 #include "ban.h"
 
+#include "ChannelListener.h"
+
 #define MAX_TEXT 512
 #define MAX_USERNAME 128
 
@@ -133,12 +135,13 @@ void Mh_handle_message(client_t *client, message_t *msg)
 			break;
 		}
 
-		/*if (SSLi_getSHA1Hash(client->ssl, client->hash) && Ban_isBanned(client)) {
-			char hexhash[41];
-			SSLi_hash2hex(client->hash, hexhash);
-			Log_info("Client with hash '%s' is banned. Disconnecting", hexhash);
+		if (Ban_isBanned(client)) {
+			char buf[64];
+			sprintf(buf, "You were banned from the server");
+			Log_info("Client is banned. Disconnecting");
+			sendServerReject(client, buf, MumbleProto::Reject_RejectType_None);
 			goto disconnect;
-		}*/
+		}
 
 		client_itr = NULL;
 		while (Client_iterate(&client_itr) != NULL) {
@@ -320,6 +323,10 @@ void Mh_handle_message(client_t *client, message_t *msg)
 			if (client_itr->recording) {
 				sendmsg->payload.userState->set_recording(true);
 			}
+			for (int channelId : ChannelListener::getListenedChannelsForUser(client_itr))
+			{
+				sendmsg->payload.userState->add_listening_channel_add(channelId);
+			}
 			Client_send_message(client, sendmsg);
 		}
 
@@ -380,7 +387,7 @@ void Mh_handle_message(client_t *client, message_t *msg)
 		Log_debug("Voice channel crypt resync requested");
 		if (!msg->payload.cryptSetup->has_client_nonce()) {
 			sendmsg = Msg_create(CryptSetup);
-			sendmsg->payload.cryptSetup->set_server_nonce(client->cryptState.decrypt_iv, AES_BLOCK_SIZE);
+			sendmsg->payload.cryptSetup->set_server_nonce(client->cryptState.encrypt_iv, AES_BLOCK_SIZE);
 			Client_send_message(client, sendmsg);
 		} else {
 			memcpy(client->cryptState.decrypt_iv, msg->payload.cryptSetup->client_nonce().data(), AES_BLOCK_SIZE);
@@ -388,6 +395,7 @@ void Mh_handle_message(client_t *client, message_t *msg)
 		}
 		break;
 	case UserState:
+	{
 		target = NULL;
 		/* Only allow state changes for for the self user unless an admin is issuing */
 		if (msg->payload.userState->has_session() &&
@@ -417,6 +425,25 @@ void Mh_handle_message(client_t *client, message_t *msg)
 
 		msg->payload.userState->set_session(target->sessionId);
 		msg->payload.userState->set_actor(client->sessionId);
+
+		std::list<channel_t*> listeningChannelsAdd;
+
+		for (int i = 0; i < msg->payload.userState->listening_channel_add_size(); i++)
+		{
+			Channel* c = Chan_fromId(msg->payload.userState->listening_channel_add(i));
+
+			if (!c)
+			{
+				continue;
+			}
+
+			if (c->password)
+			{
+				continue;
+			}
+
+			listeningChannelsAdd.push_back(c);
+		}
 
 		if (msg->payload.userState->has_deaf()) {
 			target->deaf = msg->payload.userState->deaf();
@@ -500,7 +527,29 @@ void Mh_handle_message(client_t *client, message_t *msg)
 				msg->payload.userState->set_suppress(false);
 				target->isSuppressed = false;
 			}
+
+			if (ChannelListener::isListening(target->sessionId, msg->payload.userState->channel_id()))
+			{
+				msg->payload.userState->add_listening_channel_remove(msg->payload.userState->channel_id());
+			}
 		}
+
+		// Handle channel listening
+		for (channel_t* channel : listeningChannelsAdd)
+		{
+			ChannelListener::addListener(target, channel);
+		}
+
+		for (int i = 0; i < msg->payload.userState->listening_channel_remove_size(); i++)
+		{
+			channel_t* channel = Chan_fromId(msg->payload.userState->listening_channel_remove(i));
+
+			if (channel)
+			{
+				ChannelListener::removeListener(target, channel);
+			}
+		}
+
 		if (msg->payload.userState->has_plugin_context()) {
 			if (client->context)
 				free(client->context);
@@ -519,7 +568,7 @@ void Mh_handle_message(client_t *client, message_t *msg)
 		if (sendmsg != NULL)
 			Client_send_message_except(NULL, sendmsg);
 		break;
-
+	}
 	case TextMessage:
 		if (!getBoolConf(ALLOW_TEXTMESSAGE))
 			break;

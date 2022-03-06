@@ -28,7 +28,7 @@
 -- Create an openssl namespace to isolate the plugin
 --
 	local module = {}
-    module._VERSION = "1.0.2f"
+    module._VERSION = "1.1.1d"
 
 	module.printf = function(msg, ...)
 		printf("[openssl] " .. msg, ...)
@@ -78,7 +78,13 @@
 		module.crypto_project = function(cfg)
 			opensslimpl.verify_cfg(cfg)
 			includedirs {
+				cfg.src_dir,
 				cfg.include_dir,
+				cfg.src_dir .. "crypto/include/",
+				cfg.src_dir .. "crypto/ec/curve448/",
+				cfg.src_dir .. "crypto/ec/curve448/arch_32/",
+				cfg.src_dir .. "crypto/modes/",
+				
 			}
 
 			opensslimpl.set_defaults()
@@ -92,9 +98,15 @@
 				if not opensslimpl.library_excluded(cfg, libname, "crypto/") then
 					if string.sub(libname, 0, 6) == "crypto"  or libname == "" then
 						for _, filename in ipairs(desc.source) do
-							files {
-								cfg.src_dir .. libname .. "/" .. filename
-							}
+							if filename:match('%.s$') and _OPTIONS["game"] ~= "ny" then
+								files {
+									'vendor/openssl/asm/' .. libname .. '/' .. filename:gsub('%.s$', '.asm')
+								}
+							else						
+								files {
+									cfg.src_dir .. libname .. "/" .. filename
+								}
+							end
 						end
 						for _, filename in ipairs(desc.private_headers) do
 							table.insert(ids,
@@ -114,6 +126,7 @@
 		module.ssl_project = function(cfg)
 			opensslimpl.verify_cfg(cfg)
 			includedirs {
+				cfg.src_dir,
 				cfg.include_dir,
 			}
 
@@ -128,9 +141,15 @@
 				if libname == "ssl" or libname == "crypto"  or libname == "" then
 					if libname == "ssl" then
 						for _, filename in ipairs(desc.source) do
-							files {
-								cfg.src_dir .. libname .. "/" .. filename
-							}
+							if filename:match('%.s$') and _OPTIONS["game"] ~= "ny" then
+								files {
+									'vendor/openssl/asm/' .. libname .. '/' .. filename:gsub('%.s$', '.asm')
+								}
+							else	
+								files {
+									cfg.src_dir .. libname .. "/" .. filename
+								}
+							end
 						end
 					end
 					for _, filename in ipairs(desc.private_headers) do
@@ -156,6 +175,61 @@
 			assert(cfg.src_dir, "OpenSSL configuration does not contain a src_dir field")
 			assert(cfg.include_dir, "OpenSSL configuration does not contain an include_dir field")
 		end
+		
+		opensslimpl.templates = {
+			-- from openssl/Configurations/00-base-templates.conf
+			apps_aux_src	= "",
+			apps_init_src	= "",
+			cpuid_asm_src	= "mem_clr.c",
+			uplink_aux_src	= "",
+			bn_asm_src	= "bn_asm.c",
+			ec_asm_src	= "",
+			des_asm_src	= "des_enc.c fcrypt_b.c",
+			aes_asm_src	= "aes_core.c aes_cbc.c",
+			bf_asm_src	= "bf_enc.c",
+			md5_asm_src	= "",
+			cast_asm_src	= "c_enc.c",
+			rc4_asm_src	= "rc4_enc.c rc4_skey.c",
+			rmd160_asm_src	= "",
+			rc5_asm_src	= "rc5_enc.c",
+			wp_asm_src	= "wp_block.c",
+			cmll_asm_src	= "camellia.c cmll_misc.c cmll_cbc.c",
+			modes_asm_src	= "",
+			padlock_asm_src	= "",
+			chacha_asm_src	= "chacha_enc.c",
+			poly1305_asm_src	= "",
+			keccak1600_asm_src	= "keccak1600.c",
+		}
+		
+		local other_templates = {	
+			-- from later on in the file
+			cpuid_asm_src   = "x86_64cpuid.s",
+			bn_asm_src      = "asm/x86_64-gcc.c x86_64-mont.s x86_64-mont5.s x86_64-gf2m.s rsaz_exp.c rsaz-x86_64.s rsaz-avx2.s",
+			ec_asm_src      = "ecp_nistz256.c ecp_nistz256-x86_64.s x25519-x86_64.s",
+			aes_asm_src     = "aes_core.c aes_cbc.c vpaes-x86_64.s aesni-x86_64.s aesni-sha1-x86_64.s aesni-sha256-x86_64.s aesni-mb-x86_64.s",
+			md5_asm_src     = "md5-x86_64.s",
+			sha1_asm_src    = "sha1-x86_64.s sha256-x86_64.s sha512-x86_64.s sha1-mb-x86_64.s sha256-mb-x86_64.s",
+			rc4_asm_src     = "rc4-x86_64.s rc4-md5-x86_64.s",
+			wp_asm_src      = "wp-x86_64.s",
+			cmll_asm_src    = "cmll-x86_64.s cmll_misc.c",
+			modes_asm_src   = "ghash-x86_64.s aesni-gcm-x86_64.s",
+			padlock_asm_src = "e_padlock-x86_64.s",
+			chacha_asm_src	= "chacha-x86_64.s",
+			poly1305_asm_src= "poly1305-x86_64.s",
+			keccak1600_asm_src	= "keccak1600-x86_64.s",
+		}
+		
+		if  _OPTIONS["game"] ~= "ny" then
+			for k, v in pairs(other_templates) do
+				opensslimpl.templates[k] = v
+			end
+		end
+		
+		opensslimpl.format_templates = function(line)
+			return line:gsub('%{%- %$target%{([^%}]*)%} %-%}', function(part)
+				return opensslimpl.templates[part]
+			end)
+		end
 
 		-- generate system-level defaults
 		opensslimpl.set_defaults = function()
@@ -167,8 +241,36 @@
 					"WIN32_LEAN_AND_MEAN",
 					"_CRT_SECURE_NO_DEPRECATE",
 					"OPENSSL_SYSNAME_WIN32",
-					"OPENSSL_NO_EC_NISTP_64_GCC_128"
+					"OPENSSL_NO_EC_NISTP_64_GCC_128",
+					"OPENSSLDIR=\"C:\\Program Files\\Common Files\\SSL\"",
 				}
+
+				if _OPTIONS["game"] ~= "ny" then
+					defines {
+						--'AES_ASM',
+						'CPUID_ASM',
+						'OPENSSL_BN_ASM_MONT',
+						'OPENSSL_CPUID_OBJ',
+						'SHA1_ASM',
+						'SHA256_ASM',
+						'SHA512_ASM',
+						'GHASH_ASM',
+
+						'VPAES_ASM',
+						'BN_ASM',
+						'BF_ASM',
+						'BNCO_ASM',
+						'DES_ASM',
+						'LIB_BN_ASM',
+						'MD5_ASM',
+						'OPENSSL_BN_ASM',
+						'RIP_ASM',
+						'RMD160_ASM',
+						'WHIRLPOOL_ASM',
+						'WP_ASM',
+					}
+				end
+
 			filter {"architecture:x32 or architecture:x64"}
 				defines {
 					"L_ENDIAN",
@@ -193,6 +295,7 @@
 		-- Parse an openssl makefile and generate a library description
 		opensslimpl.parse_library = function(pathToMakefile)
 			local lib = {
+				name = "",
 				public_headers = {},
 				private_headers = {},
 				source = {},
@@ -210,16 +313,12 @@
 					if curr:sub(#curr) == "\\" then
 						line = line:sub(0, #line-1)
 					else
-						-- openssl splits header files into two categories:
-						--    private headers (HEADER=...)
-						--    public headers  (EXHEADER=...)
-						-- source files are denoted by LIBSRC=...
-						if string.sub(line, 1, 9) == "EXHEADER=" then
-							lib.public_headers = opensslimpl.split_words(line:sub(10))
-						elseif string.sub(line, 1, 7) == "HEADER=" then
-							lib.private_headers = opensslimpl.split_words(line:sub(8))
-						elseif string.sub(line, 1, 7) == "LIBSRC=" then
-							lib.source = opensslimpl.split_words(line:sub(8))
+						line = opensslimpl.format_templates(line)
+					
+						if string.sub(line, 1, 5) == "LIBS=" then
+							lib.name = line:sub(6)
+						elseif string.sub(line, 1, 7) == "SOURCE[" then
+							lib.source = opensslimpl.split_words(line:sub(10 + #lib.name))
 						end
 
 						line = ""
@@ -261,7 +360,7 @@
 			-- find makefiles in crypto/
 			local cryptoPrefix = OPENSSL_DIR .. "crypto/"
 			local makefile
-			for _, makefile in ipairs(os.matchfiles(cryptoPrefix .. "**/Makefile")) do
+			for _, makefile in ipairs(os.matchfiles(cryptoPrefix .. "**/build.info")) do
 				local libraryName = path.getdirectory(makefile)
 				if string.sub(libraryName, 1, #cryptoPrefix) == cryptoPrefix then
 					libraryName = string.sub(libraryName, #cryptoPrefix + 1)
@@ -270,16 +369,14 @@
 			end
 
 			-- describe the core crypto library
-			libraries["crypto"] = opensslimpl.parse_library(OPENSSL_DIR .. "crypto/Makefile")
+			libraries["crypto"] = opensslimpl.parse_library(OPENSSL_DIR .. "crypto/build.info")
 
 			-- describe the SSL library
-			libraries["ssl"] = opensslimpl.parse_library(OPENSSL_DIR .. "ssl/Makefile")
+			libraries["ssl"] = opensslimpl.parse_library(OPENSSL_DIR .. "ssl/build.info")
 
 			-- describe the core openssl library
-			if os.isfile(OPENSSL_DIR .. "Makefile") then
-				libraries[""] = opensslimpl.parse_library(OPENSSL_DIR .. "Makefile")
-			elseif os.isfile(OPENSSL_DIR .. "Makefile.org") then
-				libraries[""] = opensslimpl.parse_library(OPENSSL_DIR .. "Makefile.org")
+			if os.isfile(OPENSSL_DIR .. "build.info") then
+				libraries[""] = opensslimpl.parse_library(OPENSSL_DIR .. "build.info")
 			end
 
 			return libraries

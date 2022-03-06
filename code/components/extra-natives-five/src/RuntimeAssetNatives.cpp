@@ -7,6 +7,8 @@
 
 #include <scrBind.h>
 
+#include <CrossBuildRuntime.h>
+
 #define RAGE_FORMATS_GAME five
 #define RAGE_FORMATS_GAME_FIVE
 
@@ -16,6 +18,7 @@
 #include <Resource.h>
 #include <fxScripting.h>
 #include <VFSManager.h>
+#include <VFSWin32.h>
 
 #include <grcTexture.h>
 
@@ -24,6 +27,7 @@
 #include <wrl.h>
 #include <wincodec.h>
 
+#define WANT_CEF_INTERNALS
 #include <CefOverlay.h>
 
 #include <NetLibrary.h>
@@ -31,6 +35,10 @@
 #include <ResourceCacheDevice.h>
 #include <ResourceManager.h>
 #include <json.hpp>
+
+#include <atPool.h>
+
+#include <skyr/url.hpp>
 
 #include <concurrent_unordered_set.h>
 
@@ -43,7 +51,7 @@ public:
 
 	RuntimeTex(rage::grcTexture* texture, const void* data, size_t size);
 
-	RuntimeTex(rage::grcTexture* texture);
+	RuntimeTex(rage::grcTexture* texture, bool owned = true);
 
 	virtual ~RuntimeTex();
 
@@ -59,6 +67,11 @@ public:
 
 	void Commit();
 
+	inline void SetReferenceData(fwRefContainer<fwRefCountable> reference)
+	{
+		m_reference = reference;
+	}
+
 	inline rage::grcTexture* GetTexture()
 	{
 		return m_texture;
@@ -67,9 +80,13 @@ public:
 private:
 	rage::grcTexture* m_texture;
 
+	fwRefContainer<fwRefCountable> m_reference;
+
 	int m_pitch;
 
 	std::vector<uint8_t> m_backingPixels;
+
+	bool m_owned;
 };
 
 class RuntimeTxd
@@ -93,6 +110,7 @@ private:
 };
 
 RuntimeTex::RuntimeTex(const char* name, int width, int height)
+	: m_owned(true)
 {
 	rage::grcManualTextureDef textureDef;
 	memset(&textureDef, 0, sizeof(textureDef));
@@ -115,21 +133,25 @@ RuntimeTex::RuntimeTex(const char* name, int width, int height)
 }
 
 RuntimeTex::RuntimeTex(rage::grcTexture* texture, const void* data, size_t size)
-	: m_texture(texture)
+	: m_texture(texture), m_owned(true)
 {
 	m_backingPixels.resize(size);
 	memcpy(&m_backingPixels[0], data, m_backingPixels.size());
 }
 
-RuntimeTex::RuntimeTex(rage::grcTexture* texture)
-	: m_texture(texture)
+RuntimeTex::RuntimeTex(rage::grcTexture* texture, bool owned)
+	: m_texture(texture), m_owned(owned)
 {
 	m_backingPixels.resize(0);
 }
 
 RuntimeTex::~RuntimeTex()
 {
-	delete m_texture;
+	if (m_owned)
+	{
+		delete m_texture;
+		m_texture = nullptr;
+	}
 }
 
 int RuntimeTex::GetWidth()
@@ -158,10 +180,10 @@ void RuntimeTex::SetPixel(int x, int y, int r, int g, int b, int a)
 
 	auto start = &m_backingPixels[offset];
 
-	start[3] = b;
-	start[2] = g;
-	start[1] = r;
-	start[0] = a;
+	start[3] = a;
+	start[2] = r;
+	start[1] = g;
+	start[0] = b;
 }
 
 bool RuntimeTex::SetPixelData(const void* data, size_t length)
@@ -199,7 +221,7 @@ RuntimeTxd::RuntimeTxd(const char* name)
 	streaming::Manager* streaming = streaming::Manager::GetInstance();
 	auto txdStore = streaming->moduleMgr.GetStreamingModule("ytd");
 
-	txdStore->GetOrCreate(&m_txdIndex, name);
+	txdStore->FindSlotFromHashKey(&m_txdIndex, name);
 
 	if (m_txdIndex != 0xFFFFFFFF)
 	{
@@ -213,7 +235,7 @@ RuntimeTxd::RuntimeTxd(const char* name)
 			streaming::strAssetReference ref;
 			ref.asset = m_txd;
 
-			txdStore->SetAssetReference(m_txdIndex, ref);
+			txdStore->SetResource(m_txdIndex, ref);
 			entry.flags = (512 << 8) | 1;
 		}
 	}
@@ -227,6 +249,16 @@ RuntimeTex* RuntimeTxd::CreateTexture(const char* name, int width, int height)
 	}
 
 	if (m_textures.find(name) != m_textures.end())
+	{
+		return nullptr;
+	}
+
+	if (width <= 0 || width > 8192)
+	{
+		return nullptr;
+	}
+
+	if (height <= 0 || height > 8192)
 	{
 		return nullptr;
 	}
@@ -252,7 +284,10 @@ RuntimeTex* RuntimeTxd::CreateTextureFromDui(const char* name, const char* duiHa
 		return nullptr;
 	}
 
-	auto tex = std::make_shared<RuntimeTex>(nui::GetWindowTexture(duiHandle));
+	auto texture = nui::GetWindowTexture(duiHandle);
+	auto tex = std::make_shared<RuntimeTex>((rage::grcTexture*)texture->GetHostTexture(), false);
+	tex->SetReferenceData(texture);
+
 	m_txd->Add(name, tex->GetTexture());
 
 	m_textures[name] = tex;
@@ -264,84 +299,6 @@ RuntimeTex* RuntimeTxd::CreateTextureFromDui(const char* name, const char* duiHa
 #pragma comment(lib, "windowscodecs.lib")
 
 ComPtr<IWICImagingFactory> g_imagingFactory;
-
-class VfsStream : public Microsoft::WRL::RuntimeClass<Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>, IStream>
-{
-private:
-	fwRefContainer<vfs::Stream> m_stream;
-
-public:
-	VfsStream(fwRefContainer<vfs::Stream> stream)
-	{
-		m_stream = stream;
-	}
-
-	// Inherited via RuntimeClass
-	virtual HRESULT Read(void * pv, ULONG cb, ULONG * pcbRead) override
-	{
-		*pcbRead = m_stream->Read(pv, cb);
-
-		return S_OK;
-	}
-	virtual HRESULT Write(const void * pv, ULONG cb, ULONG * pcbWritten) override
-	{
-		*pcbWritten = m_stream->Write(pv, cb);
-		return S_OK;
-	}
-	virtual HRESULT Seek(LARGE_INTEGER dlibMove, DWORD dwOrigin, ULARGE_INTEGER * plibNewPosition) override
-	{
-		auto p = m_stream->Seek(dlibMove.QuadPart, dwOrigin);
-
-		if (plibNewPosition)
-		{
-			plibNewPosition->QuadPart = p;
-		}
-
-		return S_OK;
-	}
-
-	virtual HRESULT SetSize(ULARGE_INTEGER libNewSize) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT CopyTo(IStream * pstm, ULARGE_INTEGER cb, ULARGE_INTEGER * pcbRead, ULARGE_INTEGER * pcbWritten) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Commit(DWORD grfCommitFlags) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Revert(void) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT LockRegion(ULARGE_INTEGER libOffset, ULARGE_INTEGER cb, DWORD dwLockType) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT UnlockRegion(ULARGE_INTEGER libOffset, ULARGE_INTEGER cb, DWORD dwLockType) override
-	{
-		return E_NOTIMPL;
-	}
-	virtual HRESULT Stat(STATSTG * pstatstg, DWORD grfStatFlag) override
-	{
-		pstatstg->cbSize.QuadPart = m_stream->GetLength();
-		pstatstg->type = STGTY_STREAM;
-		pstatstg->grfMode = STGM_READ;
-
-		return S_OK;
-	}
-	virtual HRESULT Clone(IStream ** ppstm) override
-	{
-		return E_NOTIMPL;
-	}
-};
-
-static ComPtr<IStream> CreateComStream(fwRefContainer<vfs::Stream> stream)
-{
-	return Microsoft::WRL::Make<VfsStream>(stream);
-}
 
 RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fileName)
 {
@@ -366,7 +323,7 @@ RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fil
 
 	ComPtr<IWICBitmapDecoder> decoder;
 
-	ComPtr<IStream> stream = CreateComStream(vfs::OpenRead(resource->GetPath() + "/" + fileName));
+	ComPtr<IStream> stream = vfs::CreateComStream(vfs::OpenRead(resource->GetPath() + "/" + fileName));
 
 	HRESULT hr = g_imagingFactory->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, decoder.GetAddressOf());
 
@@ -396,9 +353,9 @@ RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fil
 			}
 
 			// create a pixel data buffer
-			uint32_t* pixelData = new uint32_t[width * height];
+			std::unique_ptr<uint32_t[]> pixelData(new uint32_t[width * height]);
 
-			hr = source->CopyPixels(nullptr, width * 4, width * height * 4, reinterpret_cast<BYTE*>(pixelData));
+			hr = source->CopyPixels(nullptr, width * 4, width * height * 4, reinterpret_cast<BYTE*>(pixelData.get()));
 
 			if (SUCCEEDED(hr))
 			{
@@ -409,9 +366,9 @@ RuntimeTex* RuntimeTxd::CreateTextureFromImage(const char* name, const char* fil
 				reference.depth = 1;
 				reference.stride = width * 4;
 				reference.format = 11; // should correspond to DXGI_FORMAT_B8G8R8A8_UNORM
-				reference.pixelData = (uint8_t*)pixelData;
+				reference.pixelData = (uint8_t*)pixelData.get();
 
-				auto tex = std::make_shared<RuntimeTex>(rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr), pixelData, width * height * 4);
+				auto tex = std::make_shared<RuntimeTex>(rage::grcTextureFactory::getInstance()->createImage(&reference, nullptr), pixelData.get(), width * height * 4);
 				m_txd->Add(name, tex->GetTexture());
 
 				m_textures[name] = tex;
@@ -441,7 +398,7 @@ static hook::cdecl_stub<void(fwArchetype*)> registerArchetype([]()
 	return hook::get_pattern("48 8B D9 8A 49 60 80 F9", -11);
 });
 
-static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, msgpack::object>& data, void* old = nullptr);
+static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, msgpack::object>& data, void* old = nullptr, bool keep = false);
 
 static bool FillStructure(rage::parStructure* structure, const std::function<bool(rage::parMember* member)>& fn)
 {
@@ -538,6 +495,26 @@ static bool SetVector(void* ptr, const msgpack::object& obj)
 			y = *(float*)(obj.via.ext.data() + 4);
 			z = *(float*)(obj.via.ext.data() + 8);
 			w = *(float*)(obj.via.ext.data() + 12);
+		}
+	}
+	else if (obj.type == msgpack::type::ARRAY)
+	{
+		std::vector<float> floats = obj.as<std::vector<float>>();
+
+		if (floats.size() >= 2)
+		{
+			x = floats[0];
+			y = floats[1];
+		}
+
+		if (floats.size() >= 3)
+		{
+			z = floats[2];
+		}
+
+		if (floats.size() >= 4)
+		{
+			w = floats[3];
 		}
 	}
 
@@ -705,9 +682,9 @@ static bool SetArray(void* ptr, const msgpack::object& value, rage::parMember* m
 	return true;
 }
 
-static void* MakeStructFromMsgPack(const char* structType, const std::map<std::string, msgpack::object>& data, void* old = nullptr)
+void* MakeStructFromMsgPack(const char* structType, const std::map<std::string, msgpack::object>& data, void* old = nullptr, bool keep = false)
 {
-	return MakeStructFromMsgPack(HashRageString(structType), data, old);
+	return MakeStructFromMsgPack(HashRageString(structType), data, old, keep);
 }
 
 static bool SetFromMsgPack(rage::parMember* memberBase, void* structVal, const msgpack::object& value)
@@ -792,7 +769,7 @@ static bool SetFromMsgPack(rage::parMember* memberBase, void* structVal, const m
 	return true;
 }
 
-static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, msgpack::object>& data, void* old)
+static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, msgpack::object>& data, void* old, bool keep)
 {
 	std::string structTypeReal;
 
@@ -817,13 +794,29 @@ static void* MakeStructFromMsgPack(uint32_t hash, const std::map<std::string, ms
 		return nullptr;
 	}
 
-	auto retval = (!old) ? structDef->m_new() : structDef->m_placementNew(old);
+	void* retval = nullptr;
 
-	std::map<uint32_t, msgpack::object> mappedData;
+	if (old)
+	{
+		if (keep)
+		{
+			retval = old;
+		}
+		else
+		{
+			retval = structDef->m_placementNew(old);
+		}
+	}
+	else
+	{
+		retval = structDef->m_new();
+	}
+
+	std::map<uint32_t, std::reference_wrapper<const msgpack::object>> mappedData;
 
 	for (auto& entry : data)
 	{
-		mappedData[HashRageString(entry.first.c_str())] = std::move(entry.second);
+		mappedData.emplace(HashRageString(entry.first.c_str()), entry.second);
 	}
 
 	if (retval)
@@ -969,6 +962,18 @@ static InitFunction initFunction([]()
 					factoryObject.as<std::vector<std::map<std::string, msgpack::object>>>() :
 					std::vector<std::map<std::string, msgpack::object>>{ factoryObject.as<std::map<std::string, msgpack::object>>() };
 
+				static int idx;
+				std::string nameRef = fmt::sprintf("reg_ents_%d", idx++);
+
+				CMapData* mapData = new CMapData();
+
+				// 1604, temp
+				assert(!xbr::IsGameBuildOrGreater<1868>());
+
+				*(uintptr_t*)mapData = 0x1419343E0;
+				mapData->name = HashString(nameRef.c_str());
+				mapData->contentFlags = 73;
+
 				float aabbMin[3];
 				float aabbMax[3];
 
@@ -980,33 +985,35 @@ static InitFunction initFunction([]()
 				aabbMax[1] = 0.0f - FLT_MAX;
 				aabbMax[2] = 0.0f - FLT_MAX;
 
-				// TODO: replace this logic with 'proper' fwMapData
-
-				CMapDataContents* contents = makeMapDataContents();
-				contents->entities = new void*[entities.size()];
-				memset(contents->entities, 0, sizeof(void*) * entities.size());
+				mapData->entities.Expand(entities.size());
 
 				size_t i = 0;
 
 				for (const auto& entityData : entities)
 				{
 					fwEntityDef* entityDef = (fwEntityDef*)MakeStructFromMsgPack("CEntityDef", entityData);
+					mapData->entities.Set(i, entityDef);
 
 					uint64_t archetypeUnk = 0xFFFFFFF;
 					fwArchetype* archetype = GetArchetypeSafe(entityDef->archetypeName, &archetypeUnk);
 
 					if (archetype)
 					{
-						void* entity = fwEntityDef__instantiate(entityDef, 0, archetype, &archetypeUnk);
+						float radius = archetype->radius;
+
+						if (archetype->radius < 0.01f)
+						{
+							radius = 250.f;
+						}
 
 						// update AABB
-						float xMin = entityDef->position[0] - archetype->radius;
-						float yMin = entityDef->position[1] - archetype->radius;
-						float zMin = entityDef->position[2] - archetype->radius;
+						float xMin = entityDef->position[0] - radius;
+						float yMin = entityDef->position[1] - radius;
+						float zMin = entityDef->position[2] - radius;
 
-						float xMax = entityDef->position[0] + archetype->radius;
-						float yMax = entityDef->position[1] + archetype->radius;
-						float zMax = entityDef->position[2] + archetype->radius;
+						float xMax = entityDef->position[0] + radius;
+						float yMax = entityDef->position[1] + radius;
+						float zMax = entityDef->position[2] + radius;
 
 						aabbMin[0] = (xMin < aabbMin[0]) ? xMin : aabbMin[0];
 						aabbMin[1] = (yMin < aabbMin[1]) ? yMin : aabbMin[1];
@@ -1015,28 +1022,67 @@ static InitFunction initFunction([]()
 						aabbMax[0] = (xMax > aabbMax[0]) ? xMax : aabbMax[0];
 						aabbMax[1] = (yMax > aabbMax[1]) ? yMax : aabbMax[1];
 						aabbMax[2] = (zMax > aabbMax[2]) ? zMax : aabbMax[2];
-
-						contents->entities[i] = entity;
-						i++;
 					}
+
+					i++;
 				}
 
-				contents->numEntities = i;
+				mapData->entitiesExtentsMin[0] = aabbMin[0];
+				mapData->entitiesExtentsMin[1] = aabbMin[1];
+				mapData->entitiesExtentsMin[2] = aabbMin[2];
 
-				CMapData mapData = { 0 };
-				mapData.aabbMax[0] = aabbMax[0];
-				mapData.aabbMax[1] = aabbMax[1];
-				mapData.aabbMax[2] = aabbMax[2];
-				mapData.aabbMax[3] = FLT_MAX;
+				mapData->entitiesExtentsMax[0] = aabbMax[0];
+				mapData->entitiesExtentsMax[1] = aabbMax[1];
+				mapData->entitiesExtentsMax[2] = aabbMax[2];
 
-				mapData.aabbMin[0] = aabbMin[0];
-				mapData.aabbMin[1] = aabbMin[1];
-				mapData.aabbMin[2] = aabbMin[2];
-				mapData.aabbMin[3] = 0.0f - FLT_MAX;
+				mapData->streamingExtentsMin[0] = aabbMin[0];
+				mapData->streamingExtentsMin[1] = aabbMin[1];
+				mapData->streamingExtentsMin[2] = aabbMin[2];
 
-				mapData.unkBool = 2;
+				mapData->streamingExtentsMax[0] = aabbMax[0];
+				mapData->streamingExtentsMax[1] = aabbMax[1];
+				mapData->streamingExtentsMax[2] = aabbMax[2];
 
-				addToScene(contents, &mapData, false, false);
+				auto mapTypesStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ytyp");
+				auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
+				
+				uint32_t mehId;
+				mapTypesStore->FindSlot(&mehId, "v_int_1");
+
+				uint32_t mapId;
+				mapDataStore->FindSlotFromHashKey(&mapId, nameRef.c_str());
+
+				if (mapId != -1)
+				{
+					void* unkRef[4] = { 0 };
+					unkRef[0] = mapData;
+
+					// 1604, temp (pso store placement cookie)
+					((void(*)(void*, uint32_t, const void*))0x14158FCD4)((void*)0x142DC9678, mapId + mapDataStore->baseIdx, unkRef);
+
+					auto pool = (atPoolBase*)((char*)mapDataStore + 56);
+					*(int32_t*)(pool->GetAt<char>(mapId) + 32) |= 2048;
+					*(int16_t*)(pool->GetAt<char>(mapId) + 38) = 1;
+					*(int32_t*)(pool->GetAt<char>(mapId) + 24) = mehId; // TODO: FIGURE OUT
+
+					//auto contents = (CMapDataContents*)mapDataStore->GetPtr(mapId);
+					auto mapMeta = (void*)mapDataStore->GetDataPtr(mapId); // not sure?
+
+					// TODO: leak
+					mapData->CreateMapDataContents()->PrepareInteriors(mapMeta, mapData, mapId);
+					
+					// reference is ignored but we pass it for formality - it actually uses PSO store placement cookies
+					streaming::strAssetReference ref;
+					ref.asset = mapData;
+
+					mapDataStore->SetResource(mapId, ref);
+					streaming::Manager::GetInstance()->Entries[mapId + mapDataStore->baseIdx].flags |= (512 << 8) | 1;
+
+					// 1604
+					((void(*)(int))0x1408CF07C)(0);
+
+					((void(*)(void*))((*(void***)0x142DCA970)[2]))((void*)0x142DCA970);
+				}
 			}
 		}
 	});
@@ -1151,6 +1197,29 @@ static InitFunction initFunction([]()
 			throw std::runtime_error("no current script runtime");
 		}
 
+		// anonymize query string parameters in case these are used for anything malign
+		try
+		{
+			auto uri = skyr::make_url(sourceUrl);
+			
+			if (uri)
+			{
+				if (!uri->search().empty())
+				{
+					uri->set_search(fmt::sprintf("hash=%08x", HashString(uri->search().c_str())));
+					sourceUrl = uri->href();
+				}
+			}
+			else
+			{
+				throw std::runtime_error("invalid streaming URL");
+			}
+		}
+		catch (std::exception& e)
+		{
+			throw std::runtime_error(va("invalid streaming URL: %s", e.what()));
+		}
+
 		auto resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
 
 		auto headerList = std::make_shared<HttpHeaderList>();
@@ -1179,13 +1248,14 @@ static InitFunction initFunction([]()
 				if (it == headerList->end())
 				{
 					it = headerList->find("content-length");
-					length = atoi(it->second.c_str());
 
 					if (it == headerList->end())
 					{
 						trace("Invalid HTTP response from %s.\n", sourceUrl);
 						return;
 					}
+
+					length = atoi(it->second.c_str());
 				}
 				else
 				{

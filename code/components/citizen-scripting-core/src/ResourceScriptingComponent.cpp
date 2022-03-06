@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 #include "Resource.h"
+#include "ResourceManager.h"
 #include "ResourceEventComponent.h"
 #include "ResourceMetaDataComponent.h"
 #include "ResourceScriptingComponent.h"
@@ -15,10 +16,44 @@
 #include <ICoreGameInit.h>
 #endif
 
+#include <DebugAlias.h>
+#include <ETWProviders/etwprof.h>
+
 #include <Error.h>
 
 namespace fx
 {
+class ResourceScriptingManagerComponent : public fwRefCountable, public fx::IAttached<ResourceManager>
+{
+public:
+	virtual void AttachToObject(ResourceManager* manager) override
+	{
+		manager->OnTick.Connect([this]()
+		{
+			// execute resource tick functions
+			// #FIXME: nested iteration safety?
+			for (const auto& resourcePair : m_resources)
+			{
+				const auto& component = resourcePair.second;
+				component->Tick();
+			}
+		});
+	}
+
+	void AddResource(Resource* resource)
+	{
+		resource->OnRemove.Connect([this, resource]()
+		{
+			m_resources.erase(resource);
+		});
+
+		m_resources[resource] = resource->GetComponent<ResourceScriptingComponent>();
+	}
+
+private:
+	std::unordered_map<fx::Resource*, fwRefContainer<ResourceScriptingComponent>> m_resources;
+};
+
 static tbb::concurrent_queue<std::tuple<std::string, std::function<void()>>> g_onNetInitCbs;
 
 OMPtr<IScriptHost> GetScriptHostForResource(Resource* resource);
@@ -66,6 +101,8 @@ ResourceScriptingComponent::ResourceScriptingComponent(Resource* resource)
 
 			for (auto it = environments.begin(); it != environments.end(); )
 			{
+				auto metaComponent = MakeNew<ScriptMetaDataComponent>(resource);
+
 				OMPtr<IScriptFileHandlingRuntime> ptr = *it;
 				bool environmentUsed = false;
 
@@ -73,7 +110,7 @@ ResourceScriptingComponent::ResourceScriptingComponent(Resource* resource)
 				{
 					for (auto& script : list)
 					{
-						if (ptr->HandlesFile(const_cast<char*>(script.c_str())))
+						if (ptr->HandlesFile(const_cast<char*>(script.c_str()), metaComponent.GetRef()))
 						{
 							environmentUsed = true;
 							break;
@@ -151,13 +188,10 @@ ResourceScriptingComponent::ResourceScriptingComponent(Resource* resource)
 			}
 #endif
 		}
-	});
+		else {
+			CreateEmptyEnvironments();
 
-	resource->OnTick.Connect([=] ()
-	{
-		for (const auto& [id, tickRuntime] : m_tickRuntimes)
-		{
-			tickRuntime->Tick();
+			m_resource->OnCreate();
 		}
 	});
 
@@ -175,6 +209,23 @@ ResourceScriptingComponent::ResourceScriptingComponent(Resource* resource)
 
 		m_tickRuntimes.clear();
 		m_scriptRuntimes.clear();
+	});
+}
+
+void ResourceScriptingComponent::Tick()
+{
+	// #TODO: 32 bit
+#if defined(_M_AMD64) && defined(ETW_MARKS_ENABLED)
+	std::string message(fmt::format("{} tick", m_resource->GetName()));
+	CETWScope etwScope(message.c_str());
+#endif
+
+	m_resource->Run([this]()
+	{
+		for (const auto& [id, tickRuntime] : m_tickRuntimes)
+		{
+			tickRuntime->Tick();
+		}
 	});
 }
 
@@ -213,17 +264,33 @@ void ResourceScriptingComponent::CreateEnvironments()
 		}
 
 		// add the event
-		eventComponent->OnTriggerEvent.Connect([=](const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
+		eventComponent->OnTriggerEvent.Connect([this](const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
 		{
 			if (m_eventsHandled.find(eventName) == m_eventsHandled.end())
 			{
 				// '*' event is an override to accept all in this resource
 				if (m_eventsHandled.find("*") == m_eventsHandled.end())
 				{
-					// skip the HLL ScRT
-					return;
+					// skip any further processing of this per-resource event
+					return false;
 				}
 			}
+
+			return true;
+		},
+		INT32_MIN);
+
+		eventComponent->OnTriggerEvent.Connect([=](const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
+		{
+			// save data in case we need to trace this back from dumps
+			char resourceNameBit[128];
+			char eventNameBit[128];
+
+			strncpy(resourceNameBit, m_resource->GetName().c_str(), std::size(resourceNameBit));
+			strncpy(eventNameBit, eventName.c_str(), std::size(eventNameBit));
+
+			debug::Alias(resourceNameBit);
+			debug::Alias(eventNameBit);
 
 			// invoke the event runtime
 			for (auto&& runtime : eventRuntimes)
@@ -240,7 +307,7 @@ void ResourceScriptingComponent::CreateEnvironments()
 
 	// pre-cache tick runtimes
 	{
-		for (auto& [ id, runtime ] : m_scriptRuntimes)
+		for (auto& [id, runtime] : m_scriptRuntimes)
 		{
 			OMPtr<IScriptTickRuntime> tickRuntime;
 
@@ -252,27 +319,29 @@ void ResourceScriptingComponent::CreateEnvironments()
 	}
 
 	// iterate over the runtimes and load scripts as requested
-	for (auto& environmentPair : m_scriptRuntimes)
-	{
-		OMPtr<IScriptFileHandlingRuntime> ptr;
+	OMPtr<IScriptFileHandlingRuntime> ptr;
 
-		fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+	fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
 
-		auto sharedScripts = metaData->GlobEntriesVector("shared_script");
-		auto clientScripts = metaData->GlobEntriesVector(
+	auto sharedScripts = metaData->GlobEntriesVector("shared_script");
+	auto clientScripts = metaData->GlobEntriesVector(
 #ifdef IS_FXSERVER
-			"server_script"
+	"server_script"
 #else
-			"client_script"
+	"client_script"
 #endif
-		);
+	);
 
-		if (FX_SUCCEEDED(environmentPair.second.As(&ptr)))
+	auto metaComponent = MakeNew<ScriptMetaDataComponent>(m_resource);
+	for (auto& list : { sharedScripts, clientScripts })
+	{
+		for (auto& script : list)
 		{
-			for (auto& list : { sharedScripts, clientScripts }) {
-				for (auto& script : list)
+			for (auto& environmentPair : m_scriptRuntimes)
+			{
+				if (FX_SUCCEEDED(environmentPair.second.As(&ptr)))
 				{
-					if (ptr->HandlesFile(const_cast<char*>(script.c_str())))
+					if (ptr->HandlesFile(const_cast<char*>(script.c_str()), metaComponent.GetRef()))
 					{
 						result_t hr = ptr->LoadFile(const_cast<char*>(script.c_str()));
 
@@ -280,10 +349,30 @@ void ResourceScriptingComponent::CreateEnvironments()
 						{
 							trace("Failed to load script %s.\n", script.c_str());
 						}
+
+						continue;
 					}
 				}
 			}
 		}
+	}
+
+	if (!m_tickRuntimes.empty())
+	{
+		m_resource->GetManager()->GetComponent<ResourceScriptingManagerComponent>()->AddResource(m_resource);
+	}
+}
+
+void ResourceScriptingComponent::CreateEmptyEnvironments()
+{
+	// Setup handlers that preempt OnTriggerEvent for no ScRT resources
+	fwRefContainer<ResourceEventComponent> eventComponent = m_resource->GetComponent<ResourceEventComponent>();
+	if (eventComponent.GetRef())
+	{
+		eventComponent->OnTriggerEvent.Connect([this](const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
+		{
+			return false;
+		}, INT32_MIN);
 	}
 }
 }
@@ -293,6 +382,11 @@ static InitFunction initFunction([]()
 	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
 	{
 		resource->SetComponent<fx::ResourceScriptingComponent>(new fx::ResourceScriptingComponent(resource));
+	});
+
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* resourceManager)
+	{
+		resourceManager->SetComponent(new fx::ResourceScriptingManagerComponent());
 	});
 });
 
@@ -339,3 +433,5 @@ bool DLL_EXPORT UpdateScriptInitialization()
 	return fx::g_onNetInitCbs.empty();
 }
 #endif
+
+DECLARE_INSTANCE_TYPE(fx::ResourceScriptingManagerComponent);

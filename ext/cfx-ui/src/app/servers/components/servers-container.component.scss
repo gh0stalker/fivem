@@ -1,38 +1,49 @@
 @import "variables";
 
-:host {
+.servers {
+	height: 100%;
 	display: flex;
+	flex-direction: column;
+	justify-content: stretch;
 
-	@include appContent;
+	overflow: hidden;
 
-	.servers {
-		width: $width;
+	aside {
+		position: relative;
+		width: 100%;
 
-		aside {
-			position: relative;
-			width: 100%;
-			height: $filterHeight + $padding;
+		margin-bottom: var(--qh);
+	}
+
+	article {
+		width: 100%;
+		height: 100%;
+
+		margin-left: 0;
+
+		display: flex;
+		overflow-y: hidden;
+
+		app-server-tag-filter {
+			display: none;
+			width: 20%;
+			margin-right: var(--qh);
 		}
 
-		article {
-			width: 100%;
-			height: calc(#{$appContentHeight} - #{$filterHeight});
-			margin-left: 0;
+		servers-list {
+			height: 100%;
+			flex-grow: 1;
 
-			display: flex;
-
-			app-server-tag-filter {
-				width: 20%;
-				margin-right: $padding;
+			&.pins {
+				/* should match amount of header buttons - unpadded (without qh) + padded (with qh) */
+				width: calc((var(--q3) * 4) + (3 * (var(--q3) + var(--qh))));
+				flex-shrink: 0;
+				margin-left: var(--qh);
 			}
+		}
 
-			servers-list {
-				flex-grow: 1;
-			}
-
-			&>* {
-				position: relative;
-			}
+		&>* {
+			position: relative;
 		}
 	}
 }

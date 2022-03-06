@@ -15,6 +15,8 @@
 #define RAGE_FORMATS_ny_pgContainers 1
 #elif defined(RAGE_FORMATS_GAME_PAYNE)
 #define RAGE_FORMATS_payne_pgContainers 1
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+#define RAGE_FORMATS_rdr3_pgContainers 1
 #endif
 
 #if defined(RAGE_FORMATS_GAME_FIVE)
@@ -63,6 +65,11 @@ public:
 		return (*m_offset)[offset];
 	}
 
+	inline auto& operator[](TIndex offset)
+	{
+		return Get(offset);
+	}
+
 	void Expand(TIndex newSize)
 	{
 		if (m_size >= newSize)
@@ -75,6 +82,7 @@ public:
 
 		delete[] *m_offset;
 		m_offset = newOffset;
+		m_size = newSize;
 	}
 
 	pgArray* MakeSaveable()
@@ -116,6 +124,7 @@ public:
 	}
 };
 
+#pragma pack(push, 1)
 template<typename TValue>
 class pgObjectArray : public pgStreamableBase
 {
@@ -123,6 +132,11 @@ private:
 	pgPtr<pgPtr<TValue>> m_objects;
 	uint16_t m_count;
 	uint16_t m_size;
+
+	// ensure 8-byte padding
+#if defined(RAGE_FORMATS_GAME_FIVE)
+	uint32_t m_padding;
+#endif
 
 public:
 	pgObjectArray()
@@ -152,6 +166,12 @@ public:
 		{
 			auto object = *(objects[i]);
 
+			if (!object)
+			{
+				(*m_objects)[i] = nullptr;
+				continue;
+			}
+
 			if (pgStreamManager::IsInBlockMap(object, nullptr, false))
 			{
 				(*m_objects)[i] = object;
@@ -178,6 +198,7 @@ public:
 
 		delete[] *m_objects;
 		m_objects = newObjects;
+		m_size = newSize;
 	}
 
 	TValue* Get(uint16_t offset)
@@ -188,6 +209,11 @@ public:
 		}
 
 		return *((*m_objects)[offset]);
+	}
+
+	inline auto& operator[](uint16_t offset)
+	{
+		return ((*m_objects)[offset]);
 	}
 
 	pgObjectArray* MakeSaveable()
@@ -230,10 +256,15 @@ public:
 		for (int i = 0; i < m_size; i++)
 		{
 			(*m_objects)[i].Resolve(blockMap);
-			(*m_objects)[i]->Resolve(blockMap);
+
+			if (!(*m_objects)[i].IsNull())
+			{
+				(*m_objects)[i]->Resolve(blockMap);
+			}
 		}
 	}
 };
+#pragma pack(pop)
 
 template<typename TValue>
 class pgDictionary : public pgBase
@@ -313,6 +344,33 @@ public:
 
 	inline void Add(uint32_t keyHash, TValue* value)
 	{
+		for (size_t idx = 0; idx < m_hashes.GetCount(); idx++)
+		{
+			if (m_hashes[idx] == keyHash)
+			{
+				// dupe
+				return;
+			}
+			else if (m_hashes[idx] > keyHash)
+			{
+				// expand array
+				auto lastCount = m_hashes.GetCount();
+
+				m_hashes.Set(m_hashes.GetCount(), 0);
+				m_values.Set(m_values.GetCount(), nullptr);
+
+				// move
+				std::move_backward(&m_hashes[idx], &m_hashes[lastCount], &m_hashes[lastCount + 1]);
+				std::move_backward(&m_values[idx], &m_values[lastCount], &m_values[lastCount + 1]);
+
+				// insert
+				m_hashes.Set(idx, keyHash);
+				m_values.Set(idx, value);
+
+				return;
+			}
+		}
+
 		m_hashes.Set(m_hashes.GetCount(), keyHash);
 		m_values.Set(m_values.GetCount(), value);
 	}

@@ -1,5 +1,6 @@
 #include "StdInc.h"
 
+#if defined(LAUNCHER_PERSONALITY_MAIN)
 #include <CfxState.h>
 #include <HostSharedData.h>
 
@@ -15,20 +16,22 @@
 
 #include <filesystem>
 
+#include <CfxLocale.h>
+
 #pragma comment(lib, "shlwapi.lib")
 
 namespace WRL = Microsoft::WRL;
 
-namespace fs = std::experimental::filesystem;
+namespace fs = std::filesystem;
 
-static void SetAumid(const WRL::ComPtr<IShellLink>& link)
+static void SetAumid(const WRL::ComPtr<IShellLink>& link, const std::wstring& custom = {})
 {
 	WRL::ComPtr<IPropertyStore> propertyStore;
 
 	if (SUCCEEDED(link.As(&propertyStore)))
 	{
 		PROPVARIANT pv;
-		if (SUCCEEDED(InitPropVariantFromString(L"CitizenFX.FiveM.Client", &pv)))
+		if (SUCCEEDED(InitPropVariantFromString((!custom.empty() ? custom.c_str() : L"CitizenFX." PRODUCT_NAME L".Client"), &pv)))
 		{
 			propertyStore->SetValue(PKEY_AppUserModel_ID, pv);
 
@@ -59,7 +62,13 @@ static std::wstring GetRootPath()
 
 	if (!appDataPath.empty())
 	{
+#ifdef GTA_FIVE
 		appDataPath += L"\\FiveM";
+#elif defined(IS_RDR3)
+		appDataPath += L"\\RedM";
+#else
+		appDataPath += L"\\Cfx.re";
+#endif
 
 		CreateDirectory(appDataPath.c_str(), nullptr);
 	}
@@ -90,11 +99,11 @@ static void CreateUninstallEntryIfNeeded()
 
 	setUninstallString(L"DisplayName", PRODUCT_NAME);
 	setUninstallString(L"DisplayIcon", filename + std::wstring(L",0"));
-	setUninstallString(L"HelpLink", L"https://fivem.net/");
+	setUninstallString(L"HelpLink", L"https://cfx.re/");
 	setUninstallString(L"InstallLocation", GetRootPath());
-	setUninstallString(L"Publisher", L"The CitizenFX Collective");
+	setUninstallString(L"Publisher", L"Cfx.re");
 	setUninstallString(L"UninstallString", fmt::sprintf(L"\"%s\" -uninstall app", filename));
-	setUninstallString(L"URLInfoAbout", L"https://fivem.net/");
+	setUninstallString(L"URLInfoAbout", L"https://cfx.re/");
 	setUninstallDword(L"NoModify", 1);
 	setUninstallDword(L"NoRepair", 1);
 }
@@ -102,7 +111,7 @@ static void CreateUninstallEntryIfNeeded()
 void Install_Uninstall(const wchar_t* directory)
 {
 	// check if this is actually a FiveM directory we're trying to uninstall
-	if (GetFileAttributes(fmt::sprintf(L"%s\\%s", directory, L"FiveM.app").c_str()) == INVALID_FILE_ATTRIBUTES)
+	if (GetFileAttributes(fmt::sprintf(L"%s\\%s", directory, PRODUCT_NAME L".app").c_str()) == INVALID_FILE_ATTRIBUTES)
 	{
 		return;
 	}
@@ -113,9 +122,9 @@ void Install_Uninstall(const wchar_t* directory)
 	if (FAILED(TaskDialog(
 		NULL,
 		GetModuleHandle(NULL),
-		L"Uninstall FiveM",
-		L"Uninstall FiveM?",
-		fmt::sprintf(L"Are you sure you want to remove FiveM from the installation root at %s?", directory).c_str(),
+		va(gettext(L"Uninstall %s"), PRODUCT_NAME),
+		va(gettext(L"Uninstall %s?"), PRODUCT_NAME),
+		fmt::sprintf(gettext(L"Are you sure you want to remove %s from the installation root at %s?"), PRODUCT_NAME, directory).c_str(),
 		TDCBF_YES_BUTTON | TDCBF_NO_BUTTON,
 		NULL,
 		&button)))
@@ -154,16 +163,16 @@ void Install_Uninstall(const wchar_t* directory)
 	};
 
 	addDelete(directory);
-	addDelete(GetFolderPath(FOLDERID_Programs) + L"\\FiveM.lnk");
-	addDelete(GetFolderPath(FOLDERID_Desktop) + L"\\FiveM.lnk");
-	addDelete(GetFolderPath(FOLDERID_Programs) + L"\\FiveM Singleplayer.lnk");
-	addDelete(GetFolderPath(FOLDERID_Desktop) + L"\\FiveM Singleplayer.lnk");
+	addDelete(GetFolderPath(FOLDERID_Programs) + L"\\" PRODUCT_NAME L".lnk");
+	addDelete(GetFolderPath(FOLDERID_Desktop) + L"\\" PRODUCT_NAME L".lnk");
+	addDelete(GetFolderPath(FOLDERID_Programs) + L"\\" PRODUCT_NAME L" Singleplayer.lnk");
+	addDelete(GetFolderPath(FOLDERID_Desktop) + L"\\" PRODUCT_NAME L" Singleplayer.lnk");
 
 	hr = ifo->PerformOperations();
 
 	if (FAILED(hr))
 	{
-		MessageBox(NULL, fmt::sprintf(L"Failed to uninstall FiveM. HRESULT = 0x%08x", hr).c_str(), L"InsnailShield", MB_OK | MB_ICONSTOP);
+		MessageBox(NULL, fmt::sprintf(L"Failed to uninstall " PRODUCT_NAME L". HRESULT = 0x%08x", hr).c_str(), L"InsnailShield", MB_OK | MB_ICONSTOP);
 		return;
 	}
 
@@ -188,7 +197,7 @@ bool Install_PerformInstallation()
 	}
 
 	// the executable goes to the target
-	auto targetExePath = rootPath + L"\\FiveM.exe";
+	auto targetExePath = rootPath + L"\\" PRODUCT_NAME L".exe";
 
 	auto doHandoff = [targetExePath]()
 	{
@@ -200,7 +209,7 @@ bool Install_PerformInstallation()
 		{
 			static HostSharedData<CfxState> hostData("CfxInitState");
 			hostData->inJobObject = false;
-			hostData->initialPid = pi.dwProcessId;
+			hostData->SetInitialPid(pi.dwProcessId);
 
 			ResumeThread(pi.hThread);
 
@@ -218,12 +227,14 @@ bool Install_PerformInstallation()
 	{
 		// at least re-verify the game, if the user 'tried' to reinstall
 		DeleteFileW((rootPath + L"\\caches.xml").c_str());
-		DeleteFileW((rootPath + L"\\FiveM.app\\caches.xml").c_str());
+		DeleteFileW((rootPath + L"\\" PRODUCT_NAME L".app\\caches.xml").c_str());
+		DeleteFileW((rootPath + L"\\content_index.xml").c_str());
+		DeleteFileW((rootPath + L"\\" PRODUCT_NAME L".app\\content_index.xml").c_str());
 
 		// hand off to the actual game
 		if (!doHandoff())
 		{
-			MessageBox(nullptr, L"FiveM is already installed. You should launch it through the shortcut in the Start menu.\nIf you want to create a portable installation, put FiveM.exe into an empty folder instead.", L"FiveM", MB_OK | MB_ICONINFORMATION);
+			MessageBox(nullptr, PRODUCT_NAME L" is already installed. You should launch it through the shortcut in the Start menu.\nIf you want to create a portable installation, put " PRODUCT_NAME L".exe into an empty folder instead.", PRODUCT_NAME, MB_OK | MB_ICONINFORMATION);
 		}
 
 		return true;
@@ -248,7 +259,7 @@ bool Install_PerformInstallation()
 		if (SUCCEEDED(hr))
 		{
 			shellLink->SetPath(targetExePath.c_str());
-			shellLink->SetDescription(L"FiveM is a modification framework for Grand Theft Auto V");
+			shellLink->SetDescription(PRODUCT_NAME L" is a modification framework based on the Cfx.re platform");
 			shellLink->SetIconLocation(targetExePath.c_str(), 0);
 			
 			SetAumid(shellLink);
@@ -258,11 +269,12 @@ bool Install_PerformInstallation()
 
 			if (SUCCEEDED(hr))
 			{
-				persist->Save((GetFolderPath(FOLDERID_Programs) + L"\\FiveM.lnk").c_str(), TRUE);
-				persist->Save((GetFolderPath(FOLDERID_Desktop) + L"\\FiveM.lnk").c_str(), TRUE);
+				persist->Save((GetFolderPath(FOLDERID_Programs) + L"\\" PRODUCT_NAME L".lnk").c_str(), TRUE);
+				persist->Save((GetFolderPath(FOLDERID_Desktop) + L"\\" PRODUCT_NAME L".lnk").c_str(), TRUE);
 			}
 		}
 
+#if 0
 		// make the SP shortcut
 		hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLink, (void**)shellLink.ReleaseAndGetAddressOf());
 
@@ -270,7 +282,7 @@ bool Install_PerformInstallation()
 		{
 			shellLink->SetPath(targetExePath.c_str());
 			shellLink->SetArguments(L"-sp");
-			shellLink->SetDescription(L"FiveM is a modification framework for Grand Theft Auto V");
+			shellLink->SetDescription(PRODUCT_NAME L" is a modification framework for Grand Theft Auto V");
 			shellLink->SetIconLocation(targetExePath.c_str(), -202);
 
 			SetAumid(shellLink);
@@ -280,20 +292,21 @@ bool Install_PerformInstallation()
 
 			if (SUCCEEDED(hr))
 			{
-				persist->Save((GetFolderPath(FOLDERID_Programs) + L"\\FiveM Singleplayer.lnk").c_str(), TRUE);
-				persist->Save((GetFolderPath(FOLDERID_Desktop) + L"\\FiveM Singleplayer.lnk").c_str(), TRUE);
+				persist->Save((GetFolderPath(FOLDERID_Programs) + L"\\" PRODUCT_NAME L" Singleplayer.lnk").c_str(), TRUE);
+				persist->Save((GetFolderPath(FOLDERID_Desktop) + L"\\" PRODUCT_NAME L" Singleplayer.lnk").c_str(), TRUE);
 			}
 		}
+#endif
 
 		CoUninitialize();
 	}
 
 	// create installroot dirs
 	{
-		auto appPath = rootPath + L"\\FiveM.app";
+		auto appPath = rootPath + L"\\" PRODUCT_NAME L".app";
 		CreateDirectory(appPath.c_str(), nullptr);
 
-		FILE* f = _wfopen((appPath + L"\\FiveM.installroot").c_str(), L"w");
+		FILE* f = _wfopen((appPath + L"\\" PRODUCT_NAME L".installroot").c_str(), L"w");
 		if (f)
 		{
 			fclose(f);
@@ -309,13 +322,65 @@ bool Install_PerformInstallation()
 	return false;
 }
 
+#include <boost/algorithm/string.hpp>
+
+static void WriteVisualElementsManifest()
+{
+#ifdef GTA_FIVE
+	auto rootExe = GetModuleHandleW(NULL);
+	wchar_t rootPath[512] = { 0 };
+	GetModuleFileNameW(rootExe, rootPath, std::size(rootPath));
+
+	std::wstring rootDir = rootPath;
+	std::wstring manifestName = rootDir;
+
+	manifestName = manifestName.substr(0, manifestName.find_last_of(L'.')) + L".VisualElementsManifest.xml";
+	rootDir = rootDir.substr(0, rootDir.find_last_of(L"/\\") + 1);
+
+	if (GetFileAttributesW(manifestName.c_str()) != INVALID_FILE_ATTRIBUTES)
+	{
+		return;
+	}
+
+	auto citizenDir = MakeRelativeCitPath(L"citizen");
+	boost::algorithm::replace_all(citizenDir, rootDir, L"");
+
+	FILE* f = _wfopen(manifestName.c_str(), L"wb");
+
+	if (f)
+	{
+		fmt::fprintf(f, R"(<Application xmlns:xsi='http://www.w3.org/2001/XMLSchema-instance'>
+  <VisualElements
+      ShowNameOnSquare150x150Logo='off'
+      Square150x150Logo='%s\VisualElements\VisualElements_150.png'
+      Square70x70Logo='%s\VisualElements\VisualElements_70.png'
+      ForegroundText='dark'
+      BackgroundColor='#F57F00'/>
+</Application>)",
+		ToNarrow(citizenDir), ToNarrow(citizenDir));
+		fclose(f);
+
+		// update .lnk time, if any
+		HANDLE hFile = CreateFile(fmt::sprintf(L"%s\\%s%s.lnk", GetFolderPath(FOLDERID_Programs), PRODUCT_NAME, L"").c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+
+		if (hFile != INVALID_HANDLE_VALUE)
+		{
+			FILETIME rn = { 0 };
+			GetSystemTimeAsFileTime(&rn);
+			SetFileTime(hFile, NULL, NULL, &rn);
+			CloseHandle(hFile);
+		}
+	}
+#endif
+}
+
 bool Install_RunInstallMode()
 {
 	// if we're already installed 'sufficiently', this isn't a new install
 	if (GetFileAttributes(MakeRelativeCitPath(L"CoreRT.dll").c_str()) != INVALID_FILE_ATTRIBUTES ||
 		GetFileAttributes(MakeRelativeCitPath(L"citizen-resources-client.dll").c_str()) != INVALID_FILE_ATTRIBUTES ||
 		GetFileAttributes(MakeRelativeCitPath(L"CitizenFX.ini").c_str()) != INVALID_FILE_ATTRIBUTES ||
-		GetFileAttributes(MakeRelativeCitPath(L"FiveM.installroot").c_str()) != INVALID_FILE_ATTRIBUTES)
+		GetFileAttributes(MakeRelativeCitPath(PRODUCT_NAME L".installroot").c_str()) != INVALID_FILE_ATTRIBUTES)
 	{
 		using namespace std::string_literals;
 
@@ -326,37 +391,71 @@ bool Install_RunInstallMode()
 
 		wcsrchr(exePath, L'\\')[0] = L'\0';
 
-		std::wstring linkPath = exePath + L"\\FiveM Singleplayer.lnk"s;
+		std::vector<std::tuple<std::wstring, std::wstring, int, std::wstring>> links;
 
-		if (GetFileAttributes(linkPath.c_str()) == INVALID_FILE_ATTRIBUTES)
+#ifdef GTA_FIVE
+#if 0
+		links.push_back({ L" Singleplayer", L"-sp", -202, L"" });
+		links.push_back({ L" Singleplayer (patch 1.27)", L"-b372", -202, L"" });
+#endif
+		links.push_back({ L" - Cfx.re Development Kit (FxDK)", L"-fxdk", -203, L"CitizenFX.FiveM.SDK" });
+#endif
+
+		for (auto& link : links)
 		{
-			CoInitialize(NULL);
+			std::wstring linkPath = fmt::sprintf(L"%s\\%s%s.lnk", exePath, PRODUCT_NAME, std::get<0>(link));
 
-			WRL::ComPtr<IShellLink> shellLink;
-			HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLink, (void**)shellLink.ReleaseAndGetAddressOf());
-
-			if (SUCCEEDED(hr))
+			if (GetFileAttributes(linkPath.c_str()) == INVALID_FILE_ATTRIBUTES)
 			{
-				shellLink->SetPath(exeName.c_str());
-				shellLink->SetArguments(L"-sp");
-				shellLink->SetDescription(L"FiveM is a modification framework for Grand Theft Auto V");
-				shellLink->SetIconLocation(exeName.c_str(), -202);
+				CoInitialize(NULL);
 
-				SetAumid(shellLink);
-
-				WRL::ComPtr<IPersistFile> persist;
-				hr = shellLink.As(&persist);
+				WRL::ComPtr<IShellLink> shellLink;
+				HRESULT hr = CoCreateInstance(CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER, IID_IShellLink, (void**)shellLink.ReleaseAndGetAddressOf());
 
 				if (SUCCEEDED(hr))
 				{
-					persist->Save(linkPath.c_str(), TRUE);
-				}
-			}
+					shellLink->SetPath(exeName.c_str());
+					shellLink->SetArguments(std::get<1>(link).c_str());
+					shellLink->SetDescription(PRODUCT_NAME L" is a modification framework for Grand Theft Auto V");
+					shellLink->SetIconLocation(exeName.c_str(), std::get<2>(link));
 
-			CoUninitialize();
+					SetAumid(shellLink, std::get<3>(link));
+
+					WRL::ComPtr<IPersistFile> persist;
+					hr = shellLink.As(&persist);
+
+					if (SUCCEEDED(hr))
+					{
+						persist->Save(linkPath.c_str(), TRUE);
+
+						if (GetFileAttributes(MakeRelativeCitPath(PRODUCT_NAME L".installroot").c_str()) != INVALID_FILE_ATTRIBUTES)
+						{
+							persist->Save(fmt::sprintf(L"%s\\%s%s.lnk", GetFolderPath(FOLDERID_Programs), PRODUCT_NAME, std::get<0>(link)).c_str(), TRUE);
+						}
+					}
+				}
+
+				CoUninitialize();
+			}
+		}
+
+		auto removeLinks = {
+			fmt::sprintf(L"%s\\%s%s.lnk", exePath, PRODUCT_NAME, L" Singleplayer"),
+			fmt::sprintf(L"%s\\%s%s.lnk", exePath, PRODUCT_NAME, L" Singleplayer (patch 1.27)"),
+			GetFolderPath(FOLDERID_Programs) + L"\\" PRODUCT_NAME L" Singleplayer.lnk",
+			GetFolderPath(FOLDERID_Desktop) + L"\\" PRODUCT_NAME L" Singleplayer.lnk"
+		};
+
+		for (const auto& link : removeLinks)
+		{
+			if (GetFileAttributesW(link.c_str()) != INVALID_FILE_ATTRIBUTES)
+			{
+				DeleteFileW(link.c_str());
+			}
 		}
 
 		CreateUninstallEntryIfNeeded();
+		WriteVisualElementsManifest();
 
 		return false;
 	}
@@ -366,21 +465,29 @@ bool Install_RunInstallMode()
 
 	bool isDownloadsFolder = false;
 
-	if (StrStrIW(hostData->initPath, L"downloads") != nullptr ||
-		StrStrIW(hostData->initPath, L"\\dls") != nullptr)
+	if (StrStrIW(hostData->GetInitPath().c_str(), L"downloads") != nullptr ||
+		StrStrIW(hostData->GetInitPath().c_str(), L"\\dls") != nullptr ||
+		StrStrIW(hostData->GetInitPath().c_str(), L"\\Desktop") != nullptr)
 	{
 		isDownloadsFolder = true;
 	}
 
-	size_t maxOtherFiles = (isDownloadsFolder) ? 3 : 5;
+	size_t maxOtherFiles = (isDownloadsFolder) ? 2 : 5;
 
 	// count the amount of files 'together' with us in our folder
-	fs::directory_iterator it(hostData->initPath), end;
+	fs::directory_iterator it(hostData->GetInitPath()), end;
 	size_t numFiles = std::count_if(it, end, [](const fs::directory_entry& entry)
 	{
-		if (entry.path().filename().string()[0] == '.')
+		try
 		{
-			return false;
+			if (entry.path().filename().string()[0] == '.')
+			{
+				return false;
+			}
+		}
+		catch (std::exception& e)
+		{
+
 		}
 
 		return true;
@@ -394,3 +501,9 @@ bool Install_RunInstallMode()
 
 	return Install_PerformInstallation();
 }
+#else
+bool Install_RunInstallMode()
+{
+	return false;
+}
+#endif

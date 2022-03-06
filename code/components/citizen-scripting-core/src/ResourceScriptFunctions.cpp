@@ -12,22 +12,29 @@
 #include <ResourceManager.h>
 #include <fxScripting.h>
 
+#include <StateBagComponent.h>
+
 #include <ScriptSerialization.h>
+
+#include <ResourceCallbackComponent.h>
 
 #include <CoreConsole.h>
 #include <se/Security.h>
 
+#include <SharedFunction.h>
+
 struct CommandObject
 {
 	std::string name;
+	int32_t arity;
 
-	CommandObject(const std::string& name)
-		: name(name)
+	CommandObject(const std::string& name, size_t arity)
+		: name(name), arity(arity)
 	{
 
 	}
 
-	MSGPACK_DEFINE_MAP(name);
+	MSGPACK_DEFINE_MAP(name, arity);
 };
 
 static InitFunction initFunction([] ()
@@ -121,13 +128,18 @@ static InitFunction initFunction([] ()
 
 				outerRefs[commandName] = commandRef;
 
+				if (consoleCxt->GetCommandManager()->HasCommand(commandName))
+				{
+					return;
+				}
+
 				// restricted? if not, add the command
 				if (!context.GetArgument<bool>(2))
 				{
 					seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "builtin.everyone" }, se::Object{ "command." + commandName }, se::AccessType::Allow);
 				}
 
-				consoleCxt->GetCommandManager()->Register(commandName, [=](ConsoleExecutionContext& context)
+				int commandToken = consoleCxt->GetCommandManager()->Register(commandName, [=](ConsoleExecutionContext& context)
 				{
 					try
 					{
@@ -143,6 +155,11 @@ static InitFunction initFunction([] ()
 
 					return true;
 				});
+
+				resource->OnStop.Connect([consoleCxt, commandToken]()
+				{
+					consoleCxt->GetCommandManager()->Unregister(commandToken);
+				}, INT32_MAX);
 			}
 		}
 	});
@@ -162,9 +179,9 @@ static InitFunction initFunction([] ()
 				auto resourceManager = resource->GetManager();
 				auto consoleCxt = resourceManager->GetComponent<console::Context>();
 
-				consoleCxt->GetCommandManager()->ForAllCommands([&](const std::string& commandName)
+				consoleCxt->GetCommandManager()->ForAllCommands2([&commandList](const console::CommandMetadata& command)
 				{
-					commandList.emplace_back(commandName);
+					commandList.emplace_back(command.GetName(), (command.GetArity() == -1) ? -1 : int32_t(command.GetArity()));
 				});
 
 				context.SetResult(fx::SerializeObject(commandList));
@@ -261,5 +278,122 @@ static InitFunction initFunction([] ()
 		se::ScopedPrincipal principalScope(se::Principal{ context.CheckArgument<const char*>(0) });
 
 		context.SetResult(seCheckPrivilege(context.CheckArgument<const char*>(1)));
+	});
+
+#ifdef _DEBUG
+	fx::ScriptEngine::RegisterNativeHandler("_TEST_ERROR_NATIVE", [](fx::ScriptContext& context) 
+	{
+		*(volatile int*)0 = 0xDEAD;
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("_TEST_EXCEPTION_NATIVE", [](fx::ScriptContext& context)
+	{
+		throw std::exception("_TEST_EXCEPTION_NATIVE called!");
+	});
+#endif
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_STATE_BAG_VALUE", [](fx::ScriptContext& context)
+	{
+		auto bagName = context.CheckArgument<const char*>(0);
+		auto keyName = context.CheckArgument<const char*>(1);
+
+		auto rm = fx::ResourceManager::GetCurrent();
+		auto sbac = rm->GetComponent<fx::StateBagComponent>();
+
+		if (auto bag = sbac->GetStateBag(bagName); bag)
+		{
+			auto entry = bag->GetKey(keyName);
+
+			if (entry)
+			{
+				static thread_local std::string tmp;
+				tmp = *entry;
+
+				context.SetResult(fx::scrObject{ tmp.c_str(), tmp.size() });
+				return;
+			}
+		}
+
+		context.SetResult(fx::SerializeObject(msgpack::type::nil_t{}));
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_STATE_BAG_VALUE", [](fx::ScriptContext& context)
+	{
+		auto bagName = context.CheckArgument<const char*>(0);
+		auto keyName = context.CheckArgument<const char*>(1);
+		auto keyValue = context.CheckArgument<const char*>(2);
+		auto keySize = context.GetArgument<uint32_t>(3);
+		auto replicated = context.GetArgument<bool>(4);
+
+		auto rm = fx::ResourceManager::GetCurrent();
+		auto sbac = rm->GetComponent<fx::StateBagComponent>();
+
+		if (auto bag = sbac->GetStateBag(bagName); bag)
+		{
+			bag->SetKey(0, keyName, std::string_view{ keyValue, keySize }, replicated);
+			context.SetResult(true);
+
+			return;
+		}
+
+		context.SetResult(false);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("ADD_STATE_BAG_CHANGE_HANDLER", [](fx::ScriptContext& context)
+	{
+		fx::OMPtr<IScriptRuntime> runtime;
+
+		static std::map<std::string, std::string> outerRefs;
+
+		if (!FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+		{
+			return;
+		}
+
+		fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+		if (!resource)
+		{
+			return;
+		}
+
+		auto keyName = context.GetArgument<const char*>(0);
+		auto bagName = context.GetArgument<const char*>(1);
+
+		std::string keyNameRef = (keyName) ? keyName : "";
+		std::string bagNameRef = (bagName) ? bagName : "";
+		auto cbRef = fx::FunctionRef{ context.CheckArgument<const char*>(2) };
+
+		auto rm = fx::ResourceManager::GetCurrent();
+		auto sbac = rm->GetComponent<fx::StateBagComponent>();
+
+		auto cookie = sbac->OnStateBagChange.Connect(make_shared_function([rm, keyNameRef, bagNameRef, cbRef = std::move(cbRef)](int source, std::string_view bagName, std::string_view key, const msgpack::object& value, bool replicated)
+		{
+			if (keyNameRef.empty() || key == keyNameRef)
+			{
+				if (bagNameRef.empty() || bagName == bagNameRef)
+				{
+					rm->CallReference<void>(cbRef.GetRef(), std::string{ bagName }, std::string{ key }, value, source, replicated);
+				}
+			}
+
+			return true;
+		}));
+
+		resource->OnStop.Connect([sbac, cookie]()
+		{
+			sbac->OnStateBagChange.Disconnect(cookie);
+		});
+
+		context.SetResult(cookie);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("REMOVE_STATE_BAG_CHANGE_HANDLER", [](fx::ScriptContext& context)
+	{
+		auto cookie = context.GetArgument<int>(0);
+		auto rm = fx::ResourceManager::GetCurrent();
+		auto sbac = rm->GetComponent<fx::StateBagComponent>();
+
+		sbac->OnStateBagChange.Disconnect(size_t(cookie));
 	});
 });

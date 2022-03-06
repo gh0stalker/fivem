@@ -7,13 +7,16 @@
 
 #pragma once
 
-#include <concurrent_unordered_map.h>
-
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 
+#include <unordered_map>
+
 #include <wrl.h>
+
+#include <MumbleAudioSink.h>
 
 #define XAUDIO2_HELPER_FUNCTIONS
 #include <xaudio2.h>
@@ -22,10 +25,15 @@
 #include <mmdeviceapi.h>
 #include <opus.h>
 
+#include <LabSound/extended/LabSound.h>
+
 namespace WRL = Microsoft::WRL;
 
 class MumbleClient;
 class MumbleUser;
+
+struct JitterBuffer_;
+typedef struct JitterBuffer_ JitterBuffer;
 
 class MumbleAudioOutput
 {
@@ -42,7 +50,9 @@ public:
 
 	void HandleClientPosition(const MumbleUser& user, float position[3]);
 
-	void HandleClientVoiceData(const MumbleUser& user, uint64_t sequence, const uint8_t* data, size_t size);
+	void HandleClientVolumeOverride(const MumbleUser& user, float volume);
+
+	void HandleClientVoiceData(const MumbleUser& user, uint64_t sequence, const uint8_t* data, size_t size, bool hasTerminator);
 
 	void HandleClientDisconnect(const MumbleUser& user);
 
@@ -56,27 +66,176 @@ public:
 
 	void SetDistance(float distance);
 
+	float GetDistance();
+
+	std::shared_ptr<lab::AudioContext> GetAudioContext(const std::string& name);
+
 	inline void SetClient(MumbleClient* client)
 	{
 		m_client = client;
 	}
 
+	friend struct XA2DestinationNode;
+
 private:
-	struct ClientAudioState : public IXAudio2VoiceCallback
+	struct BaseAudioState;
+
+	struct ClientAudioStateBase
 	{
-		IXAudio2SourceVoice* voice;
-		uint64_t sequence;
+		ClientAudioStateBase();
+
+		virtual ~ClientAudioStateBase();
+
+		virtual bool PollAudio(int frameCount, BaseAudioState* root);
+
+		void resizeBuffer(size_t size);
+
+		uint64_t sequence = 0;
+		bool isTalking;
+		OpusDecoder* opus;
+		JitterBuffer* jitter;
+
+		std::mutex jitterLock;
+
+		int iLastConsume = 0;
+		int iBufferFilled = 0;
+		int iBufferOffset = 0;
+		float* pfBuffer = nullptr;
+		int iBufferSize = 48000;
+		bool bLastAlive = true;
+		bool bHasTerminator = false;
+
+		bool quiet = true;
+		float fPowerMax = 0.0f;
+		float fPowerMin = 0.0f;
+
+		float fAverageAvailable = 0.0f;
+		int iMissCount = 0;
+		int iInterpCount = 0;
+
+		std::list<std::unique_ptr<std::vector<uint8_t>>> qlFrames;
+	};
+
+	struct BaseAudioState : public std::enable_shared_from_this<BaseAudioState>
+	{
+	public:
 		float volume;
 		float position[3];
 		float distance;
-		bool isTalking;
-		bool isAudible;
-		OpusDecoder* opus;
+		float overrideVolume;
+		bool isAudible = true;
 		uint32_t lastTime;
+
+		uint32_t lastPush = 0;
+
+	private:
+		std::shared_mutex innerStateMutex;
+
+		std::shared_ptr<ClientAudioStateBase> innerState;
+
+	public:
+		BaseAudioState();
+
+		virtual ~BaseAudioState();
+
+		void HandleVoiceData(uint64_t sequence, const uint8_t* data, size_t size, bool hasTerminator);
+
+		inline std::shared_ptr<ClientAudioStateBase> GetInnerState()
+		{
+			std::shared_lock _(innerStateMutex);
+			return innerState;
+		}
+
+		inline void SetInnerState(std::shared_ptr<ClientAudioStateBase> val)
+		{
+			std::unique_lock _(innerStateMutex);
+			innerState = val;
+		}
+
+		virtual bool Valid()
+		{
+			return true;
+		}
+
+		virtual void PushSound(int16_t* voiceBuffer, int len)
+		{
+		}
+
+		virtual void PushPosition(MumbleAudioOutput* baseIo, float position[3])
+		{
+		}
+
+		virtual bool IsTalking()
+		{
+			if (auto is = GetInnerState())
+			{
+				return is->isTalking;
+			}
+
+			return false;
+		}
+
+		virtual bool ShouldManagePoll()
+		{
+			return false;
+		}
+
+		virtual void AfterConstruct()
+		{
+		}
+	};
+
+	struct ExternalAudioState : public BaseAudioState
+	{
+		ExternalAudioState(fwRefContainer<IMumbleAudioSink> sink);
+
+		virtual ~ExternalAudioState();
+
+		virtual bool Valid() override;
+
+		virtual void PushSound(int16_t* voiceBuffer, int len) override;
+
+		virtual void PushPosition(MumbleAudioOutput* baseIo, float position[3]) override;
+
+		virtual bool IsTalking() override;
+
+		virtual void AfterConstruct() override;
+
+		fwRefContainer<IMumbleAudioSink> sink;
+	};
+
+	struct ClientAudioState : public BaseAudioState, public IXAudio2VoiceCallback
+	{
+		/// <summary>
+		/// @FIX(wyoming-papa-chicken): PushPosition happens on MainThrd,
+		/// destroyVoice happens on the UV Loop, OnBufferEnd exists on XA2.
+		/// </summary>
+		std::mutex m_render;
+		IXAudio2SourceVoice* voice;
+		volatile bool shuttingDown;
+
+		std::shared_ptr<lab::AudioContext> context;
+		std::shared_ptr<lab::AudioSourceNode> inNode;
 
 		ClientAudioState();
 
 		virtual ~ClientAudioState();
+
+		virtual bool Valid() override
+		{
+			return !context || context->destination();
+		}
+
+		virtual bool ShouldManagePoll()
+		{
+			return true;
+		}
+
+		virtual void PushSound(int16_t* voiceBuffer, int len) override;
+
+		virtual void PushPosition(MumbleAudioOutput* baseIo, float position[3]) override;
+
+		void PushSoundInternal(uint16_t* voiceBuffer, int len);
 
 		void __stdcall OnVoiceProcessingPassStart(UINT32 BytesRequired) override {}
 		void __stdcall OnVoiceProcessingPassEnd() override {}
@@ -95,11 +254,13 @@ private:
 
 	WRL::ComPtr<IMMDeviceEnumerator> m_mmDeviceEnumerator;
 
-	concurrency::concurrent_unordered_map<uint32_t, std::shared_ptr<ClientAudioState>> m_clients;
+	std::unordered_map<uint32_t, std::shared_ptr<BaseAudioState>> m_clients;
+	std::shared_mutex m_clientsMutex;
 
 	std::thread m_thread;
 
 	bool m_initialized;
+	bool m_initializeSignaled = false;
 
 	std::mutex m_initializeMutex;
 
@@ -118,6 +279,8 @@ private:
 	DirectX::XMFLOAT3 m_lastPosition;
 
 	uint32_t m_lastMatrixTime;
+
+	int m_channelCount;
 
 	float m_distance;
 

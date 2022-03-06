@@ -67,9 +67,13 @@ public:
 
 	virtual void ExecuteBuffer();
 
+	virtual void SaveConfiguration(const std::string& path);
+
 	virtual void SaveConfigurationIfNeeded(const std::string& path);
 
 	virtual void SetVariableModifiedFlags(int flags);
+
+	virtual bool GIsPrinting();
 
 	virtual ConsoleCommandManager* GetCommandManager();
 
@@ -83,8 +87,11 @@ public:
 	inline bool IsBufferEmpty()
 	{
 		std::lock_guard<std::mutex> guard(m_commandBufferMutex);
-		return m_commandBuffer.empty();
+		return m_commandBuffer.empty() && !m_executing;
 	}
+
+public:
+	fwEvent<const std::function<void(const std::string&)>&> OnSaveConfiguration;
 
 private:
 	Context* m_fallbackContext;
@@ -96,6 +103,8 @@ private:
 	std::string m_commandBuffer;
 
 	std::mutex m_commandBufferMutex;
+
+	volatile bool m_executing;
 };
 
 #ifdef COMPILING_CORE
@@ -139,7 +148,7 @@ void ExecuteSingleCommand(const std::string& command);
 
 void ExecuteSingleCommandDirect(const ProgramArguments& arguments);
 
-ProgramArguments Tokenize(const std::string& line);
+CORE_EXPORT ProgramArguments Tokenize(const std::string& line);
 
 void AddToBuffer(const std::string& text);
 

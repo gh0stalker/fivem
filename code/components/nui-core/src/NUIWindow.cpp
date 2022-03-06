@@ -11,23 +11,34 @@
 #include "NUIClient.h"
 #include "NUIWindowManager.h"
 
-#include <DrawCommands.h>
-
 #include <Error.h>
 
 #include <LaunchMode.h>
 #include <CoreConsole.h>
 
-#include <sysAllocator.h>
-
 #include <include/base/cef_bind.h>
 #include <include/wrapper/cef_closure_task.h>
+#include <include/cef_request_context_handler.h>
+
+#include <CefOverlay.h>
+
+extern nui::GameInterface* g_nuiGi;
 
 #include "memdbgon.h"
 
-NUIWindow::NUIWindow(bool primary, int width, int height)
-	: m_primary(primary), m_width(width), m_height(height), m_renderBuffer(nullptr), m_dirtyFlag(0), m_onClientCreated(nullptr), m_nuiTexture(nullptr), m_popupTexture(nullptr), m_swapTexture(nullptr),
-	  m_swapRtv(nullptr), m_swapSrv(nullptr), m_dereferencedNuiTexture(false)
+extern std::wstring GetNUIStoragePath();
+
+namespace nui
+{
+extern bool g_rendererInit;
+
+extern void AddSchemeHandlerFactories(CefRefPtr<CefRequestContext> rc);
+}
+
+NUIWindow::NUIWindow(bool rawBlit, int width, int height, const std::string& windowContext)
+	: m_rawBlit(rawBlit), m_width(width), m_height(height), m_renderBuffer(nullptr), m_dirtyFlag(0), m_onClientCreated(nullptr), m_nuiTexture(nullptr), m_popupTexture(nullptr), m_swapTexture(nullptr),
+	  m_swapRtv(nullptr), m_swapSrv(nullptr), m_dereferencedNuiTexture(false), m_lastFrameTime(0), m_lastMessageTime(0), m_roundedHeight(0), m_roundedWidth(0),
+	  m_syncKey(0), m_paintType(NUIPaintTypeDummy), m_windowContext(windowContext)
 {
 	memset(&m_lastDirtyRect, 0, sizeof(m_lastDirtyRect));
 
@@ -45,11 +56,10 @@ NUIWindow::~NUIWindow()
 
 	if (nuiClient)
 	{
-		auto& mutex = nuiClient->GetWindowLock();
-
-		mutex.lock();
 		nuiClient->SetWindowValid(false);
+		nuiClient->ClearWindow();
 
+		std::unique_lock _(nuiClient->GetWindowLock());
 		if (nuiClient->GetBrowser() && nuiClient->GetBrowser()->GetHost())
 		{
 			if (!CefCurrentlyOn(TID_UI))
@@ -60,18 +70,6 @@ NUIWindow::~NUIWindow()
 			{
 				nuiClient->GetBrowser()->GetHost()->CloseBrowser(true);
 			}
-		}
-
-		mutex.unlock();
-	}
-
-	for (auto& texPair : m_parentTextures)
-	{
-		auto tex = texPair.second;
-
-		if (tex)
-		{
-			tex->Release();
 		}
 	}
 
@@ -98,113 +96,104 @@ NUIWindow::~NUIWindow()
 	Instance<NUIWindowManager>::Get()->RemoveWindow(this);
 }
 
-fwRefContainer<NUIWindow> NUIWindow::Create(bool primary, int width, int height, CefString url)
+fwRefContainer<NUIWindow> NUIWindow::Create(bool primary, int width, int height, CefString url, bool instant, const std::string& context)
 {
-	auto window = new NUIWindow(primary, width, height);
-	window->Initialize(url);
+	auto window = new NUIWindow(primary, width, height, context);
+
+	if (instant)
+	{
+		window->Initialize(url);
+	}
+	else
+	{
+		window->m_initUrl = url;
+	}
 
 	return window;
 }
 
+void NUIWindow::DeferredCreate()
+{
+	if (!m_client)
+	{
+		Initialize(m_initUrl);
+	}
+}
+
 #pragma region shaders
+/*
+// fxc /T ps_4_0 /E PSMain /Qstrip_reflect /Fo test.cso /Fh test.h test.hlsl
+
+Texture2D tx : register(t0);
+SamplerState sm : register(s0);
+
+float4 PSMain(in float4 pos : SV_Position, in float2 uv : TEXCOORD0): SV_TARGET {
+    float4 color = tx.Sample(sm, uv);
+    color.rgb /= color.a;
+    return color;
+}
+*/
+
 const BYTE quadPS[] =
 {
-	68,  88,  66,  67,  58,  78,
-	234,  91, 133,  80, 171, 186,
-	78,  67, 133,  59, 192,  44,
-	182,  57,   1,   0,   0,   0,
-	60,   2,   0,   0,   5,   0,
-	0,   0,  52,   0,   0,   0,
-	200,   0,   0,   0,  32,   1,
-	0,   0,  84,   1,   0,   0,
-	192,   1,   0,   0,  82,  68,
-	69,  70, 140,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   2,   0,   0,   0,
-	28,   0,   0,   0,   0,   4,
-	255, 255,   0,   1,   0,   0,
-	99,   0,   0,   0,  92,   0,
-	0,   0,   3,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   1,   0,
-	0,   0,   0,   0,   0,   0,
-	96,   0,   0,   0,   2,   0,
-	0,   0,   5,   0,   0,   0,
-	4,   0,   0,   0, 255, 255,
-	255, 255,   0,   0,   0,   0,
-	1,   0,   0,   0,  12,   0,
-	0,   0, 115, 109, 112,   0,
-	116, 120,   0,  77, 105,  99,
-	114, 111, 115, 111, 102, 116,
-	32,  40,  82,  41,  32,  72,
-	76,  83,  76,  32,  83, 104,
-	97, 100, 101, 114,  32,  67,
-	111, 109, 112, 105, 108, 101,
-	114,  32,  49,  48,  46,  49,
-	0, 171,  73,  83,  71,  78,
-	80,   0,   0,   0,   2,   0,
-	0,   0,   8,   0,   0,   0,
-	56,   0,   0,   0,   0,   0,
-	0,   0,   1,   0,   0,   0,
-	3,   0,   0,   0,   0,   0,
-	0,   0,  15,   0,   0,   0,
-	68,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	3,   0,   0,   0,   1,   0,
-	0,   0,   3,   3,   0,   0,
-	83,  86,  95,  80,  79,  83,
-	73,  84,  73,  79,  78,   0,
-	84,  69,  88,  67,  79,  79,
-	82,  68,   0, 171, 171, 171,
-	79,  83,  71,  78,  44,   0,
-	0,   0,   1,   0,   0,   0,
-	8,   0,   0,   0,  32,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   3,   0,
-	0,   0,   0,   0,   0,   0,
-	15,   0,   0,   0,  83,  86,
-	95,  84,  65,  82,  71,  69,
-	84,   0, 171, 171,  83,  72,
-	68,  82, 100,   0,   0,   0,
-	64,   0,   0,   0,  25,   0,
-	0,   0,  90,   0,   0,   3,
-	0,  96,  16,   0,   0,   0,
-	0,   0,  88,  24,   0,   4,
-	0, 112,  16,   0,   0,   0,
-	0,   0,  85,  85,   0,   0,
-	98,  16,   0,   3,  50,  16,
-	16,   0,   1,   0,   0,   0,
-	101,   0,   0,   3, 242,  32,
-	16,   0,   0,   0,   0,   0,
-	69,   0,   0,   9, 242,  32,
-	16,   0,   0,   0,   0,   0,
-	70,  16,  16,   0,   1,   0,
-	0,   0,  70, 126,  16,   0,
-	0,   0,   0,   0,   0,  96,
-	16,   0,   0,   0,   0,   0,
-	62,   0,   0,   1,  83,  84,
-	65,  84, 116,   0,   0,   0,
-	2,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	2,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   1,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   1,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0,   0,   0,   0,   0,
-	0,   0
+     68,  88,  66,  67, 143,   7,
+    231, 175,  20,  94, 243, 235,
+    204,  15,  80,  20, 247, 182,
+    206,  11,   1,   0,   0,   0,
+     92,   1,   0,   0,   3,   0,
+      0,   0,  44,   0,   0,   0,
+    132,   0,   0,   0, 184,   0,
+      0,   0,  73,  83,  71,  78,
+     80,   0,   0,   0,   2,   0,
+      0,   0,   8,   0,   0,   0,
+     56,   0,   0,   0,   0,   0,
+      0,   0,   1,   0,   0,   0,
+      3,   0,   0,   0,   0,   0,
+      0,   0,  15,   0,   0,   0,
+     68,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   0,   0,
+      3,   0,   0,   0,   1,   0,
+      0,   0,   3,   3,   0,   0,
+     83,  86,  95,  80, 111, 115,
+    105, 116, 105, 111, 110,   0,
+     84,  69,  88,  67,  79,  79,
+     82,  68,   0, 171, 171, 171,
+     79,  83,  71,  78,  44,   0,
+      0,   0,   1,   0,   0,   0,
+      8,   0,   0,   0,  32,   0,
+      0,   0,   0,   0,   0,   0,
+      0,   0,   0,   0,   3,   0,
+      0,   0,   0,   0,   0,   0,
+     15,   0,   0,   0,  83,  86,
+     95,  84,  65,  82,  71,  69,
+     84,   0, 171, 171,  83,  72,
+     68,  82, 156,   0,   0,   0,
+     64,   0,   0,   0,  39,   0,
+      0,   0,  90,   0,   0,   3,
+      0,  96,  16,   0,   0,   0,
+      0,   0,  88,  24,   0,   4,
+      0, 112,  16,   0,   0,   0,
+      0,   0,  85,  85,   0,   0,
+     98,  16,   0,   3,  50,  16,
+     16,   0,   1,   0,   0,   0,
+    101,   0,   0,   3, 242,  32,
+     16,   0,   0,   0,   0,   0,
+    104,   0,   0,   2,   1,   0,
+      0,   0,  69,   0,   0,   9,
+    242,   0,  16,   0,   0,   0,
+      0,   0,  70,  16,  16,   0,
+      1,   0,   0,   0,  70, 126,
+     16,   0,   0,   0,   0,   0,
+      0,  96,  16,   0,   0,   0,
+      0,   0,  14,   0,   0,   7,
+    114,  32,  16,   0,   0,   0,
+      0,   0,  70,   2,  16,   0,
+      0,   0,   0,   0, 246,  15,
+     16,   0,   0,   0,   0,   0,
+     54,   0,   0,   5, 130,  32,
+     16,   0,   0,   0,   0,   0,
+     58,   0,  16,   0,   0,   0,
+      0,   0,  62,   0,   0,   1
 };
 
 const BYTE quadVS[] =
@@ -332,66 +321,74 @@ const BYTE quadVS[] =
 }; 
 #pragma endregion
 
+static auto roundUp(int x, int y)
+{
+	return x + (y - (x % y));
+}
+
 void NUIWindow::Initialize(CefString url)
 {
+#if defined(GTA_NY)
+	static bool nuiSharedResourcesEnabled = false;
+#else
 	static bool nuiSharedResourcesEnabled = true;
 	static ConVar<bool> nuiSharedResources("nui_useSharedResources", ConVar_Archive, true, &nuiSharedResourcesEnabled);
+#endif
 
-	InitializeCriticalSection(&m_renderBufferLock);
+	// Vulkan/D3D12(on7) don't support shared resources before Windows 10
+#if defined(IS_RDR3)
+	if (!IsWindows10OrGreater())
+	{
+		nuiSharedResourcesEnabled = false;
+	}
+#endif
 
 	if (m_renderBuffer)
 	{
 		delete[] m_renderBuffer;
 	}
 
-	// rounding function
-	auto roundUp = [] (int x, int y)
-	{
-		return x + (y - (x % y));
-	};
-
 	// create the temporary backing store
 	m_roundedHeight = roundUp(m_height, 16);
 	m_roundedWidth = roundUp(m_width, 16);
 
-	// create the backing texture
-	rage::grcManualTextureDef textureDef;
-	memset(&textureDef, 0, sizeof(textureDef));
-	textureDef.isStaging = 0;
-	textureDef.arraySize = 1;
-
-	m_nuiTexture = rage::grcTextureFactory::getInstance()->createManualTexture(m_width, m_height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
-	
-	if (!m_primary)
-	{
-		D3D11_TEXTURE2D_DESC tgtDesc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_B8G8R8A8_UNORM, m_width, m_height, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
-
-		auto d3d = GetD3D11Device();
-		d3d->CreateTexture2D(&tgtDesc, nullptr, &m_swapTexture);
-
-		D3D11_RENDER_TARGET_VIEW_DESC rtDesc = CD3D11_RENDER_TARGET_VIEW_DESC(m_swapTexture, D3D11_RTV_DIMENSION_TEXTURE2D);
-
-		d3d->CreateRenderTargetView(m_swapTexture, &rtDesc, &m_swapRtv);
-	}
+	InitializeRenderBacking();
 
 	// create the client/browser instance
 	m_client = new NUIClient(this);
 
 	CefWindowInfo info;
-	info.SetAsWindowless(FindWindow(L"grcWindow", nullptr));
+	info.SetAsWindowless(NULL);
 	info.shared_texture_enabled = (!CfxIsWine() && nuiSharedResourcesEnabled);
-	info.external_begin_frame_enabled = true;
+	info.external_begin_frame_enabled = nuiSharedResourcesEnabled;
 	info.width = m_width;
 	info.height = m_height;
 
 	CefBrowserSettings settings;
 	settings.javascript_close_windows = STATE_DISABLED;
-	settings.web_security = STATE_DISABLED;
+	//settings.web_security = STATE_DISABLED;
 	settings.windowless_frame_rate = 240;
 	CefString(&settings.default_encoding).FromString("utf-8");
 
-	CefRefPtr<CefRequestContext> rc = CefRequestContext::GetGlobalContext();
-	CefBrowserHost::CreateBrowser(info, m_client, url, settings, rc);
+	CefRefPtr<CefRequestContext> rc;
+
+	if (m_windowContext.empty())
+	{
+		rc = CefRequestContext::GetGlobalContext();
+	}
+	else
+	{
+		auto cachePath = fmt::sprintf(L"%s\\context-%s", GetNUIStoragePath(), ToWide(m_windowContext));
+		CreateDirectory(cachePath.c_str(), nullptr);
+
+		CefRequestContextSettings rcConfig;
+		CefString(&rcConfig.cache_path).FromWString(cachePath);
+		rc = CefRequestContext::CreateContext(rcConfig, {});
+
+		nui::AddSchemeHandlerFactories(rc);
+	}
+
+	CefBrowserHost::CreateBrowser(info, m_client, url, settings, {}, rc);
 
 	if (!info.shared_texture_enabled)
 	{
@@ -399,108 +396,120 @@ void NUIWindow::Initialize(CefString url)
 	}
 }
 
+void NUIWindow::InitializeRenderBacking()
+{
+	if (!nui::g_rendererInit)
+	{
+		return;
+	}
+
+	// create the backing texture
+	{
+		std::lock_guard<std::shared_mutex> _(m_textureMutex);
+		m_nuiTexture = g_nuiGi->CreateTextureBacking(m_width, m_height, nui::GITextureFormat::ARGB);
+	}
+
+	if (!m_rawBlit)
+	{
+		D3D11_TEXTURE2D_DESC tgtDesc = CD3D11_TEXTURE2D_DESC(DXGI_FORMAT_B8G8R8A8_UNORM, m_width, m_height, 1, 1, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+
+		auto d3d = g_nuiGi->GetD3D11Device();
+		d3d->CreateTexture2D(&tgtDesc, nullptr, &m_swapTexture);
+
+		D3D11_RENDER_TARGET_VIEW_DESC rtDesc = CD3D11_RENDER_TARGET_VIEW_DESC(m_swapTexture, D3D11_RTV_DIMENSION_TEXTURE2D);
+
+		d3d->CreateRenderTargetView(m_swapTexture, &rtDesc, &m_swapRtv);
+	}
+}
+
 void NUIWindow::AddDirtyRect(const CefRect& rect)
 {
-	EnterCriticalSection(&m_renderBufferLock);
 	m_dirtyRects.push(rect);
-	LeaveCriticalSection(&m_renderBufferLock);
 }
 
 CefBrowser* NUIWindow::GetBrowser()
 {
+	if (!m_client)
+	{
+		return nullptr;
+	}
+
 	return ((NUIClient*)m_client.get())->GetBrowser();
 }
 
 void NUIWindow::UpdateSharedResource(void* sharedHandle, uint64_t syncKey, const CefRenderHandler::RectList& rects, CefRenderHandler::PaintElementType type)
 {
-	if (!m_primary && type != CefRenderHandler::PaintElementType::PET_VIEW)
+	if (!m_rawBlit && type != CefRenderHandler::PaintElementType::PET_VIEW)
 	{
 		return;
 	}
 
-	static bool createdClient;
+	if (!m_nuiTexture.GetRef())
+	{
+		// hope we'll resize soon
+		return;
+	}
 
 	HANDLE parentHandle = (void*)sharedHandle;
 	m_syncKey = syncKey;
 	
 	{
-		if (m_lastParentHandle[type] != parentHandle)
+		if (sharedHandle != m_lastParentHandle[type])
 		{
-			if (type == CefRenderHandler::PaintElementType::PET_VIEW)
-			{
-				trace("Changing NUI shared resource...\n");
-			}
-
 			m_lastParentHandle[type] = parentHandle;
 
-			ID3D11Device* device = GetD3D11Device();
+			auto& texRef = (type == CefRenderHandler::PaintElementType::PET_VIEW) ? m_nuiTexture : m_popupTexture;
 
-			ID3D11Resource* resource = nullptr;
-			if (SUCCEEDED(device->OpenSharedResource(parentHandle, __uuidof(IDXGIResource), (void**)&resource)))
+			int w, h;
+
+			if (type == CefRenderHandler::PaintElementType::PET_VIEW)
 			{
-				ID3D11Texture2D* texture;
-				assert(SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture)));
+				w = m_width;
+				h = m_height;
+			}
+			else
+			{
+				w = m_popupRect.width;
+				h = m_popupRect.height;
+			}
 
-				NUIWindowManager* wm = Instance<NUIWindowManager>::Get();
-				ID3D11Texture2D* oldTexture = nullptr;
+			if (!m_rawBlit)
+			{
+				auto oldRef = m_parentTextures[type];
 
-				D3D11_TEXTURE2D_DESC desc;
-				texture->GetDesc(&desc);
+				auto fakeTexRef = g_nuiGi->CreateTextureFromShareHandle(parentHandle, w, h);
+				SetParentTexture(type, fakeTexRef);
 
-				auto& texRef = (type == CefRenderHandler::PaintElementType::PET_VIEW) ? m_nuiTexture : m_popupTexture;
-
-				if (GetParentTexture(type))
-				{
-					oldTexture = GetParentTexture(type);
-				}
-
-				SetParentTexture(type, texture);
-
-				// only release afterward to prevent the parent texture being invalid
-				if (oldTexture)
-				{
-					oldTexture->Release();
-				}
+				auto oldSrv = m_swapSrv;
 
 				struct
 				{
 					void* vtbl;
 					ID3D11Device* rawDevice;
-				}*deviceStuff = (decltype(deviceStuff))device;
+				}*deviceStuff = (decltype(deviceStuff))g_nuiGi->GetD3D11Device();
 
-				if (!m_primary)
+				auto nativeTexture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW)->GetNativeTexture();
+
+				if (nativeTexture)
 				{
-					auto oldSrv = m_swapSrv;
-
-					deviceStuff->rawDevice->CreateShaderResourceView(GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW), nullptr, &m_swapSrv);
-
-					if (oldSrv)
-					{
-						oldSrv->Release();
-					}
+					deviceStuff->rawDevice->CreateShaderResourceView((ID3D11Resource*)nativeTexture, nullptr, &m_swapSrv);
 				}
 				else
 				{
-					if (texRef)
-					{
-						if (texRef->texture)
-						{
-							texRef->texture->Release();
-						}
-
-						texRef->texture = texture;
-						texture->AddRef();
-
-						if (texRef->srv)
-						{
-							texRef->srv->Release();
-						}
-
-						deviceStuff->rawDevice->CreateShaderResourceView(texture, nullptr, &texRef->srv);
-					}
+					m_swapSrv = {};
 				}
 
-				createdClient = true;
+				if (oldSrv)
+				{
+					oldSrv->Release();
+				}
+			}
+			else
+			{
+				std::lock_guard<std::shared_mutex> _(m_textureMutex);
+
+				texRef = g_nuiGi->CreateTextureFromShareHandle(parentHandle, w, h);
+				SetParentTexture(type, texRef);
 			}
 		}
 	}
@@ -529,53 +538,134 @@ void NUIWindow::UpdateSharedResource(void* sharedHandle, uint64_t syncKey, const
 }
 
 #include <d3d11_1.h>
+#include <mmsystem.h>
 
-void NUIWindow::UpdateFrame()
+extern bool HasFocus();
+
+void NUIWindow::SendBeginFrame()
 {
+	bool isFocus = false;
+	auto curTime = timeGetTime();
+
 	if (m_client)
 	{
 		auto client = ((NUIClient*)m_client.get());
 
 		auto browser = client->GetBrowser();
-		
+
+		if (browser)
+		{
+			if (nui::GetFocusBrowser() == browser)
+			{
+				isFocus = true;
+			}
+		}
+	}
+
+	if (m_client)
+	{
+		auto client = ((NUIClient*)m_client.get());
+
+		auto browser = client->GetBrowser();
+
 		if (browser)
 		{
 			auto host = browser->GetHost();
 
 			if (host)
 			{
+#ifndef GTA_NY
 				host->SendExternalBeginFrame();
+#endif
+				m_lastFrameTime = curTime;
+			}
+		}
+	}
+}
+
+void NUIWindow::TouchMessage()
+{
+	m_lastMessageTime = timeGetTime();
+}
+
+void NUIWindow::UpdateFrame()
+{
+	if (m_client)
+	{
+		auto browser = ((NUIClient*)m_client.get())->GetBrowser();
+
+		if (browser)
+		{
+			// the CEF API has a 'is muted' getter but it doesn't work
+			bool shouldMute = false;
+			g_nuiGi->QueryShouldMute(shouldMute);
+
+			if (!m_isMuted && shouldMute)
+			{
+				browser->GetHost()->SetAudioMuted(true);
+				m_isMuted = true;
+			}
+			else if (m_isMuted && !shouldMute)
+			{
+				browser->GetHost()->SetAudioMuted(false);
+				m_isMuted = false;
 			}
 		}
 	}
 
-	if (!m_nuiTexture)
+#if !defined(IS_RDR3) && !defined(GTA_NY)
+	if (GetPaintType() != NUIPaintTypePostRender)
+#endif
+	{
+		SendBeginFrame();
+	}
+
+	if (!GetTexture().GetRef())
 	{
 		return;
 	}
 
-	if (m_primary)
-	{
+	if (m_rawBlit)
+	{		
 		int resX, resY;
-		GetGameResolution(resX, resY);
+		g_nuiGi->GetGameResolution(&resX, &resY);
 
 		if (m_width != resX || m_height != resY)
 		{
 			m_width = resX;
 			m_height = resY;
 
-			((NUIClient*)m_client.get())->GetBrowser()->GetHost()->WasResized();
+			{
+				auto _ = GetRenderBufferLock();
+				m_roundedHeight = roundUp(m_height, 16);
+				m_roundedWidth = roundUp(m_width, 16);
 
-			// make a new texture
-			delete m_nuiTexture;
+				if (m_renderBuffer)
+				{
+					delete[] m_renderBuffer;
+					m_renderBuffer = new char[4 * m_roundedWidth * m_roundedHeight];
+				}
+			}
 
-			rage::grcManualTextureDef textureDef;
-			memset(&textureDef, 0, sizeof(textureDef));
-			textureDef.isStaging = 0;
-			textureDef.arraySize = 1;
+			if (m_client)
+			{
+				auto browser = ((NUIClient*)m_client.get())->GetBrowser();
 
-			// create the new texture
-			m_nuiTexture = rage::grcTextureFactory::getInstance()->createManualTexture(m_width, m_height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
+				if (browser)
+				{
+					((NUIClient*)m_client.get())->GetBrowser()->GetHost()->WasResized();
+				}
+				else
+				{
+					m_onLoadQueue.push([this]()
+					{
+						((NUIClient*)m_client.get())->GetBrowser()->GetHost()->WasResized();
+					});
+				}
+
+				std::lock_guard<std::shared_mutex> _(m_textureMutex);
+				m_nuiTexture = g_nuiGi->CreateTextureBacking(m_width, m_height, nui::GITextureFormat::ARGB);
+			}
 		}
 
 		for (auto& item : m_pollQueue)
@@ -589,16 +679,16 @@ void NUIWindow::UpdateFrame()
 			argList->SetSize(1);
 			argList->SetString(0, item);
 
-			browser->SendProcessMessage(PID_RENDERER, message);
+			browser->GetMainFrame()->SendProcessMessage(PID_RENDERER, message);
 		}
 	}
 
 	m_pollQueue.clear();
 
 	NUIWindowManager* wm = Instance<NUIWindowManager>::Get();
-	ID3D11Texture2D* texture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW);
+	auto texture = GetParentTexture(CefRenderHandler::PaintElementType::PET_VIEW);
 
-	if (texture)
+	if (texture.GetRef())
 	{
 		//
 		// dirty flag checking and CopySubresourceRegion are disabled here due to some issue
@@ -608,17 +698,17 @@ void NUIWindow::UpdateFrame()
 		// issue on any modern GPU.
 		//
 		//if (InterlockedExchange(&m_dirtyFlag, 0) > 0)
-		if (!m_primary)
+		if (!m_rawBlit)
 		{
 			HRESULT hr = S_OK;
 
 			if (hr == S_OK)
 			{
-				ID3D11Device* device = GetD3D11Device();
+				ID3D11Device* device = g_nuiGi->GetD3D11Device();
 
 				if (device)
 				{
-					ID3D11DeviceContext* deviceContext = GetD3D11DeviceContext();
+					ID3D11DeviceContext* deviceContext = g_nuiGi->GetD3D11DeviceContext();
 					assert(deviceContext);
 
 					D3D11_BOX box = CD3D11_BOX(m_lastDirtyRect.left,
@@ -628,9 +718,9 @@ void NUIWindow::UpdateFrame()
 											   m_lastDirtyRect.bottom,
 											   1);
 
-					if (m_primary)
+					if (m_rawBlit)
 					{
-						deviceContext->CopyResource(m_nuiTexture->texture, texture);
+						g_nuiGi->BlitTexture(GetTexture(), texture);
 					}
 					else
 					{
@@ -646,13 +736,13 @@ void NUIWindow::UpdateFrame()
 						std::call_once(of, []()
 						{
 							D3D11_SAMPLER_DESC sd = CD3D11_SAMPLER_DESC(CD3D11_DEFAULT());
-							GetD3D11Device()->CreateSamplerState(&sd, &ss);
+							g_nuiGi->GetD3D11Device()->CreateSamplerState(&sd, &ss);
 
 							D3D11_BLEND_DESC bd = CD3D11_BLEND_DESC(CD3D11_DEFAULT());
-							GetD3D11Device()->CreateBlendState(&bd, &bs);
+							g_nuiGi->GetD3D11Device()->CreateBlendState(&bd, &bs);
 
-							GetD3D11Device()->CreateVertexShader(quadVS, sizeof(quadVS), nullptr, &vs);
-							GetD3D11Device()->CreatePixelShader(quadPS, sizeof(quadPS), nullptr, &ps);
+							g_nuiGi->GetD3D11Device()->CreateVertexShader(quadVS, sizeof(quadVS), nullptr, &vs);
+							g_nuiGi->GetD3D11Device()->CreatePixelShader(quadPS, sizeof(quadPS), nullptr, &ps);
 						});
 
 						ID3DUserDefinedAnnotation* pPerf;
@@ -673,10 +763,11 @@ void NUIWindow::UpdateFrame()
 						D3D11_VIEWPORT oldVp;
 						UINT numVPs = 1;
 
-						deviceContext->RSGetViewports(&numVPs, &oldVp);
+						D3D11_RECT oldSr;
+						UINT numSRs = 1;
 
-						CD3D11_VIEWPORT vp = CD3D11_VIEWPORT(0.0f, 0.0f, m_width, m_height);
-						deviceContext->RSSetViewports(1, &vp);
+						deviceContext->RSGetScissorRects(&numSRs, &oldSr);
+						deviceContext->RSGetViewports(&numVPs, &oldVp);
 
 						deviceContext->OMGetBlendState(&oldBs, nullptr, nullptr);
 
@@ -688,6 +779,12 @@ void NUIWindow::UpdateFrame()
 
 						deviceContext->OMSetRenderTargets(1, &m_swapRtv, nullptr);
 						deviceContext->OMSetBlendState(bs, nullptr, 0xffffffff);
+
+						CD3D11_VIEWPORT vp = CD3D11_VIEWPORT(0.0f, 0.0f, m_width, m_height);
+						deviceContext->RSSetViewports(1, &vp);
+
+						CD3D11_RECT sr = CD3D11_RECT(0, 0, m_width, m_height);
+						deviceContext->RSSetScissorRects(1, &sr);
 
 						deviceContext->PSSetShader(ps, nullptr, 0);
 						deviceContext->PSSetSamplers(0, 1, &ss);
@@ -706,7 +803,7 @@ void NUIWindow::UpdateFrame()
 
 						deviceContext->Draw(4, 0);
 
-						deviceContext->CopyResource(m_nuiTexture->texture, m_swapTexture);
+						deviceContext->CopyResource((ID3D11Resource*)GetTexture()->GetNativeTexture(), m_swapTexture);
 
 						deviceContext->OMSetRenderTargets(1, &oldRtv, oldDsv);
 
@@ -719,6 +816,7 @@ void NUIWindow::UpdateFrame()
 						deviceContext->PSSetShaderResources(0, 1, &oldSrv);
 						deviceContext->OMSetBlendState(oldBs, nullptr, 0xffffffff);
 						deviceContext->RSSetViewports(1, &oldVp);
+						deviceContext->RSSetScissorRects(numSRs, &oldSr);
 
 						if (oldVs)
 						{
@@ -782,19 +880,24 @@ void NUIWindow::UpdateFrame()
 			int pitch;
 			bool discarded = false;
 
-			rage::grcLockedTexture lockedTexture;
+			nui::GILockedTexture lockedTexture;
 
-			if (m_nuiTexture->Map(0, 0, &lockedTexture, rage::grcLockFlags::Write))
+			if (GetTexture()->Map(0, 0, &lockedTexture, nui::GILockFlags::Write))
 			{
 				pBits = lockedTexture.pBits;
 				pitch = lockedTexture.pitch;
 			}
-			else if (m_nuiTexture->Map(0, 0, &lockedTexture, rage::grcLockFlags::WriteDiscard))
+			else if (GetTexture()->Map(0, 0, &lockedTexture, nui::GILockFlags::WriteDiscard))
 			{
 				pBits = lockedTexture.pBits;
 				pitch = lockedTexture.pitch;
 
 				discarded = true;
+			}
+			else
+			{
+				// really
+				pBits = nullptr;
 			}
 
 			if (pBits)
@@ -803,34 +906,41 @@ void NUIWindow::UpdateFrame()
 				{
 					while (!m_dirtyRects.empty())
 					{
-						EnterCriticalSection(&m_renderBufferLock);
+						auto _ = GetRenderBufferLock();
 						CefRect rect = m_dirtyRects.front();
 						m_dirtyRects.pop();
-						LeaveCriticalSection(&m_renderBufferLock);
 
-						int height = m_height;
-
-						for (int y = rect.y; y < (rect.y + rect.height); y++)
+						if (pitch >= (rect.width * 4))
 						{
-							int dy = height - y;
+							int height = m_height;
 
-							int* src = &((int*)(m_renderBuffer))[(y * m_roundedWidth) + rect.x];
-							int* dest = &((int*)(pBits))[(dy * (pitch / 4)) + rect.x];
+							// ignore invalid height/width
+							if (((rect.y + rect.height) > height) || ((rect.x + rect.width) > m_roundedWidth))
+							{
+								continue;
+							}
 
-							memcpy(dest, src, (rect.width * 4));
+							for (int y = rect.y; y < (rect.y + rect.height); y++)
+							{
+								int dy = height - y - 1;
+
+								int* src = &((int*)(m_renderBuffer))[(y * m_roundedWidth) + rect.x];
+								int* dest = &((int*)(pBits))[(dy * (pitch / 4)) + rect.x];
+
+								memcpy(dest, src, (rect.width * 4));
+							}
 						}
 					}
 				}
 				else
 				{
-					EnterCriticalSection(&m_renderBufferLock);
+					auto _ = GetRenderBufferLock();
 					m_dirtyRects = std::queue<CefRect>();
-					LeaveCriticalSection(&m_renderBufferLock);
 
 					memcpy(pBits, m_renderBuffer, m_height * pitch);
 				}
 
-				m_nuiTexture->Unmap(&lockedTexture);
+				GetTexture()->Unmap(&lockedTexture);
 			}
 		}
 	}
@@ -848,18 +958,11 @@ void NUIWindow::HandlePopupShow(bool show)
 {
 	if (!show)
 	{
-		if (m_parentTextures[CefRenderHandler::PaintElementType::PET_POPUP])
+		if (m_parentTextures[CefRenderHandler::PaintElementType::PET_POPUP].GetRef())
 		{
-			m_parentTextures[CefRenderHandler::PaintElementType::PET_POPUP]->Release();
 			m_parentTextures[CefRenderHandler::PaintElementType::PET_POPUP] = nullptr;
-		}
 
-		if (m_popupTexture)
-		{
-			m_popupTexture->srv->Release();
-			m_popupTexture->srv = nullptr;
-
-			delete m_popupTexture;
+			std::lock_guard<std::shared_mutex> _(m_textureMutex);
 			m_popupTexture = nullptr;
 		}
 	}
@@ -869,14 +972,8 @@ void NUIWindow::SetPopupRect(const CefRect& rect)
 {
 	m_popupRect = rect;
 
-	rage::sysMemAllocator::UpdateAllocatorValue();
-
-	rage::grcManualTextureDef textureDef;
-	memset(&textureDef, 0, sizeof(textureDef));
-	textureDef.isStaging = 0;
-	textureDef.arraySize = 1;
-
-	m_popupTexture = rage::grcTextureFactory::getInstance()->createManualTexture(rect.width, rect.height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
+	std::lock_guard<std::shared_mutex> _(m_textureMutex);
+	m_popupTexture = g_nuiGi->CreateTextureBacking(rect.width, rect.height, nui::GITextureFormat::ARGB);
 }
 
 void NUIWindow::SetPaintType(NUIPaintType type)

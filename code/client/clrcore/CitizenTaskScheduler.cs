@@ -21,27 +21,39 @@ namespace CitizenFX.Core
 			}
 		}
 
+		[SecuritySafeCritical]
 		public static void Tick()
 		{
-			Action[] tasks;
+			var flowBlock = CitizenTaskScheduler.SuppressFlow();
 
-			lock (m_scheduledTasks)
+			try
 			{
-				tasks = m_scheduledTasks.ToArray();
-				m_scheduledTasks.Clear();
+				Action[] tasks;
+
+				lock (m_scheduledTasks)
+				{
+					tasks = m_scheduledTasks.ToArray();
+					m_scheduledTasks.Clear();
+				}
+
+				foreach (var task in tasks)
+				{
+					try
+					{
+						task();
+					}
+					catch (Exception e)
+					{
+						InternalManager.PrintErrorInternal($"task continuation", e);
+					}
+				}
+			}
+			finally
+			{
+
 			}
 
-			foreach (var task in tasks)
-			{
-				try
-				{
-					task();
-				}
-				catch (Exception e)
-				{
-					Debug.WriteLine($"Exception during executing Post callback: {e}");
-				}
-			}
+			flowBlock?.Undo();
 		}
 
 		public override SynchronizationContext CreateCopy()
@@ -50,101 +62,110 @@ namespace CitizenFX.Core
 		}
 	}
 
-    class CitizenTaskScheduler : TaskScheduler
-    {
+	class CitizenTaskScheduler : TaskScheduler
+	{
 		private static readonly object m_inTickTasksLock = new object();
-		private List<Task> m_inTickTasks;
+		private Dictionary<int, Task> m_inTickTasks;
 
-        private readonly List<Task> m_runningTasks = new List<Task>();
+		private readonly Dictionary<int, Task> m_runningTasks = new Dictionary<int, Task>();
 
-        protected CitizenTaskScheduler()
-        {
-            
-        }
+		protected CitizenTaskScheduler()
+		{
 
-        [SecurityCritical]
-        protected override void QueueTask(Task task)
-        {
+		}
+
+		[SecurityCritical]
+		protected override void QueueTask(Task task)
+		{
 			if (m_inTickTasks != null)
 			{
 				lock (m_inTickTasksLock)
 				{
 					if (m_inTickTasks != null)
-						m_inTickTasks.Add(task);
+						m_inTickTasks[task.Id] = task;
 				}
 			}
 
 			lock (m_runningTasks)
 			{
-				m_runningTasks.Add(task);
+				m_runningTasks[task.Id] = task;
 			}
-        }
+		}
 
-        [SecurityCritical]
-        protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
-        {
+		[SecurityCritical]
+		protected override bool TryExecuteTaskInline(Task task, bool taskWasPreviouslyQueued)
+		{
 			if (!taskWasPreviouslyQueued)
-            {
-                return TryExecuteTask(task);
-            }
+			{
+				//using (var scope = new ProfilerScope(() => GetTaskName(task)))
+				{
+					return TryExecuteTask(task);
+				}
+			}
 
-            return false;
-        }
+			return false;
+		}
 
-        [SecurityCritical]
-        protected override IEnumerable<Task> GetScheduledTasks()
-        {
+		[SecurityCritical]
+		protected override IEnumerable<Task> GetScheduledTasks()
+		{
 			lock (m_runningTasks)
 			{
-				return m_runningTasks.ToArray();
+				return m_runningTasks.Select(a => a.Value).ToArray();
 			}
-        }
+		}
 
-        public override int MaximumConcurrencyLevel => 1;
+		public override int MaximumConcurrencyLevel => 1;
 
-	    public void Tick()
-        {
+		[SecuritySafeCritical]
+		public void Tick()
+		{
+			var flowBlock = SuppressFlow();
+
 			Task[] tasks;
 
 			lock (m_runningTasks)
 			{
-				tasks = m_runningTasks.ToArray();
+				tasks = m_runningTasks.Values.ToArray();
 			}
 
 			// ticks should be reentrant (Tick might invoke TriggerEvent, e.g.)
-			List<Task> lastInTickTasks;
+			Dictionary<int, Task> lastInTickTasks;
 
 			lock (m_inTickTasksLock)
 			{
 				lastInTickTasks = m_inTickTasks;
 
-				m_inTickTasks = new List<Task>();
+				m_inTickTasks = new Dictionary<int, Task>();
 			}
 
 			do
 			{
-				foreach (var task in tasks)
+				using (var scope = new ProfilerScope(() => "task iteration"))
 				{
-					InvokeTryExecuteTask(task);
-
-					if (task.Exception != null)
+					foreach (var task in tasks)
 					{
-						Debug.WriteLine("Exception thrown by a task: {0}", task.Exception.ToString());
-					}
+						InvokeTryExecuteTask(task);
 
-					if (task.IsCompleted || task.IsFaulted || task.IsCanceled)
-					{
-						lock (m_runningTasks)
+						if (task.Exception != null)
 						{
-							m_runningTasks.Remove(task);
+							Debug.WriteLine("Exception thrown by a task: {0}", task.Exception.ToString());
+						}
+
+						if (task.IsCompleted || task.IsFaulted || task.IsCanceled)
+						{
+							lock (m_runningTasks)
+							{
+								m_runningTasks.Remove(task.Id);
+							}
 						}
 					}
-				}
 
-				lock (m_inTickTasksLock)
-				{
-					tasks = m_inTickTasks.ToArray();
-					m_inTickTasks.Clear();
+					lock (m_inTickTasksLock)
+					{
+						tasks = m_inTickTasks.Values.ToArray();
+						m_inTickTasks.Clear();
+					}
 				}
 			} while (tasks.Length != 0);
 
@@ -152,13 +173,44 @@ namespace CitizenFX.Core
 			{
 				m_inTickTasks = lastInTickTasks;
 			}
-        }
+
+			flowBlock?.Undo();
+		}
+
+		internal static AsyncFlowControl? SuppressFlow()
+		{
+			AsyncFlowControl? flow = null;
+
+			if (!ExecutionContext.IsFlowSuppressed())
+			{
+				flow = ExecutionContext.SuppressFlow();
+			}
+
+			return flow;
+		}
 
         [SecuritySafeCritical]
         private bool InvokeTryExecuteTask(Task task)
         {
-            return TryExecuteTask(task);
+			//using (var scope = new ProfilerScope(() => GetTaskName(task)))
+			{
+				return TryExecuteTask(task);
+			}
         }
+
+		private static FieldInfo ms_taskFieldInfo = typeof(Task).GetField("m_action", BindingFlags.Instance | BindingFlags.NonPublic);
+
+		private string GetTaskName(Task task)
+		{
+			var action = ms_taskFieldInfo.GetValue(task);
+
+			if (action is Delegate deleg)
+			{
+				return $"{deleg.Method.DeclaringType.Name} -> task {deleg.Method.Name}";
+			}
+
+			return action?.ToString() ?? task.ToString();
+		}
 
 		[SecuritySafeCritical]
         public static void Create()

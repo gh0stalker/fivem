@@ -11,7 +11,12 @@
 #include <ClientRegistry.h>
 #include <ServerInstanceBase.h>
 
+#include <Error.h>
+#include <StructuredTrace.h>
+
 #include <enet/enet.h>
+
+#include <FixedBuffer.h>
 
 namespace fx
 {
@@ -133,11 +138,8 @@ namespace fx
 			// disable peer throttling
 			enet_peer_throttle_configure(peer, 1000, ENET_PEER_PACKET_THROTTLE_SCALE, 0);
 
-#ifdef _DEBUG
-			//enet_peer_timeout(peer, 86400 * 1000, 86400 * 1000, 86400 * 1000);
-#endif
-
-			enet_peer_timeout(peer, ENET_PEER_TIMEOUT_LIMIT, ENET_PEER_TIMEOUT_MINIMUM, 10000);
+			// all-but-disable the backoff-based timeout, and set the hard timeout to 30 seconds
+			enet_peer_timeout(peer, 10000000, 10000000, 30000);
 		}
 
 	private:
@@ -147,19 +149,34 @@ namespace fx
 
 	class GameServerNetImplENet : public GameServerNetBase
 	{
+		struct ConnectionUsage
+		{
+			in6_addr address;
+			size_t count = 0;
+		};
+
 	public:
 		GameServerNetImplENet(GameServer* server)
 			: m_server(server), m_basePeerId(1)
 		{
+			m_clientRegistry = m_server->GetInstance()->GetComponent<fx::ClientRegistry>();
+
 			static ConsoleCommand cmd("force_enet_disconnect", [this](int peerIdx)
 			{
-				peerIdx = m_server->GetInstance()->GetComponent<fx::ClientRegistry>()->GetClientByNetID(peerIdx)->GetPeer();
+				auto client = m_clientRegistry->GetClientByNetID(peerIdx);
 
-				auto peer = m_peerHandles.left.find(peerIdx);
-
-				if (peer != m_peerHandles.left.end())
+				if (!client)
 				{
-					enet_peer_disconnect(peer->get_right(), 0);
+					return;
+				}
+
+				peerIdx = client->GetPeer();
+
+				auto peer = m_peerHandles.find(peerIdx);
+
+				if (peer != m_peerHandles.end())
+				{
+					enet_peer_disconnect(peer->second, 0);
 				}
 			});
 		}
@@ -178,11 +195,27 @@ namespace fx
 		}
 
 	private:
+		void OnDisconnect(ENetPeer* peer)
+		{
+			console::DPrintf("enet", "Peer %s disconnected from ENet.\n", GetPeerAddress(peer->address).ToString());
+
+			auto peerId = static_cast<int>(reinterpret_cast<uintptr_t>(peer->data));
+			m_peerHandles.erase(peerId);
+
+			// reset connection data (in case of a reconnect from the same client)
+			if (auto it = m_peerData.find(peerId); it != m_peerData.end())
+			{
+				m_connectionUsage.erase(it->second);
+				m_peerData.erase(it);
+			}
+		}
+
 		void ProcessHost(ENetHost* host)
 		{
 			ENetEvent event;
+			int enetEntry = 0;
 
-			while (enet_host_service(host, &event, 0) > 0)
+			while ((enetEntry = enet_host_service(host, &event, 0)) != 0)
 			{
 				switch (event.type)
 				{
@@ -190,27 +223,140 @@ namespace fx
 				{
 					console::DPrintf("enet", "Peer %s connected to ENet (id %d).\n", GetPeerAddress(event.peer->address).ToString(), m_basePeerId + 1);
 
-					m_peerHandles.left.insert({ ++m_basePeerId, event.peer });
+					auto peerId = ++m_basePeerId;
+					event.peer->data = reinterpret_cast<void*>(peerId);
+					m_peerHandles.emplace(peerId, event.peer);
+					m_peerData.emplace(peerId, event.data);
+
+					auto& usage = m_connectionUsage[event.data];
+					usage.count = 9999; // set high enough to invalidate down below
 					break;
 				}
 				case ENET_EVENT_TYPE_DISCONNECT:
 				{
-					console::DPrintf("enet", "Peer %s disconnected from ENet.\n", GetPeerAddress(event.peer->address).ToString());
-
-					m_peerHandles.right.erase(event.peer);
+					OnDisconnect(event.peer);
 					break;
 				}
 				case ENET_EVENT_TYPE_RECEIVE:
 				{
-					auto peerId = m_peerHandles.right.find(event.peer)->get_left();
+					auto peerId = static_cast<int>(reinterpret_cast<uintptr_t>(event.peer->data));
 
-					m_server->ProcessPacket(new NetPeerImplENet(this, peerId), event.packet->data, event.packet->dataLength);
+					NetPeerImplENet netPeer(this, peerId);
+					m_server->ProcessPacket(&netPeer, event.packet->data, event.packet->dataLength);
 					enet_packet_destroy(event.packet);
 					break;
 				}
 				}
 			}
 		}
+
+		bool OnValidateData(ENetHost* host, const ENetAddress* address, uint32_t data)
+		{
+			bool valid = true;
+
+			if (!m_clientRegistry->HasClientByConnectionTokenHash(data))
+			{
+				valid = false;
+			}
+
+			// if it's still valid
+			if (valid)
+			{
+				auto& usage = m_connectionUsage[data];
+
+				// if this is the first use of this token, set the address
+				if (!usage.count)
+				{
+					usage.address = address->host;
+				}
+				else
+				{
+					// if it's been used too many times already, stop it
+					if (usage.count > 3)
+					{
+						valid = false;
+					}
+					// or if the address is suddenly different from a prior retry
+					else if (memcmp(&usage.address, &address->host, sizeof(in6_addr)) != 0)
+					{
+						valid = false;
+					}
+				}
+
+				// increment usage
+				usage.count++;
+			}
+
+			return valid;
+		}
+
+		void OnTimeout(ENetHost* host, ENetPeer* peer)
+		{
+			auto currentCommand = enet_list_begin(&peer->sentReliableCommands);
+			auto currentTime = host->serviceTime;
+
+			std::map<ENetPacket*, OutgoingCommandInfo> outgoingCommandsMap;
+			size_t pendingCommandCount = 0;
+
+			while (currentCommand != enet_list_end(&peer->sentReliableCommands))
+			{
+				auto outgoingCommand = (ENetOutgoingCommand*)currentCommand;
+				currentCommand = enet_list_next(currentCommand);
+
+				if (auto packet = outgoingCommand->packet)
+				{
+					OutgoingCommandInfo info;
+					info.size = packet->dataLength;
+					info.timeAgo = currentTime - outgoingCommand->sentTime;
+					info.type = *(uint32_t*)packet->data;
+
+					if (info.type == HashRageString("msgNetEvent"))
+					{
+						info.eventName = std::string{ (const char*)packet->data + 8 };
+					}
+
+					if (auto outIt = outgoingCommandsMap.find(packet); outIt != outgoingCommandsMap.end())
+					{
+						if (outIt->second.timeAgo < info.timeAgo)
+						{
+							outIt->second = std::move(info);
+						}
+					}
+					else
+					{
+						outgoingCommandsMap[packet] = std::move(info);
+					}
+				}
+
+				pendingCommandCount++;
+			}
+
+			std::vector<OutgoingCommandInfo> outgoingCommands;
+
+			for (const auto& cmd : outgoingCommandsMap)
+			{
+				outgoingCommands.push_back(cmd.second);
+			}
+
+			std::sort(outgoingCommands.begin(), outgoingCommands.end(), [](const OutgoingCommandInfo& left, const OutgoingCommandInfo& right)
+			{
+				return right.size < left.size;
+			});
+
+			if (outgoingCommands.size() > 7)
+			{
+				outgoingCommands.resize(7);
+			}
+
+			TimeoutInfo info;
+			info.bigCommandList = std::move(outgoingCommands);
+			info.pendingCommands = pendingCommandCount;
+
+			auto peerId = static_cast<int>(reinterpret_cast<uintptr_t>(peer->data));
+			m_timeoutInfo[peerId] = std::move(info);
+		}
+
+		std::unordered_map<int, TimeoutInfo> m_timeoutInfo;
 
 	public:
 
@@ -245,34 +391,77 @@ namespace fx
 			enet_socketset_select(nfds, &readfds, nullptr, timeout);
 		}
 
-		virtual fwRefContainer<NetPeerBase> GetPeer(int peerId) override
+		virtual void GetPeer(int peerId, NetPeerStackBuffer& stackBuffer) override
 		{
-			return new NetPeerImplENet(this, peerId);
+			stackBuffer.Construct<NetPeerImplENet>(this, peerId);
 		}
 
 		virtual void ResetPeer(int peerId) override
 		{
-			auto peerPair = m_peerHandles.left.find(peerId);
+			auto peerPair = m_peerHandles.find(peerId);
 
-			if (peerPair == m_peerHandles.left.end())
+			if (peerPair == m_peerHandles.end())
 			{
 				return;
 			}
 
-			enet_peer_reset(peerPair->get_right());
+			// save the peer as m_peerHandles will see an erase
+			auto peer = peerPair->second;
+
+			// enet_peer_reset will not trigger a disconnect event, so we'll manually run that
+			OnDisconnect(peer);
+
+			// reset the peer
+			enet_peer_reset(peer);
+		}
+
+		virtual TimeoutInfo GatherTimeoutInfo(int peerId) override
+		{
+			auto timeoutData = m_timeoutInfo.find(peerId);
+
+			if (timeoutData == m_timeoutInfo.end())
+			{
+				return {};
+			}
+
+			auto info = std::move(timeoutData->second);
+			m_timeoutInfo.erase(peerId);
+
+			return std::move(info);
 		}
 
 		virtual void SendPacket(int peer, int channel, const net::Buffer& buffer, NetPacketType type) override
 		{
-			auto peerPair = m_peerHandles.left.find(peer);
-
-			if (peerPair == m_peerHandles.left.end())
+			auto peerPair = m_peerHandles.find(peer);
+			if (peerPair == m_peerHandles.end())
 			{
 				return;
 			}
 
-			auto packet = enet_packet_create(buffer.GetBuffer(), buffer.GetCurOffset(), (type == NetPacketType_Reliable || type == NetPacketType_ReliableReplayed) ? ENET_PACKET_FLAG_RELIABLE : (ENetPacketFlag)0);
-			enet_peer_send(peerPair->get_right(), channel, packet);
+			auto bufferBytes = buffer.GetBuffer();
+			auto bufferLength = buffer.GetCurOffset();
+
+			if (!bufferBytes && bufferLength > 0)
+			{
+#ifdef _DEBUG
+				__debugbreak();
+#endif
+				return;
+			}
+
+			// fewer allocations!!
+			auto flags = ENET_PACKET_FLAG_NO_ALLOCATE | ((type == NetPacketType_Reliable) ? ENET_PACKET_FLAG_RELIABLE : (ENetPacketFlag)0);
+			auto packet = enet_packet_create(bufferBytes, bufferLength, flags);
+
+			using NetBufferSharedPtr = std::shared_ptr<std::vector<uint8_t>>;
+
+			static object_pool<NetBufferSharedPtr> sharedPtrPool;
+			packet->userData = sharedPtrPool.construct(buffer.GetBytes());
+			packet->freeCallback = [](ENetPacket* packet)
+			{
+				sharedPtrPool.destruct((NetBufferSharedPtr*)packet->userData);
+			};
+			enet_peer_send(peerPair->second, channel, packet);
 		}
 
 		virtual void SendOutOfBand(const net::PeerAddress & to, const std::string_view & oob, bool prefix) override
@@ -310,12 +499,13 @@ namespace fx
 		{
 			// create an ENet host
 			ENetAddress addr = GetENetAddress(address);
-			ENetHost* host = enet_host_create(&addr, 256, 2, 0, 0);
+			ENetHost* host = enet_host_create(&addr, std::min(MAX_CLIENTS + 32, int(ENET_PROTOCOL_MAXIMUM_PEER_ID)), 2, 0, 0);
 
 			// ensure the host exists
 			if (!host)
 			{
-				trace("Could not bind on %s - is this address valid and not already in use?\n", address.ToString());
+				StructuredTrace({ "type", "bind_error" }, { "type", "enet" }, { "address", address.ToString() });
+				FatalError("Could not bind on %s - is this address valid and not already in use?\n", address.ToString());
 				return;
 			}
 
@@ -325,6 +515,16 @@ namespace fx
 			host->intercept = [](ENetHost* host, ENetEvent* event)
 			{
 				return g_hostInstances[host]->OnIntercept(host);
+			};
+
+			host->peerTimeoutCb = [](ENetHost* host, ENetPeer* peer)
+			{
+				return g_hostInstances[host]->OnTimeout(host, peer);
+			};
+
+			host->validateDataCb = [](ENetHost* host, const ENetAddress* address, uint32_t data)
+			{
+				return g_hostInstances[host]->OnValidateData(host, address, data);
 			};
 
 			this->hosts.push_back(THostPtr{ host });
@@ -345,6 +545,10 @@ namespace fx
 	private:
 		GameServer* m_server;
 
+		fwRefContainer<fx::ClientRegistry> m_clientRegistry;
+
+		std::unordered_map<uint32_t, ConnectionUsage> m_connectionUsage;
+
 	public:
 		friend class NetPeerImplENet;
 
@@ -354,7 +558,8 @@ namespace fx
 
 		std::vector<THostPtr> hosts;
 
-		boost::bimap<int, ENetPeer*> m_peerHandles;
+		std::map<int, ENetPeer*> m_peerHandles;
+		std::map<int, uint32_t> m_peerData;
 
 		fwEvent<ENetHost*> OnHostRegistered;
 
@@ -363,14 +568,14 @@ namespace fx
 
 	ENetPeer* NetPeerImplENet::GetPeer()
 	{
-		auto it = m_host->m_peerHandles.left.find(m_handle);
+		auto it = m_host->m_peerHandles.find(m_handle);
 
-		if (it == m_host->m_peerHandles.left.end())
+		if (it == m_host->m_peerHandles.end())
 		{
 			return nullptr;
 		}
 
-		return it->get_right();
+		return it->second;
 	}
 
 	fwRefContainer<GameServerNetBase> CreateGSNet_ENet(fx::GameServer* server)

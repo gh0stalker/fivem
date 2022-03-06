@@ -2,6 +2,9 @@
 
 #include <unordered_set>
 
+// uncomment this to enable cloning natives, remove this hack later.
+//#define ONESYNC_CLONING_NATIVES
+
 class NetLibrary;
 
 namespace rage
@@ -13,6 +16,31 @@ class CNetGamePlayer;
 
 namespace sync
 {
+struct FrameIndex
+{
+	union
+	{
+		struct
+		{
+			uint64_t lastFragment : 1;
+			uint64_t currentFragment : 7;
+			uint64_t frameIndex : 56;
+		};
+
+		uint64_t full;
+	};
+
+	FrameIndex()
+		: full(0)
+	{
+	}
+
+	FrameIndex(uint64_t idx)
+		: full(idx)
+	{
+	}
+};
+
 class INetObjMgrAbstraction
 {
 public:
@@ -22,7 +50,7 @@ public:
 
 	virtual void DestroyNetworkObject(rage::netObject* object) = 0;
 
-	virtual void ChangeOwner(rage::netObject* object, CNetGamePlayer* player, int migrationType) = 0;
+	virtual void ChangeOwner(rage::netObject* object, int oldOwnerId, CNetGamePlayer* player, int migrationType) = 0;
 
 	virtual rage::netObject* GetNetworkObject(uint16_t id) = 0;
 
@@ -33,6 +61,8 @@ class CloneManager
 {
 public:
 	virtual ~CloneManager() = default;
+
+	virtual void Reset() = 0;
 
 	virtual void Update() = 0;
 
@@ -50,10 +80,12 @@ public:
 
 	virtual rage::netObject* GetNetObject(uint16_t objectId) = 0;
 
-	virtual const std::unordered_set<rage::netObject*>& GetObjectList() = 0;
+	virtual const std::vector<rage::netObject*>& GetObjectList() = 0;
+
+	virtual bool IsRemovingObjectId(uint16_t objectId) = 0;
 
 	// TEMP: for temporary use during player deletion
-	virtual void DeleteObjectId(uint16_t objectId, bool force = false) = 0;
+	virtual void DeleteObjectId(uint16_t objectId, uint16_t uniqifier, bool force = false) = 0;
 
 public:
 	virtual void Logv(const char* format, fmt::printf_args argumentList) = 0;

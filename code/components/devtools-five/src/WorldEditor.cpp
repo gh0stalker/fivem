@@ -302,7 +302,7 @@ static InitFunction initFunction2([]()
 	});
 });
 
-static std::string OpenFileBrowser(const std::string& extension, const std::string& fileType);
+std::string OpenFileBrowser(const std::string& extension, const std::string& fileType);
 
 static InitFunction initFunction([]()
 {
@@ -362,6 +362,7 @@ static InitFunction initFunction([]()
 				ImGui::Selectable(txd.c_str());
 			}
 		}
+		ImGui::End();
 	});
 });
 
@@ -400,7 +401,7 @@ private:
 
 #include <ShlObj.h>
 
-static std::string OpenFileBrowser(const std::string& extension, const std::string& fileType)
+std::string OpenFileBrowser(const std::string& extension, const std::string& fileType)
 {
 	ScopedCoInitialize coInit(COINIT_APARTMENTTHREADED);
 

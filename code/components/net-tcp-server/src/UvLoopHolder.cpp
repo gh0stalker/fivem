@@ -7,6 +7,7 @@
 
 #include "StdInc.h"
 #include "UvLoopHolder.h"
+#include "UvLoopManager.h"
 #include "memdbgon.h"
 
 namespace net
@@ -20,10 +21,31 @@ UvLoopHolder::UvLoopHolder(const std::string& loopTag)
 	// assign our pointer to the loop
 	m_loop->data(std::make_shared<void*>(this));
 
+	m_async = m_loop->resource<uvw::AsyncHandle>();
+
+	m_async->on<uvw::AsyncEvent>([this](const uvw::AsyncEvent& ev, uvw::AsyncHandle& handle)
+	{
+		std::function<void()> fn;
+
+		while (m_functionQueue.try_pop(fn))
+		{
+			fn();
+		}
+	});
+
 	// start the loop's runtime thread
 	m_thread = std::thread([=] ()
 	{
-		SetThreadName(-1, const_cast<char*>(va("UV loop: %s", m_loopTag.c_str())));
+		SetThreadName(-1, const_cast<char*>(va(
+#ifdef _WIN32
+			"UV loop: %s"
+#else
+			// pthread names are limited in length, so we keep it short
+			"luv_%s"
+#endif
+			, m_loopTag.c_str())));
+
+		Instance<UvLoopManager>::Get()->SetCurrent(this);
 
 		// start running the loop
 		while (!m_shouldExit)

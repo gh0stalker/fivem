@@ -10,6 +10,13 @@
 
 namespace net
 {
+fwRefContainer<UvLoopHolder> UvLoopManager::Get(const std::string& loopTag)
+{
+	auto it = m_uvLoops.find(loopTag);
+
+	return (it == m_uvLoops.end()) ? nullptr : it->second;
+}
+
 fwRefContainer<UvLoopHolder> UvLoopManager::GetOrCreate(const std::string& loopTag)
 {
 	auto it = m_uvLoops.find(loopTag);
@@ -23,13 +30,28 @@ fwRefContainer<UvLoopHolder> UvLoopManager::GetOrCreate(const std::string& loopT
 	return it->second;
 }
 
+static thread_local UvLoopHolder* g_uvLoop;
+
+fwRefContainer<UvLoopHolder> UvLoopManager::GetCurrent()
+{
+	return g_uvLoop;
+}
+
+void UvLoopManager::SetCurrent(UvLoopHolder* holder)
+{
+	g_uvLoop = holder;
+}
+
 void UvLoopManager::Disown(const std::string& loopTag)
 {
 	m_uvLoops.erase(loopTag);
 }
 }
 
-static InitFunction initFunction([] ()
+struct Init
 {
-	Instance<net::UvLoopManager>::Set(new net::UvLoopManager());
-}, -5000);
+	Init()
+	{
+		Instance<net::UvLoopManager>::Set(new net::UvLoopManager());
+	}
+} init;

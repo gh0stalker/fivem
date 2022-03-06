@@ -2,8 +2,10 @@
 #include <CefOverlay.h>
 
 #include <ICoreGameInit.h>
+#include <CL2LaunchMode.h>
 
 #include <Hooking.h>
+#include <StatusText.h>
 
 #include <Resource.h>
 
@@ -24,8 +26,10 @@
 
 #include <CoreConsole.h>
 
-#include <Rect.h>
+#include <CfxRect.h>
 #include <DrawCommands.h>
+
+#include <CrossBuildRuntime.h>
 
 #include <Error.h>
 
@@ -34,14 +38,33 @@ static std::map<uint64_t, std::chrono::milliseconds> g_loadTiming;
 static std::chrono::milliseconds g_loadTimingBase;
 static std::set<uint64_t> g_visitedTimings;
 
-// 1365
-// 1493
-// 1604
-#define NUM_DLC_CALLS 32
+static bool ShouldSkipLoading();
+
+static int GetNumDlcCalls()
+{
+	if (xbr::IsGameBuildOrGreater<2372>())
+	{
+		return 37;
+	}
+	else if (xbr::IsGameBuildOrGreater<2189>())
+	{
+		return 36;
+	}
+	else if (xbr::IsGameBuildOrGreater<2060>())
+	{
+		return 35;
+	}
+	else if (xbr::IsGameBuildOrGreater<1604>())
+	{
+		return 33;
+	}
+
+	return 0;
+}
 
 using fx::Resource;
 
-static bool g_doDrawBelowLoadingScreens;
+bool g_doDrawBelowLoadingScreens;
 static bool frameOn = false;
 static bool primedMapLoad = false;
 
@@ -59,6 +82,14 @@ static void InvokeNUIScript(const std::string& eventName, rapidjson::Document& j
 	
 	if (json.Accept(writer))
 	{
+		// For SDK we will also send that as SDK_MESSAGE
+		if (launch::IsSDKGuest())
+		{
+			static constexpr uint32_t SEND_SDK_MESSAGE = HashString("SEND_SDK_MESSAGE");
+
+			NativeInvoke::Invoke<SEND_SDK_MESSAGE, const char*>(fmt::sprintf("{type:'game:loadingScreen',data:%s}", sb.GetString()).c_str());
+		}
+
 		nui::PostFrameMessage("loadingScreen", sb.GetString());
 	}
 }
@@ -110,6 +141,8 @@ static LoadsThread loadsThread;
 static bool autoShutdownNui = true;
 static fx::TNativeHandler g_origShutdown;
 
+#include <nutsnbolts.h>
+
 static HookFunction hookFunction([]()
 {
 	rage::scrEngine::OnScriptInit.Connect([]()
@@ -134,7 +167,8 @@ static HookFunction hookFunction([]()
 
 			if (!handler)
 			{
-				FatalError("Couldn't find SHUTDOWN_LOADING_SCREEN to hook!");
+				trace("Couldn't find SHUTDOWN_LOADING_SCREEN to hook!\n");
+				return;
 			}
 
 			g_origShutdown = *handler;
@@ -158,6 +192,7 @@ static HookFunction hookFunction([]()
 				(*handler)(ctx);
 
 				loadsThread.doSetup = true;
+				g_doDrawBelowLoadingScreens = false;
 
 				if (autoShutdownNui)
 				{
@@ -190,21 +225,19 @@ static HookFunction hookFunction([]()
 			// override LOAD_ALL_OBJECTS_NOW
 			auto handler = fx::ScriptEngine::GetNativeHandler(0xBD6E84632DD4CB3F);
 
-			if (!handler)
+			if (handler)
 			{
-				FatalError("Couldn't find LOAD_ALL_OBJECTS_NOW to hook!");
-			}
-
-			fx::ScriptEngine::RegisterNativeHandler(0xBD6E84632DD4CB3F, [=](fx::ScriptContext& ctx)
-			{
-				if (!endedLoadingScreens)
+				fx::ScriptEngine::RegisterNativeHandler(0xBD6E84632DD4CB3F, [=](fx::ScriptContext& ctx)
 				{
-					trace("Skipping LOAD_ALL_OBJECTS_NOW as loading screens haven't ended yet!\n");
-					return;
-				}
+					if (!endedLoadingScreens)
+					{
+						trace("Skipping LOAD_ALL_OBJECTS_NOW as loading screens haven't ended yet!\n");
+						return;
+					}
 
-				(*handler)(ctx);
-			});
+					(*handler)(ctx);
+				});
+			}
 		}
 
 		{
@@ -298,20 +331,29 @@ static void UpdateLoadTiming(uint64_t loadTimingIdentity)
 
 		if (curTiming.count() != 0 && g_visitedTimings.find(loadTimingIdentity) == g_visitedTimings.end())
 		{
+			auto frac = (curTiming - g_loadTimingBase).count() / (double)(g_loadTiming[1] - g_loadTimingBase).count();
+
 			rapidjson::Document doc;
 			doc.SetObject();
-			doc.AddMember("loadFraction", rapidjson::Value((curTiming - g_loadTimingBase).count() / (double)(g_loadTiming[1] - g_loadTimingBase).count()), doc.GetAllocator());
+			doc.AddMember("loadFraction", rapidjson::Value(frac), doc.GetAllocator());
 
 			InvokeNUIScript("loadProgress", doc);
+			ActivateStatusText(va("Loading game (%.0f%%)", frac * 100.0), 5, 4);
+			OnLookAliveFrame();
 
 			g_visitedTimings.insert(loadTimingIdentity);
 		}
 	}
 }
 
+static bool ShouldSkipLoading()
+{
+	return !autoShutdownNui || Instance<ICoreGameInit>::Get()->HasVariable("localMode") || Instance<ICoreGameInit>::Get()->HasVariable("storyMode");
+}
+
 void LoadsThread::DoRun()
 {
-	if (!autoShutdownNui)
+	if (ShouldSkipLoading())
 	{
 		return;
 	}
@@ -327,8 +369,7 @@ void LoadsThread::DoRun()
 	{
 		if (doSetup)
 		{
-			// 1604
-			((void(*)(int))hook::get_adjusted(0x1401C3438))(1);
+			DeactivateStatusText(1);
 
 			doSetup = false;
 		}
@@ -354,7 +395,7 @@ void LoadsThread::DoRun()
 		NativeInvoke::Invoke<0x07E5B515DB0636FC, int>(true, false, 0, false, false);
 
 		// LOAD_SCENE(?)
-		NativeInvoke::Invoke<0x4448EB75B4904BDB, int>(-2153.641f, 4597.957f, 116.662f);
+		//NativeInvoke::Invoke<0x4448EB75B4904BDB, int>(-2153.641f, 4597.957f, 116.662f);
 
 		// SHUTDOWN_LOADING_SCREEN
 		fx::ScriptContextBuffer ctx;
@@ -409,8 +450,7 @@ void LoadsThread::DoRun()
 
 		cam = 0;
 
-		// 1604
-		((void(*)(int))hook::get_adjusted(0x1401C3438))(1);
+		DeactivateStatusText(1);
 
 		// done
 		isShutdown = false;
@@ -419,7 +459,18 @@ void LoadsThread::DoRun()
 }
 
 extern int dlcIdx;
+extern std::map<uint32_t, std::string> g_dlcNameMap;
 DLL_IMPORT fwEvent<const std::string&> OnScriptInitStatus;
+
+static const char* GetName(const rage::InitFunctionData& data)
+{
+	if (auto it = g_dlcNameMap.find(data.funcHash); it != g_dlcNameMap.end())
+	{
+		return it->second.c_str();
+	}
+
+	return data.GetName();
+}
 
 static InitFunction initFunction([] ()
 {
@@ -489,15 +540,49 @@ static InitFunction initFunction([] ()
 				{
 					autoShutdownNui = false;
 				}
+
+				static ConVar<bool> uiLoadingCursor("ui_loadingCursor", ConVar_None, false);
+				auto useCursor = mdComponent->GetEntries("loadscreen_cursor");
+				if (useCursor.begin() != useCursor.end())
+				{
+					uiLoadingCursor.GetHelper()->SetRawValue(true);
+				}
+				else
+				{
+					uiLoadingCursor.GetHelper()->SetRawValue(false);
+				}
 			}
 		});
 
 		g_doDrawBelowLoadingScreens = true;
 
+#ifndef USE_NUI_ROOTLESS
+		auto icgi = Instance<ICoreGameInit>::Get();
+		std::string handoverBlob;
+
+		if (icgi->GetData("handoverBlob", &handoverBlob))
+		{
+			nui::PostRootMessage(fmt::sprintf(R"({ "type": "setHandover", "data": %s })", handoverBlob));
+		}
+#endif
+
+		if (loadingScreens.size() == 1)
+		{
+			Instance<ICoreGameInit>::Get()->SetVariable("noLoadingScreen");
+		}
+		else
+		{
+			Instance<ICoreGameInit>::Get()->ClearVariable("noLoadingScreen");
+		}
+
 		nui::CreateFrame("loadingScreen", loadingScreens.back());
 		nui::OverrideFocus(true);
 
+#ifndef USE_NUI_ROOTLESS
 		nui::PostRootMessage(R"({ "type": "focusFrame", "frameName": "loadingScreen" })");
+#else
+		// #TODONUIROOTLESS: order?
+#endif
 	}, 100);
 
 	static bool isGameReload = false;
@@ -535,6 +620,8 @@ static InitFunction initFunction([] ()
 
 				InvokeNUIScript("loadProgress", doc);
 
+				DeactivateStatusText(4);
+
 				g_visitedTimings.clear();
 			}
 		}
@@ -552,6 +639,8 @@ static InitFunction initFunction([] ()
 
 				InvokeNUIScript("loadProgress", doc);
 
+				DeactivateStatusText(4);
+
 				g_visitedTimings.clear();
 
 				g_loadTimingBase = g_loadTiming[2];
@@ -563,7 +652,7 @@ static InitFunction initFunction([] ()
 	{
 		if (type == rage::INIT_SESSION && order == 3)
 		{
-			count += NUM_DLC_CALLS;
+			count += GetNumDlcCalls();
 
 			dlcIdx = 0;
 		}
@@ -577,11 +666,20 @@ static InitFunction initFunction([] ()
 		InvokeNUIScript("startInitFunctionOrder", doc);
 	});
 
+	static auto lastIdx = 0;
+
 	rage::OnInitFunctionInvoking.Connect([] (rage::InitFunctionType type, int idx, rage::InitFunctionData& data)
 	{
-		if (type == rage::INIT_SESSION && data.initOrder == 3 && idx >= 15 && data.shutdownOrder != 42)
+		static auto extraContentWrapperIdx = 256;
+
+		if (type == rage::INIT_SESSION && data.initOrder == 3 && data.funcHash == HashString("CExtraContentWrapper"))
 		{
-			idx += NUM_DLC_CALLS;
+			extraContentWrapperIdx = idx;
+		}
+
+		if (type == rage::INIT_SESSION && data.initOrder == 3 && idx >= extraContentWrapperIdx && data.shutdownOrder != 42)
+		{
+			idx += GetNumDlcCalls();
 		}
 
 		uint64_t loadTimingIdentity = data.funcHash | ((int64_t)type << 48);
@@ -591,10 +689,12 @@ static InitFunction initFunction([] ()
 		rapidjson::Document doc;
 		doc.SetObject();
 		doc.AddMember("type", rapidjson::Value(rage::InitFunctionTypeToString(type), doc.GetAllocator()), doc.GetAllocator());
-		doc.AddMember("name", rapidjson::Value(data.GetName(), doc.GetAllocator()), doc.GetAllocator());
+		doc.AddMember("name", rapidjson::Value(GetName(data), doc.GetAllocator()), doc.GetAllocator());
 		doc.AddMember("idx", idx, doc.GetAllocator());
 
 		InvokeNUIScript("initFunctionInvoking", doc);
+
+		lastIdx = idx;
 	});
 
 	rage::OnInitFunctionInvoked.Connect([] (rage::InitFunctionType type, const rage::InitFunctionData& data)
@@ -602,27 +702,27 @@ static InitFunction initFunction([] ()
 		rapidjson::Document doc;
 		doc.SetObject();
 		doc.AddMember("type", rapidjson::Value(rage::InitFunctionTypeToString(type), doc.GetAllocator()), doc.GetAllocator());
-		doc.AddMember("name", rapidjson::Value(data.GetName(), doc.GetAllocator()), doc.GetAllocator());
+		doc.AddMember("name", rapidjson::Value(GetName(data), doc.GetAllocator()), doc.GetAllocator());
 
 		InvokeNUIScript("initFunctionInvoked", doc);
 	});
 
 	rage::OnInitFunctionEnd.Connect([] (rage::InitFunctionType type)
 	{
-		{
-			rapidjson::Document doc;
-			doc.SetObject();
-			doc.AddMember("type", rapidjson::Value(rage::InitFunctionTypeToString(type), doc.GetAllocator()), doc.GetAllocator());
-
-			InvokeNUIScript("endInitFunction", doc);
-		}
-
 		if (type == rage::INIT_BEFORE_MAP_LOADED)
 		{
 			primedMapLoad = true;
 		}
 		else if (type == rage::INIT_SESSION)
 		{
+			rapidjson::Document doc;
+			doc.SetObject();
+			doc.AddMember("type", rapidjson::Value(rage::InitFunctionTypeToString(type), doc.GetAllocator()), doc.GetAllocator());
+			doc.AddMember("name", rapidjson::Value("FinalizeLoad", doc.GetAllocator()), doc.GetAllocator());
+			doc.AddMember("idx", lastIdx + 1, doc.GetAllocator());
+
+			InvokeNUIScript("initFunctionInvoking", doc);
+
 			if (g_loadProfileConvar->GetValue())
 			{
 				auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::high_resolution_clock::now().time_since_epoch()) - g_loadTimingBase;
@@ -660,6 +760,7 @@ static InitFunction initFunction([] ()
 				doc.AddMember("loadFraction", 1.0, doc.GetAllocator());
 
 				InvokeNUIScript("loadProgress", doc);
+				DeactivateStatusText(4);
 			}
 
 			// for next time
@@ -672,6 +773,14 @@ static InitFunction initFunction([] ()
 
 			loadsThread.doShutdown = true;
 		}
+
+		{
+			rapidjson::Document doc;
+			doc.SetObject();
+			doc.AddMember("type", rapidjson::Value(rage::InitFunctionTypeToString(type), doc.GetAllocator()), doc.GetAllocator());
+
+			InvokeNUIScript("endInitFunction", doc);
+		}
 	});
 
 	auto printLog = [](const std::string& message)
@@ -682,10 +791,9 @@ static InitFunction initFunction([] ()
 
 		InvokeNUIScript("onLogLine", doc);
 
-		if (autoShutdownNui)
+		if (!ShouldSkipLoading())
 		{
-			// 1604
-			((void(*)(const char*, int, int))hook::get_adjusted(0x1401C3578))(message.c_str(), 5, 1);
+			ActivateStatusText(message.c_str(), 5, 1);
 		}
 	};
 

@@ -49,7 +49,7 @@ auto CoreGetComponentRegistry()
 		RefSource()
 		{
 #ifdef _WIN32
-			auto func = (ComponentRegistry*(*)())GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreGetComponentRegistry");
+			auto func = (ComponentRegistry*(*)())GetProcAddress(GetModuleHandleW(L"CoreRT.dll"), "CoreGetComponentRegistry");
 #else
 			auto func = (ComponentRegistry*(*)())dlsym(dlopen("./libCoreRT.so", RTLD_LAZY), "CoreGetComponentRegistry");
 #endif
@@ -68,32 +68,25 @@ template<typename TContained>
 class InstanceRegistryBase : public fwRefCountable
 {
 private:
+	static constexpr size_t kMaxSize = 128;
+
 	std::vector<TContained> m_instances;
 
 public:
 	InstanceRegistryBase()
+		: m_instances(kMaxSize)
 	{
-		EnsureSize();
-	}
-
-private:
-	inline void EnsureSize()
-	{
-		m_instances.resize(CoreGetComponentRegistry()->GetSize());
+		assert(CoreGetComponentRegistry()->GetSize() < kMaxSize);
 	}
 
 public:
 	const TContained& GetInstance(size_t key)
 	{
-		EnsureSize();
-
 		return m_instances[key];
 	}
 
 	void SetInstance(size_t key, const TContained& instance)
 	{
-		EnsureSize();
-
 		m_instances[key] = instance;
 	}
 };
@@ -119,7 +112,7 @@ static
         RefSource()
         {
 #ifdef _WIN32
-            auto func = (InstanceRegistry*(*)())GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "CoreGetGlobalInstanceRegistry");
+            auto func = (InstanceRegistry*(*)())GetProcAddress(GetModuleHandleW(L"CoreRT.dll"), "CoreGetGlobalInstanceRegistry");
 #else
 			auto func = (InstanceRegistry*(*)())dlsym(dlopen("./libCoreRT.so", RTLD_LAZY), "CoreGetGlobalInstanceRegistry");
 #endif

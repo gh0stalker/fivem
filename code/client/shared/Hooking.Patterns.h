@@ -87,16 +87,16 @@ namespace hook
 
 	public:
 		template<size_t Len>
-		pattern(const char(&pattern)[Len])
+		pattern(const char(&p)[Len])
 			: pattern(getRVA<void>(0))
 		{
-			Initialize(pattern, Len);
+			Initialize(p, Len);
 		}
 
-		pattern(std::string_view pattern)
+		pattern(std::string_view p)
 			: pattern(getRVA<void>(0))
 		{
-			Initialize(pattern.data(), pattern.size());
+			Initialize(p.data(), p.size());
 		}
 
 		inline pattern& count(uint32_t expected) &
@@ -184,6 +184,12 @@ namespace hook
 		{
 			Initialize(pattern, Len);
 		}
+
+		module_pattern(void* module, std::string_view p)
+			: pattern(module)
+		{
+			Initialize(p.data(), p.size());
+		}
 	};
 
 	class range_pattern
@@ -195,6 +201,12 @@ namespace hook
 			: pattern(begin, end)
 		{
 			Initialize(pattern, Len);
+		}
+
+		range_pattern(uintptr_t begin, uintptr_t end, std::string_view p)
+			: pattern(begin, end)
+		{
+			Initialize(p.data(), p.size());
 		}
 	};
 

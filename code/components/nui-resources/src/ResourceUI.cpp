@@ -14,6 +14,8 @@
 #include <ResourceMetaDataComponent.h>
 #include <ResourceGameLifetimeEvents.h>
 
+#include <ResourceManager.h>
+
 #include <mutex>
 
 ResourceUI::ResourceUI(Resource* resource)
@@ -29,6 +31,12 @@ ResourceUI::~ResourceUI()
 
 bool ResourceUI::Create()
 {
+	// initialize callback handlers
+	auto resourceName = m_resource->GetName();
+	std::transform(resourceName.begin(), resourceName.end(), resourceName.begin(), ::ToLower);
+	nui::RegisterSchemeHandlerFactory("http", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+	nui::RegisterSchemeHandlerFactory("https", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+
 	// get the metadata component
 	fwRefContainer<fx::ResourceMetaDataComponent> metaData = m_resource->GetComponent<fx::ResourceMetaDataComponent>();
 
@@ -54,20 +62,38 @@ bool ResourceUI::Create()
 
 	// get the page name from the iterator
 	std::string pageName = uiPageData.begin()->second;
-
-	// initialize the page
-	auto resourceName = m_resource->GetName();
-	std::transform(resourceName.begin(), resourceName.end(), resourceName.begin(), ::ToLower);
-	CefRegisterSchemeHandlerFactory("http", resourceName, Instance<NUISchemeHandlerFactory>::Get());
-	CefRegisterSchemeHandlerFactory("https", resourceName, Instance<NUISchemeHandlerFactory>::Get());
+	nui::RegisterSchemeHandlerFactory("https", "cfx-nui-" + resourceName, Instance<NUISchemeHandlerFactory>::Get());
 
 	// create the NUI frame
-	std::string path = "nui://" + m_resource->GetName() + "/" + pageName;
-	nui::CreateFrame(m_resource->GetName(), path);
+	auto rmvRes = metaData->IsManifestVersionBetween("cerulean", "");
+	auto uiPrefix = (!rmvRes || !*rmvRes) ? "nui://" : "https://cfx-nui-";
+
+	std::string path = uiPrefix + m_resource->GetName() + "/" + pageName;
+
+	// allow direct mentions of absolute URIs
+	if (pageName.find("://") != std::string::npos)
+	{
+		path = pageName;
+	}
+
+	auto uiPagePreloadData = metaData->GetEntries("ui_page_preload");
+	bool uiPagePreload = std::distance(uiPagePreloadData.begin(), uiPagePreloadData.end()) > 0;
+
+	if (uiPagePreload)
+	{
+		nui::CreateFrame(m_resource->GetName(), path);
+	}
+	else
+	{
+		nui::PrepareFrame(m_resource->GetName(), path);
+	}
 
 	// add a cross-origin entry to allow fetching the callback handler
 	CefAddCrossOriginWhitelistEntry(va("nui://%s", m_resource->GetName().c_str()), "http", m_resource->GetName(), true);
 	CefAddCrossOriginWhitelistEntry(va("nui://%s", m_resource->GetName().c_str()), "https", m_resource->GetName(), true);
+	
+	CefAddCrossOriginWhitelistEntry(va("https://cfx-nui-%s", m_resource->GetName().c_str()), "https", m_resource->GetName(), true);
+	CefAddCrossOriginWhitelistEntry(va("https://cfx-nui-%s", m_resource->GetName().c_str()), "nui", m_resource->GetName(), true);
 
 	return true;
 }
@@ -83,18 +109,33 @@ void ResourceUI::AddCallback(const std::string& type, ResUICallback callback)
 	m_callbacks.insert({ type, callback });
 }
 
-bool ResourceUI::InvokeCallback(const std::string& type, const std::string& data, ResUIResultCallback resultCB)
+void ResourceUI::RemoveCallback(const std::string& type)
+{
+	// Note: This is called by UNREGISTER_RAW_NUI_CALLBACK but
+	// can still technically target event based NUI Callbacks
+	m_callbacks.erase(type);
+}
+
+bool ResourceUI::InvokeCallback(const std::string& type, const std::string& query, const std::multimap<std::string, std::string>& headers, const std::string& data, ResUIResultCallback resultCB)
 {
 	auto set = fx::GetIteratorView(m_callbacks.equal_range(type));
 
 	if (set.begin() == set.end())
 	{
-		return false;
+		// try mapping only the first part
+		auto firstType = type.substr(0, type.find_first_of('/'));
+
+		set = fx::GetIteratorView(m_callbacks.equal_range(firstType));
+
+		if (set.begin() == set.end())
+		{
+			return false;
+		}
 	}
 
 	for (auto& cb : set)
 	{
-		cb.second(data, resultCB);
+		cb.second(type, query, headers, data, resultCB);
 	}
 
 	return true;
@@ -108,8 +149,81 @@ void ResourceUI::SignalPoll()
 static std::map<std::string, fwRefContainer<ResourceUI>> g_resourceUIs;
 static std::mutex g_resourceUIMutex;
 
+#include <boost/algorithm/string.hpp>
+
 static InitFunction initFunction([] ()
 {
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* manager)
+	{
+		nui::SetResourceLookupFunction([manager](const std::string& resourceName, const std::string& fileName) -> std::string
+		{
+			auto resource = manager->GetResource(resourceName);
+
+			if (resource.GetRef())
+			{
+				auto path = resource->GetPath();
+
+				if (!boost::algorithm::ends_with(path, "/"))
+				{
+					path += "/";
+				}
+
+				// check if it's a client script of any sorts
+				std::stringstream normalFileName;
+				char lastC = '/';
+
+				for (size_t i = 0; i < fileName.length(); i++)
+				{
+					char c = fileName[i];
+
+					if (c != '/' || lastC != '/')
+					{
+						normalFileName << c;
+					}
+
+					lastC = c;
+				}
+
+				auto nfn = normalFileName.str();
+
+				auto mdComponent = resource->GetComponent<fx::ResourceMetaDataComponent>();
+				bool valid = false;
+
+				if (nfn == "__resource.lua" || nfn == "fxmanifest.lua")
+				{
+					return "common:/data/gameconfig.xml";
+				}
+				
+				for (auto& entry : mdComponent->GlobEntriesVector("client_script"))
+				{
+					if (nfn == entry)
+					{
+						auto files = mdComponent->GlobEntriesVector("file");
+						bool isFile = false;
+
+						for (auto& fileEntry : files)
+						{
+							if (nfn == fileEntry)
+							{
+								isFile = true;
+								break;
+							}
+						}
+
+						if (!isFile)
+						{
+							return "common:/data/gameconfig.xml";
+						}
+					}
+				}
+
+				return path + fileName;
+			}
+
+			return fmt::sprintf("resources:/%s/%s", resourceName, fileName);
+		});
+	});
+
 	Resource::OnInitializeInstance.Connect([] (Resource* resource)
 	{
 		// create the UI instance
@@ -136,6 +250,7 @@ static InitFunction initFunction([] ()
 			}
 		});
 
+#ifdef GTA_FIVE
 		// pre-disconnect handling
 		resource->GetComponent<fx::ResourceGameLifetimeEvents>()->OnBeforeGameShutdown.Connect([=]()
 		{
@@ -147,8 +262,21 @@ static InitFunction initFunction([] ()
 				g_resourceUIs.erase(resource->GetName());
 			}
 		});
+#endif
 
 		// add component
 		resource->SetComponent(resourceUI);
+	});
+});
+
+#include <CefOverlay.h>
+#include <HttpClient.h>
+
+static InitFunction httpInitFunction([]()
+{
+	nui::RequestNUIBlocklist.Connect([](std::function<void(bool, const char*, size_t)> cb)
+	{
+		auto httpClient = Instance<HttpClient>::Get();
+		httpClient->DoGetRequest("https://runtime.fivem.net/nui-blacklist.json", cb);
 	});
 });

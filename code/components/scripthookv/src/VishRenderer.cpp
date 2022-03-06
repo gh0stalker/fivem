@@ -8,7 +8,7 @@
 #include "StdInc.h"
 #include <DrawCommands.h>
 #include <grcTexture.h>
-#include <RGBA.h>
+#include <CfxRGBA.h>
 
 #include <wrl.h>
 #include <wincodec.h>
@@ -251,7 +251,7 @@ DLL_EXPORT void drawTexture(int id, int index, int level, int time,
 	instance.center[1] = centerY;
 	instance.pos[0] = posX;
 	instance.pos[1] = posY;
-	instance.rotation = rotation;
+	instance.rotation = rotation * -360.0f;
 	instance.aspectValue = screenHeightScaleFactor;
 	instance.color = CRGBA::FromFloat(r, g, b, a);
 

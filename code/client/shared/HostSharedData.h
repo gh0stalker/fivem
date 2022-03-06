@@ -1,5 +1,7 @@
 #pragma once
 
+#include <CL2LaunchMode.h>
+
 template<typename TData>
 class HostSharedData
 {
@@ -9,11 +11,7 @@ public:
 		m_data = &m_fakeData;
 
 		bool initTime = true;
-#ifdef IS_FXSERVER
-		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(TData), ToWide("CFX_SV_SharedData_" + name).c_str());
-#else
-		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(TData), ToWide("CFX_SharedData_" + name).c_str());
-#endif
+		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(TData), ToWide(fmt::sprintf("CFX_%s_%s_SharedData_%s", launch::GetLaunchModeKey(), launch::GetProductKey(), name)).c_str());
 
 		if (m_fileMapping != nullptr)
 		{
@@ -28,6 +26,29 @@ public:
 			{
 				m_data = new(m_data) TData();
 			}
+		}
+	}
+
+	HostSharedData(const HostSharedData&) = delete;
+	HostSharedData(HostSharedData&& right)
+	{
+		m_fileMapping = std::move(right.m_fileMapping);
+		m_data = std::move(right.m_data);
+		m_fakeData = std::move(right.m_fakeData);
+	}
+
+	~HostSharedData()
+	{
+		if (m_data && m_data != &m_fakeData)
+		{
+			UnmapViewOfFile(m_data);
+			m_data = nullptr;
+		}
+
+		if (m_fileMapping)
+		{
+			CloseHandle(m_fileMapping);
+			m_fileMapping = nullptr;
 		}
 	}
 

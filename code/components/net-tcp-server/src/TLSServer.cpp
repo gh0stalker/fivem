@@ -115,6 +115,18 @@ public:
 	}
 };
 
+#ifdef IS_FXSERVER
+// hardened policy
+class ServerTLSPolicy : public Botan::TLS::Policy
+{
+public:
+	virtual bool abort_connection_on_undesired_renegotiation() const
+	{
+		return true;
+	}
+};
+#endif
+
 // policy allowing TLS_RSA_WITH_AES_256_CBC_SHA256 since ROS SDK wants this
 class TLSPolicy : public Botan::TLS::Policy
 {
@@ -188,7 +200,12 @@ TLSServerStream::TLSServerStream(TLSServer* server, fwRefContainer<TcpServerStre
 
 void TLSServerStream::Initialize()
 {
+#ifndef IS_FXSERVER
 	m_policy = std::make_unique<TLSPolicy>();
+#else
+	m_policy = std::make_unique<ServerTLSPolicy>();
+#endif
+
 	m_sessionManager = std::make_unique<Botan::TLS::Session_Manager_In_Memory>(m_rng);
 
 	m_tlsServer.reset(new Botan::TLS::Server(
@@ -222,7 +239,9 @@ void TLSServerStream::Initialize()
 		}
 		catch (std::exception& e)
 		{
+#ifndef IS_FXSERVER
 			trace("%s\n", e.what());
+#endif
 		}
 	});
 }
@@ -232,24 +251,24 @@ PeerAddress TLSServerStream::GetPeerAddress()
 	return m_baseStream->GetPeerAddress();
 }
 
-void TLSServerStream::Write(const std::string& data)
+void TLSServerStream::Write(const std::string& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(data);
+	DoWrite<decltype(data)>(data, std::move(onComplete));
 }
 
-void TLSServerStream::Write(const std::vector<uint8_t>& data)
+void TLSServerStream::Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(data);
+	DoWrite<decltype(data)>(data, std::move(onComplete));
 }
 
-void TLSServerStream::Write(std::string&& data)
+void TLSServerStream::Write(std::string&& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(std::move(data));
+	DoWrite<decltype(data)>(std::move(data), std::move(onComplete));
 }
 
-void TLSServerStream::Write(std::vector<uint8_t>&& data)
+void TLSServerStream::Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete)
 {
-	DoWrite<decltype(data)>(std::move(data));
+	DoWrite<decltype(data)>(std::move(data), std::move(onComplete));
 }
 
 void TLSServerStream::Close()
@@ -268,19 +287,26 @@ void TLSServerStream::Close()
 			}
 			catch (const std::exception& e)
 			{
+#ifndef IS_FXSERVER
 				trace("tls close: %s\n", e.what());
+#endif
 			}
 		}
-	});
+	}, true);
 }
 
 void TLSServerStream::WriteToClient(const uint8_t buf[], size_t length)
 {
-	std::vector<uint8_t> data(buf, buf + length);
+	auto dataPtr = std::unique_ptr<char[]>(new char[length]);
+	memcpy(dataPtr.get(), buf, length);
 	
 	if (m_baseStream.GetRef())
 	{
-		m_baseStream->Write(data);
+		m_baseStream->Write(std::move(dataPtr), length, std::move(m_nextOnComplete));
+	}
+	else
+	{
+		m_nextOnComplete = {};
 	}
 }
 
@@ -308,7 +334,9 @@ void TLSServerStream::ReceivedAlert(Botan::TLS::Alert alert, const uint8_t[], si
 	}
 	else
 	{
+#ifndef IS_FXSERVER
 		trace("alert %s\n", alert.type_string().c_str());
+#endif
 	}
 }
 
@@ -355,11 +383,11 @@ void TLSServerStream::CloseInternal()
 	m_parentServer->CloseStream(this);
 }
 
-void TLSServerStream::ScheduleCallback(const TScheduledCallback& callback)
+void TLSServerStream::ScheduleCallback(TScheduledCallback&& callback, bool performInline)
 {
 	if (m_baseStream.GetRef())
 	{
-		m_baseStream->ScheduleCallback(callback);
+		m_baseStream->ScheduleCallback(std::move(callback), performInline);
 	}
 }
 
@@ -382,6 +410,7 @@ void TLSServer::Initialize(fwRefContainer<TcpServer> baseServer, std::shared_ptr
 		fwRefContainer<TLSServerStream> childStream = new TLSServerStream(this, stream);
 		childStream->Initialize();
 
+		std::lock_guard<std::mutex> _(m_connectionsMutex);
 		m_connections.insert(childStream);
 	});
 }

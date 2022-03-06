@@ -41,6 +41,8 @@ namespace fx
 
 		virtual pplx::task<fwRefContainer<fx::Resource>> LoadResource(const std::string& uri) override;
 
+		virtual pplx::task<tl::expected<fwRefContainer<fx::Resource>, fx::ResourceManagerError>> LoadResourceWithError(const std::string& uri) override;
+
 	protected:
 		struct ResourceFileEntry
 		{
@@ -60,10 +62,17 @@ namespace fx
 	protected:
 		virtual fwRefContainer<fx::Resource> InitializeLoad(const std::string& uri, skyr::url* parsedUri);
 
-		virtual fwRefContainer<vfs::Device> OpenResourcePackfile(const fwRefContainer<fx::Resource>& resource);
+		virtual tl::expected<fwRefContainer<vfs::Device>, ResourceManagerError> OpenResourcePackfile(const fwRefContainer<fx::Resource>& resource);
 
 	protected:
 		std::multimap<std::string, ResourceFileEntry> m_resourceEntries;
+
+	public:
+		enum class StatusType
+		{
+			Downloading,
+			Verifying,
+		};
 
 	public:
 		virtual void RemoveResourceEntries(const std::string& resourceName);
@@ -72,7 +81,7 @@ namespace fx
 
 		virtual std::string FormatPath(const std::string& resourceName, const std::string& basename);
 
-		virtual void AddStatusCallback(const std::string& resourceName, const std::function<void(int, int)>& callback);
+		virtual void AddStatusCallback(const std::string& resourceName, const std::function<void(StatusType, int, int)>& callback);
 	};
 
 

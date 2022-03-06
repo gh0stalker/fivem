@@ -10,6 +10,7 @@
 #include <MinHook.h>
 
 #include <VFSManager.h>
+#include <CrossBuildRuntime.h>
 
 static hook::cdecl_stub<void(atHashMap<bool>*, const uint32_t&, const bool&)> atHashMap_bool_insert([]()
 {
@@ -34,14 +35,20 @@ static void LoadCacheHook(const char* filenameBase, const char* rootPath, int is
 {
 	if (!isDlc)
 	{
+		size_t i = 0;
+
 		for (auto& file : *g_streamingPackfiles)
 		{
 			if (file.isDLC)
 			{
+				static auto streamingModule = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("rpf");
+				const auto& packName = streaming::GetStreamingNameForIndex(streamingModule->baseIdx + i);
 				file.isDLC = false;
 
 				file.cacheFlags &= ~1;
 			}
+
+			++i;
 		}
 	}
 
@@ -177,7 +184,16 @@ static HookFunction hookFunction([]()
 
 		// CInteriorProxy module
 		hook::call(hook::get_pattern("48 8D 8C 24 C0 00 00 00 8B D0 E8", 10), GetCacheIndex); // save
-		hook::call(hook::get_pattern("48 8D 8D 88 00 00 00 8B D0 E8", 9), GetCacheIndex); // load
+
+		if (xbr::IsGameBuildOrGreater<2545>())
+		{
+			hook::call(hook::get_pattern("48 8D 8C 24 C0 00 00 00 8B D0 E8", 10), GetCacheIndex); // load
+		
+		}
+		else
+		{
+			hook::call(hook::get_pattern("48 8D 8D 88 00 00 00 8B D0 E8", 9), GetCacheIndex); // load
+		}
 	}
 	
 	{
@@ -189,7 +205,7 @@ static HookFunction hookFunction([]()
 	}
 
 	MH_Initialize();
-	MH_CreateHook(hook::get_pattern("B9 00 00 04 00 BF 01 00 00 00 39", -0x5D), LoadCacheHook, (void**)& g_loadCacheOld);
+	MH_CreateHook(hook::get_pattern("B9 00 00 04 00 BF 01 00 00 00 39", -0x5D), LoadCacheHook, (void**)&g_loadCacheOld);
 	MH_EnableHook(MH_ALL_HOOKS);
 });
 

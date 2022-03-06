@@ -101,7 +101,7 @@ namespace rage
 	public:
 		virtual ~grmShaderFactory() = default;
 
-		virtual grmShaderFx* GetShader() = 0;
+		virtual grmShaderFx* Create() = 0;
 
 		static grmShaderFactory* GetInstance();
 	};
@@ -119,6 +119,16 @@ bool GFXSPEC_EXPORT IsOnRenderThread();
 
 namespace rage
 {
+	enum grcDrawMode
+	{
+		grcPointList = 0,
+		grcLineList,
+		grcLineStrip,
+		grcTriangleList,
+		grcTriangleStrip,
+		// some more unknowns follow (lighting, etc.)
+	};
+
 	void GFXSPEC_EXPORT grcBegin(int drawMode, int count);
 	void GFXSPEC_EXPORT grcVertex(float x, float y, float z, float nX, float nY, float nZ, uint32_t color, float u, float v);
 	void GFXSPEC_EXPORT grcEnd();
@@ -131,6 +141,7 @@ void GFXSPEC_EXPORT PopDrawBlitImShader();
 void GFXSPEC_EXPORT SetTextureGtaIm(rage::grcTexture* texture);
 void GFXSPEC_EXPORT DrawImSprite(float x1, float y1, float x2, float y2, float z, float u1, float v1, float u2, float v2, uint32_t* color, int subShader);
 
+uint32_t GFXSPEC_EXPORT CreateRasterizerState(const D3D11_RASTERIZER_DESC* desc);
 uint32_t GFXSPEC_EXPORT CreateSamplerState(const D3D11_SAMPLER_DESC* desc);
 uint32_t GFXSPEC_EXPORT GetImDiffuseSamplerState();
 void GFXSPEC_EXPORT SetImDiffuseSamplerState(uint32_t samplerStateIdentifier);
@@ -178,3 +189,6 @@ GFXSPEC_EXPORT void GetGameResolution(int& width, int& height);
 #include <dxgi1_5.h>
 
 extern GFXSPEC_EXPORT fwEvent<IDXGIFactory2*, ID3D11Device*, HWND, DXGI_SWAP_CHAIN_DESC1*, DXGI_SWAP_CHAIN_FULLSCREEN_DESC*, IDXGISwapChain1**> OnTryCreateSwapChain;
+
+extern GFXSPEC_EXPORT fwEvent<bool*> OnRequestInternalScreenshot;
+extern GFXSPEC_EXPORT fwEvent<const uint8_t*, int, int> OnInternalScreenshot;

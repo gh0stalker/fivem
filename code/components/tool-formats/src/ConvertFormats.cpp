@@ -33,11 +33,23 @@
 #include <phBound.h>
 #include <fragType.h>
 
+#undef RAGE_FORMATS_GAME_FIVE
+#undef RAGE_FORMATS_GAME
+#define RAGE_FORMATS_GAME rdr3
+#define RAGE_FORMATS_GAME_RDR3
+#include <gtaDrawable.h>
+#include <phBound.h>
+#include <fragType.h>
+
+#ifndef IS_RDR3
 #include <convert/gtaDrawable_ny_five.h>
 #include <convert/phBound_ny_five.h>
 
 #include <convert/gtaDrawable_payne_five.h>
 #include <convert/phBound_payne_five.h>
+
+#include <convert/gtaDrawable_rdr3_five.h>
+#include <convert/phBound_rdr3_five.h>
 
 #include <optional>
 
@@ -51,6 +63,11 @@ namespace rage::ny
 namespace rage::payne
 {
 	rage::payne::BlockMap* UnwrapRSC5(const wchar_t* fileName);
+}
+
+namespace rage::rdr3
+{
+	rage::rdr3::BlockMap* UnwrapRSC8(const wchar_t* fileName);
 }
 
 template<typename T>
@@ -96,9 +113,16 @@ static bool AutoConvert(TBlockMap blockMap, const std::wstring& fileName, int fi
 		fileExt = fileExtOverride;
 	}
 
-	std::wstring outFileName(fileName);
-	outFileName = outFileName.substr(0, outFileName.find_last_of('.')) + L".y" + fileExt.substr(2);
+	std::wstring suffix;
 
+	if (fileExt[1] == L'y')
+	{
+		suffix = L"_nya";
+	}
+
+	std::wstring outFileName(fileName);
+	outFileName = outFileName.substr(0, outFileName.find_last_of('.')) + suffix + L".y" + fileExt.substr(2);
+	
 	return OutputFile([&]()
 	{
 		auto tgt = rage::convert<TOutput*>((TInput*)blockMap->blocks[0].data);
@@ -110,8 +134,10 @@ static bool AutoConvert(TBlockMap blockMap, const std::wstring& fileName, int fi
 	}, fileVersion, outFileName);
 }
 
-static void ConvertBoundDict(rage::ny::pgDictionary<rage::ny::phBound>* dictionary, const std::wstring& fileName)
+template<typename TConfig>
+static void ConvertBoundDict(void* dictionaryRef, const std::wstring& fileName)
 {
+	auto dictionary = (typename TConfig::TBoundDict*)dictionaryRef;
 	std::wstring dirName = boost::filesystem::path(fileName).parent_path().wstring();
 
 	if (!dirName.empty())
@@ -142,9 +168,12 @@ struct GameConfig_NY
 
 	using StreamManager = rage::ny::pgStreamManager;
 	using TBound = rage::ny::datOwner<rage::ny::phBound>;
+	using TBoundDict = rage::ny::pgDictionary<rage::ny::phBound>;
 	using TDrawable = rage::ny::gtaDrawable;
 	using TTxd = rage::ny::pgDictionary<rage::ny::grcTexturePC>;
 	using TDwd = rage::ny::pgDictionary<rage::ny::gtaDrawable>;
+
+	constexpr const static bool HasBoundDicts = true;
 };
 
 struct GameConfig_Payne
@@ -156,9 +185,28 @@ struct GameConfig_Payne
 
 	using StreamManager = rage::payne::pgStreamManager;
 	using TBound = rage::payne::phBound;
+	using TBoundDict = rage::payne::pgDictionary<rage::payne::phBound>;
 	using TDrawable = rage::payne::gtaDrawable;
 	using TTxd = rage::payne::pgDictionary<rage::payne::grcTexturePC>;
 	using TDwd = rage::payne::pgDictionary<rage::payne::gtaDrawable>;
+
+	constexpr const static bool HasBoundDicts = true;
+};
+
+struct GameConfig_RDR3
+{
+	static auto UnwrapRSC(const wchar_t* fileName)
+	{
+		return rage::rdr3::UnwrapRSC8(fileName);
+	}
+
+	using StreamManager = rage::rdr3::pgStreamManager;
+	using TBound = rage::rdr3::phBound;
+	using TDrawable = rage::rdr3::gtaDrawable;
+	using TTxd = rage::rdr3::pgDictionary<rage::rdr3::grcTexturePC>;
+	using TDwd = rage::rdr3::pgDictionary<rage::rdr3::gtaDrawable>;
+
+	constexpr const static bool HasBoundDicts = false;
 };
 
 template<typename TConfig>
@@ -181,7 +229,7 @@ static void ConvertFile(const boost::filesystem::path& path)
 
 	int fileVersion = 0;
 
-	if (fileExt == L".wbn")
+	if (fileExt == L".wbn" || fileExt == L".obn" || fileExt == L".ybn")
 	{
 		wprintf(L"converting bound %s...\n", path.filename().c_str());
 
@@ -189,10 +237,12 @@ static void ConvertFile(const boost::filesystem::path& path)
 	}
 	else if (fileExt == L".wbd")
 	{
-		wprintf(L"converting bound dictionary %s...\n", path.filename().c_str());
+		if constexpr (typename TConfig::HasBoundDicts)
+		{
+			wprintf(L"converting bound dictionary %s...\n", path.filename().c_str());
 
-		ConvertBoundDict((rage::ny::pgDictionary<rage::ny::phBound>*)bm->blocks[0].data, fileName);
-		//AutoConvert<rage::five::pgDictionary<rage::five::phBound>, rage::ny::pgDictionary<rage::ny::phBound>>(bm, fileName, 43);
+			ConvertBoundDict<TConfig>(bm->blocks[0].data, fileName);
+		}
 	}
 	else if (fileExt == L".wft")
 	{
@@ -200,7 +250,7 @@ static void ConvertFile(const boost::filesystem::path& path)
 
 		AutoConvert<rage::five::gtaDrawable, rage::ny::fragType>(bm, fileName, 162, L".ydr");
 	}
-	else if (fileExt == L".wdr")
+	else if (fileExt == L".wdr" || fileExt == L".odr" || fileExt == L".ydr")
 	{
 		wprintf(L"converting drawable %s...\n", path.filename().c_str());
 
@@ -244,7 +294,7 @@ static void ConvertFile(const boost::filesystem::path& path)
 
 		AutoConvert<rage::five::pgDictionary<rage::five::gtaDrawable>, typename TConfig::TDwd>(bm, fileName, 165);
 	}
-	else if (fileExt == L".wtd")
+	else if (fileExt == L".wtd" || fileExt == L".otd")
 	{
 		wprintf(L"converting txd %s...\n", path.filename().c_str());
 
@@ -285,6 +335,7 @@ static void FormatsConvert_HandleArguments(boost::program_options::wcommand_line
 
 	cb();
 }
+#endif
 
 #include <zlib.h>
 
@@ -317,25 +368,38 @@ rage::five::BlockMap* UnwrapRSC7(const wchar_t* fileName, rage::five::ResourceFl
 
 	flags->version = version;
 
-    /*if (version != 165)
-    {
-        printf("not actually a supported file...\n");
+	auto fla = [](uint32_t flags)
+	{
+		auto s0 = ((flags >> 27) & 0x1) << 0; // 1 bit  - 27        (*1)
+		auto s1 = ((flags >> 26) & 0x1) << 1; // 1 bit  - 26        (*2)
+		auto s2 = ((flags >> 25) & 0x1) << 2; // 1 bit  - 25        (*4)
+		auto s3 = ((flags >> 24) & 0x1) << 3; // 1 bit  - 24        (*8)
+		auto s4 = ((flags >> 17) & 0x7F) << 4; // 7 bits - 17 - 23   (*16)   (max 127 * 16)
+		auto s5 = ((flags >> 11) & 0x3F) << 5; // 6 bits - 11 - 16   (*32)   (max 63  * 32)
+		auto s6 = ((flags >> 7) & 0xF) << 6; // 4 bits - 7  - 10   (*64)   (max 15  * 64)
+		auto s7 = ((flags >> 5) & 0x3) << 7; // 2 bits - 5  - 6    (*128)  (max 3   * 128)
+		auto s8 = ((flags >> 4) & 0x1) << 8; // 1 bit  - 4         (*256)
+		auto ss = ((flags >> 0) & 0xF); // 4 bits - 0  - 3
+		auto baseSize = 0x200 << (int)ss;
+		auto size = baseSize * (s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8);
+		return (int)size;
 
-        fclose(f);
-        return nullptr;
-    }*/
+	};
 
     uint32_t flag;
 
 	fread(&flag, 1, sizeof(flag), f);
 	flags->virtualFlag = flag;
 
-    uint32_t virtualSize = ((((flag >> 17) & 0x7f) + (((flag >> 11) & 0x3f) << 1) + (((flag >> 7) & 0xf) << 2) + (((flag >> 5) & 0x3) << 3) + (((flag >> 4) & 0x1) << 4)) * (0x2000 << (flag & 0xF)));
+    //uint32_t virtualSize = ((((flag >> 17) & 0x7f) + (((flag >> 11) & 0x3f) << 1) + (((flag >> 7) & 0xf) << 2) + (((flag >> 5) & 0x3) << 3) + (((flag >> 4) & 0x1) << 4)) * (0x2000 << (flag & 0xF)));
+	uint32_t virtualSize = fla(flag);
 
     fread(&flag, 1, sizeof(flag), f);
 	flags->physicalFlag = flag;
 
-    uint32_t physicalSize = ((((flag >> 17) & 0x7f) + (((flag >> 11) & 0x3f) << 1) + (((flag >> 7) & 0xf) << 2) + (((flag >> 5) & 0x3) << 3) + (((flag >> 4) & 0x1) << 4)) * (0x2000 << (flag & 0xF)));
+	uint32_t physicalSize = fla(flag);
+
+    //uint32_t physicalSize = ((((flag >> 17) & 0x7f) + (((flag >> 11) & 0x3f) << 1) + (((flag >> 7) & 0xf) << 2) + (((flag >> 5) & 0x3) << 3) + (((flag >> 4) & 0x1) << 4)) * (0x2000 << (flag & 0xF)));
 
     std::vector<uint8_t> tempBytes(virtualSize + physicalSize);
 
@@ -396,6 +460,7 @@ rage::five::BlockMap* UnwrapRSC7(const wchar_t* fileName, rage::five::ResourceFl
     return bm;
 }
 
+#ifdef GTA_FIVE
 static void FormatsConvert_Run(const boost::program_options::variables_map& map)
 {
 	if (map.count("filename") == 0)
@@ -443,7 +508,12 @@ static void FormatsConvert_Run(const boost::program_options::variables_map& map)
 		{
 			ConvertFile<GameConfig_Payne>(filePath);
 		}
+		else if (map["game"].as<std::wstring>() == L"rdr3")
+		{
+			ConvertFile<GameConfig_RDR3>(filePath);
+		}
 	}
 }
 
 static FxToolCommand formatsConvert("formats:convert", FormatsConvert_HandleArguments, FormatsConvert_Run);
+#endif

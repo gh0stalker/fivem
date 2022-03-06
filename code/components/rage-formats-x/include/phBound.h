@@ -19,6 +19,8 @@
 #define RAGE_FORMATS_ny_phBound 1
 #elif defined(RAGE_FORMATS_GAME_PAYNE)
 #define RAGE_FORMATS_payne_phBound 1
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+#define RAGE_FORMATS_rdr3_phBound 1
 #endif
 
 #if defined(RAGE_FORMATS_GAME_FIVE)
@@ -40,6 +42,20 @@ enum class phBoundType : uint8_t
 	Geometry = 4,
 	BVH = 8,
 	Composite = 10
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+	Sphere = 0,
+	Capsule,
+	TaperedCapsule,
+	Box,
+	Geometry,
+	BVH,
+	Composite,
+	Triangle,
+	Disc,
+	Cylinder,
+	Plane,
+	Unknown,
+	Ring
 #elif defined(RAGE_FORMATS_GAME_NY)
 	Sphere = 0,
 	Capsule = 1,
@@ -80,6 +96,15 @@ public:
 	{
 
 	}
+
+	inline phVector3(const Vector3& right)
+		: x(right.x), y(right.y), z(right.z)
+#ifdef RAGE_FORMATS_GAME_NY
+		  ,
+		  _pad(NAN)
+#endif
+	{
+	}
 };
 
 struct phBoundMaterial1
@@ -114,10 +139,16 @@ struct phBoundMaterial1
 	uint8_t walkablePath : 1;
 	uint8_t noCamCollision : 1;
 	uint8_t shootThroughFx : 1;
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+	uint8_t unk1;
+	uint8_t unk2;
+
+	uint8_t roomId : 5;
+	uint8_t unk3 : 3;
 #endif
 };
 
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 struct phBoundMaterial2
 {
 	uint8_t noDecal : 1;
@@ -137,13 +168,13 @@ struct phBoundMaterial
 {
 	phBoundMaterial1 mat1;
 
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 	phBoundMaterial2 mat2;
 #endif
 };
 
 class phBound
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 	: public pgBase
 #else
 	: public datBase
@@ -156,7 +187,7 @@ private:
 
 	float m_radius;
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uintptr_t m_pad;
 #elif defined(RAGE_FORMATS_GAME_PAYNE)
 #else
@@ -165,18 +196,18 @@ private:
 
 	phVector3 m_aabbMax;
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	float m_margin;
 #endif
 	phVector3 m_aabbMin;
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
-	uint32_t m_unkCount;
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	uint32_t m_refCount;
 #endif
 
 	phVector3 m_centroid;
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	phBoundMaterial1 m_material;
 #elif defined(RAGE_FORMATS_GAME_NY)
 	phVector3 m_unkVector;
@@ -184,7 +215,7 @@ private:
 
 	phVector3 m_cg; // center of gravity
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	phBoundMaterial2 m_material2;
 #endif
 
@@ -192,8 +223,8 @@ private:
 
 #if defined(RAGE_FORMATS_GAME_NY) || defined(RAGE_FORMATS_GAME_PAYNE)
 	float m_margin[3];
-	uint32_t m_unkCount;
-#elif defined(RAGE_FORMATS_GAME_FIVE)
+	uint32_t m_refCount;
+#elif defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	float m_unkFloat;
 #endif
 
@@ -205,13 +236,16 @@ public:
 
 		m_radius = 0;
 
-		m_unkCount = 1;
+		//m_refCount = 1;
+		m_refCount = 2;
 
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_material.materialIdx = 0;
+		m_material.roomId = 0;
+
+#if !defined(RAGE_FORMATS_GAME_RDR3)
 		m_material.pedDensity = 0;
 		m_material.proceduralId = 0;
-		m_material.roomId = 0;
 		m_material.stairs = 0;
 		m_material.seeThrough = 0;
 		m_material.blockClimb = 0;
@@ -233,6 +267,7 @@ public:
 		m_material2.unknown = 0;
 
 		m_pad = 0;
+#endif
 
 		m_unkFloat = 1.0f;
 
@@ -247,7 +282,7 @@ public:
 
 	inline void SetUnkVector(const phVector3& vector)
 	{
-#if defined(RAGE_FORMATS_GAME_FIVE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_unkVector2 = vector;
 #elif defined(RAGE_FORMATS_GAME_NY)
 		m_unkVector = vector;
@@ -291,7 +326,7 @@ public:
 #endif
 	}
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	inline void SetUnkFloat(float value)
 	{
 		m_unkFloat = value;
@@ -377,13 +412,13 @@ public:
 	{
 		SetType(phBoundType::Capsule);
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_halfHeight = 0;
 		memset(m_capsulePad, 0, sizeof(m_capsulePad));
 #endif
 	}
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 public:
 	inline float GetHalfHeight()
 	{
@@ -486,7 +521,16 @@ private:
 struct phBoundFlagEntry
 {
 	uint32_t m_0; // boundflags value?
+
+#if defined(RAGE_FORMATS_GAME_RDR3)
+	uint32_t pad;
+#endif
+
 	uint32_t m_4; // defaults to -1 during import, though other values are also seen
+
+#if defined(RAGE_FORMATS_GAME_RDR3)
+	uint32_t pad2;
+#endif
 };
 
 struct phBVHNode : public pgStreamableBase
@@ -496,7 +540,7 @@ struct phBVHNode : public pgStreamableBase
 
 	uint16_t m_escapeIndexOrTriangleIndex; // if leaf, the start in phBoundPolyhedron poly array; if node, the amount of child nodes, including this node
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uint16_t m_count; // 0 if node, >=1 if leaf
 #elif defined(RAGE_FORMATS_GAME_NY)
 	uint8_t m_count;  // 0 if node, >=1 if leaf
@@ -529,19 +573,24 @@ inline float fclamp(float val, float min, float max)
 
 class phBVH : public pgStreamableBase
 {
+#if defined(RAGE_FORMATS_GAME_RDR3) || defined(IS_RDR3)
+public:
+#else
 private:
+#endif
+#if !defined(RAGE_FORMATS_GAME_RDR3)
 	pgArray<phBVHNode, uint32_t> m_nodes;
 
 	uint32_t m_depth;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE)
 	uint32_t m_pad[3];
 #endif
 
 	Vector3 m_aabbMin;
 	Vector3 m_aabbMax;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE)
 	Vector3 m_center;
 #endif
 
@@ -549,13 +598,33 @@ private:
 	Vector3 m_scale;
 
 	pgArray<phBVHSubTree> m_subTrees;
+#else
+	phVector3 m_aabbMin;
+	uint32_t m_depth;
+
+	phVector3 m_aabbMax;
+	float m_pad0;
+
+	phVector3 m_center;
+	float m_pad1;
+
+	phVector3 m_divisor; // m_scale = (1.0f / m_divisor)
+	float m_pad2;
+
+	phVector3 m_scale;
+	float m_pad3;
+
+	pgArray<phBVHNode, uint32_t> m_nodes;
+#endif
 
 public:
 	inline phBVH()
 	{
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_depth = 0;
+#ifndef RAGE_FORMATS_GAME_RDR3
 		m_pad[0] = 0;
+#endif
 
 		m_aabbMin = { FLT_MIN, FLT_MIN, FLT_MIN };
 		m_aabbMax = { FLT_MAX, FLT_MAX, FLT_MAX };
@@ -567,9 +636,12 @@ public:
 	inline void SetBVH(uint32_t numNodes, phBVHNode* nodes, uint32_t numSubTrees, phBVHSubTree* subTrees)
 	{
 		m_nodes.SetFrom(nodes, numNodes);
-		m_subTrees.SetFrom(subTrees, numSubTrees);
+
+		if (subTrees && numSubTrees)
+		{
+			m_subTrees.SetFrom(subTrees, numSubTrees);
+		}
 	}
-#endif
 
 	inline void SetAABB(const Vector3& aabbMin, const Vector3& aabbMax)
 	{
@@ -584,8 +656,26 @@ public:
 		m_divisor = { 65534.0f / size.x, 65534.0f / size.y, 65534.0f / size.z };
 		m_scale = { 1.0f / m_divisor.x, 1.0f / m_divisor.y, 1.0f / m_divisor.z };
 	}
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+	inline void SetBVH(uint32_t numNodes, phBVHNode* nodes)
+	{
+		m_nodes.SetFrom(nodes, numNodes);
+	}
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+	inline void SetAABB(const Vector3& aabbMin, const Vector3& aabbMax)
+	{
+		m_aabbMin = aabbMin;
+		m_aabbMax = aabbMax;
+
+		m_center = { (aabbMax.x + aabbMin.x) / 2.0f, (aabbMax.y + aabbMin.y) / 2.0f, (aabbMax.z + aabbMin.z) / 2.0f };
+
+		Vector3 size = { aabbMax.x - aabbMin.x, aabbMax.y - aabbMin.y, aabbMax.z - aabbMin.z };
+		m_divisor = { 65534.0f / size.x, 65534.0f / size.y, 65534.0f / size.z };
+		m_scale = { 1.0f / m_divisor.x, 1.0f / m_divisor.y, 1.0f / m_divisor.z };
+	}
+#endif
+
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	inline Vector3 Quantize(const Vector3& pos)
 	{
 		return
@@ -624,7 +714,10 @@ public:
 	inline void Resolve(BlockMap* blockMap = nullptr)
 	{
 		m_nodes.Resolve(blockMap);
+
+#ifndef RAGE_FORMATS_GAME_RDR3
 		m_subTrees.Resolve(blockMap);
+#endif
 	}
 };
 
@@ -660,8 +753,10 @@ private:
 	pgPtr<Matrix3x4> m_childMatrices;
 	pgPtr<Matrix3x4> m_childMatricesInternal; // copied from child matrices, only if 'allowinternalmotion:' is set
 
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
+#ifndef RAGE_FORMATS_GAME_RDR3
 	pgPtr<phBoundAABB> m_childAABBs;
+#endif
 
 	pgPtr<phBoundFlagEntry> m_boundFlags; // not set by V import function; might be finalbuild cut, Payne does set it but doesn't do much else with it; still set in V data files
 
@@ -742,6 +837,7 @@ public:
 		m_childMatricesInternal = outData;
 	}
 
+#if !defined(RAGE_FORMATS_GAME_RDR3)
 	inline phBoundAABB* GetChildAABBs()
 	{
 #if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
@@ -753,7 +849,7 @@ public:
 
 	inline void SetChildAABBs(uint16_t count, phBoundAABB* data)
 	{
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 		phBoundAABB* outData = new(false) phBoundAABB[count];
 
 		memcpy(outData, data, sizeof(phBoundAABB) * count);
@@ -763,8 +859,9 @@ public:
 		m_childArray.SetFrom(data, count);
 #endif
 	}
+#endif
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	inline phBoundFlagEntry* GetBoundFlags()
 	{
 		return *m_boundFlags;
@@ -790,10 +887,15 @@ public:
 	{
 		struct  
 		{
+#ifdef RAGE_FORMATS_GAME_RDR3
+			uint32_t typePad : 24;
+			uint32_t type : 3;
+#else
 #ifdef RAGE_FORMATS_GAME_FIVE
 			uint32_t type : 3; // 0: triangle, 1: sphere, 2: capsule, 3: box, 4: cylinder
 #else
 			uint32_t type : 2; // 0: triangle, 1: sphere, 2: capsule, 3: box
+#endif
 #endif
 		};
 
@@ -864,10 +966,11 @@ private:
 
 	pgPtr<void> m_unkPtr1;
 
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uint16_t m_unkShort1;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	// octant map
 	uint8_t m_numUnksPerVertex; // can be 0 without any ill effect, it seems
 #endif
 
@@ -887,10 +990,10 @@ private:
 	pgPtr<void> m_vertexUnks;
 #endif
 
-#ifdef RAGE_FORMATS_GAME_FIVE
-	pgPtr<void> m_unkPtr3;
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	pgPtr<void> m_octantData;
 
-	pgPtr<pgPtr<void>> m_unkPtr4;
+	pgPtr<pgPtr<void>> m_octants;
 #elif defined(RAGE_FORMATS_GAME_NY)
 	uint8_t m_val;
 	uint8_t m_polyPad[3];
@@ -901,7 +1004,7 @@ private:
 	uint32_t m_numVertices;
 	uint32_t m_numPolys;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uint64_t m_unkVal1;
 	uint64_t m_unkVal2;
 	uint64_t m_unkVal3;
@@ -913,7 +1016,7 @@ public:
 	inline phBoundPolyhedron()
 		: phBound()
 	{
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_unkVal1 = 0;
 		m_unkVal2 = 0;
 		m_unkVal3 = 0;
@@ -965,7 +1068,7 @@ public:
 		m_vertices = data;
 		m_numVertices = numVertices;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_numVerticesShort = numVertices;
 #endif
 	}
@@ -1002,8 +1105,8 @@ public:
 #endif
 
 #ifdef RAGE_FORMATS_GAME_FIVE
-		m_unkPtr3.Resolve(blockMap);
-		m_unkPtr4.Resolve(blockMap);
+		m_octantData.Resolve(blockMap);
+		m_octants.Resolve(blockMap);
 #endif
 	}
 
@@ -1016,6 +1119,14 @@ public:
 	{
 		return *m_polyEntries;
 	}
+
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	inline void ClearOctantMap()
+	{
+		m_octants = nullptr;
+		m_octantData = nullptr;
+	}
+#endif
 };
 
 class phBoundGeometry : public phBoundPolyhedron
@@ -1023,7 +1134,7 @@ class phBoundGeometry : public phBoundPolyhedron
 private:
 	pgPtr<phBoundMaterial> m_materials;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	pgPtr<uint32_t> m_materialColors;
 
 	uintptr_t m_pad1;
@@ -1043,7 +1154,7 @@ private:
 
 	uint8_t m_numMaterials;
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uint8_t m_numMaterialColors;
 
 	uint32_t m_pad2;
@@ -1061,7 +1172,7 @@ public:
 	{
 		SetType(phBoundType::Geometry);
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_pad1 = 0;
 		m_numSecondSurfaceVertices = 0;
 		m_numMaterials = 0;
@@ -1073,7 +1184,12 @@ public:
 #endif
 	}
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
+	inline uint32_t* GetMaterialColors()
+	{
+		return *m_materialColors;
+	}
+
 	inline void SetMaterialColors(uint8_t count, const uint32_t* inColors)
 	{
 		uint32_t* colors = (uint32_t*)pgStreamManager::Allocate(count * sizeof(uint32_t), false, nullptr);
@@ -1144,7 +1260,7 @@ class phBoundBVH : public phBoundGeometry
 private:
 	pgPtr<phBVH> m_bvh;
 
-#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE)
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_PAYNE) || defined(RAGE_FORMATS_GAME_RDR3)
 	uint64_t m_unkBvhPtr1;
 
 	uint16_t m_unkBvhShort1;
@@ -1158,7 +1274,7 @@ public:
 	inline phBoundBVH()
 		: phBoundGeometry()
 	{
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE) || defined(RAGE_FORMATS_GAME_RDR3)
 		m_unkBvhShort1 = 0xFFFF;
 		m_unkBvhPtr1 = 0;
 #endif

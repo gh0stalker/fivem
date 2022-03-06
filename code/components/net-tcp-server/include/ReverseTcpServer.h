@@ -31,9 +31,9 @@ public:
 
 	virtual void Close() override;
 
-	virtual void Write(const std::vector<uint8_t>& data) override;
+	virtual void Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete) override;
 
-	virtual void ScheduleCallback(const TScheduledCallback& callback) override;
+	virtual void ScheduleCallback(TScheduledCallback&& callback, bool performInline) override;
 
 protected:
 	void ConsumeData(const void* data, size_t length);
@@ -46,7 +46,7 @@ private:
 
 	std::shared_ptr<uvw::AsyncHandle> m_writeCallback;
 
-	tbb::concurrent_queue<std::function<void()>> m_pendingRequests;
+	tbb::concurrent_queue<TScheduledCallback> m_pendingRequests;
 };
 
 class TcpServerManager;
@@ -67,12 +67,16 @@ private:
 
 	void Reconnect();
 
+	void ReconnectWithPeer(const net::PeerAddress& peer);
+
 private:
 	TcpServerManager* m_manager;
 
 	std::shared_ptr<uvw::TimerHandle> m_reconnectTimer;
 
 	std::shared_ptr<uvw::TCPHandle> m_control;
+
+	std::shared_ptr<uvw::GetAddrInfoReq> m_addr;
 
 	std::shared_ptr<uvw::Loop> m_loop;
 

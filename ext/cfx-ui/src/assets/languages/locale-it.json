@@ -1,5 +1,5 @@
 {
-	"#ExitToDesktop": "Torna al desktop",
+    "#ExitToDesktop": "Torna al desktop",
     "#ServerList_Name": "Nome",
     "#ServerList_Players": "Giocatori",
     "#ServerList_Ping": "Ping",
@@ -33,7 +33,7 @@
     "#Settings_DarkThemeDesc": "usa un \"tema\" \"scuro\" per l'interfaccia",
     "#Settings_DevMode": "Modalità Sviluppatore",
     "#Settings_DevModeDesc": "Abilita l'opzione menu \"localhost\"",
-    "#Settings_Account": "Account FiveM connesso",
+    "#Settings_Account": "Account Cfx.re connesso",
     "#Settings_AccountLink": "Collega",
     "#Settings_AccountLinked": "Collegato: {{ username }}",
     "#Settings_Boost": "BOOST™ Del Server Corrente",
@@ -44,7 +44,7 @@
     "#Settings_MenuAudioDesc": "Attiva musica di sottofondo mentre inattivo nel menu principale",
     "#Settings_GameStreamProgress": "Progresso streaming",
     "#Settings_GameStreamProgressDesc": "Mostra i progressi mentre si stanno scaricando assets di gioco in streaming (BETA™)",
-	"#DirectConnect_TimedOut": "La richiesta al server è scaduta.",
+    "#DirectConnect_TimedOut": "La richiesta al server è scaduta.",
     "#DirectConnect_Failed": "Richiesta al server fallita.",
     "#DirectConnect_Loading": "Caricamento",
     "#DirectConnect_ServerInvalid": "Non è stato possibile trovare il server",
@@ -59,8 +59,11 @@
     "#ServerDetail_DelFavorite": "Elimina preferito",
     "#ServerDetail_Refresh": "Aggiorna",
     "#ServerDetail_ScriptHook": "Script del client permessi",
-    "#ServerDetail_OneSync": "Prototipo OneSync",
+    "#ServerDetail_OneSync": "OneSync",
     "#ServerDetail_Premium": "Livello sostenitore FiveM",
     "#Yes": "Si",
-    "#No": "No"
+    "#No": "No",
+    "#BottomNav_Create": "Crea",
+    "#BottomNav_Story": "Storia",
+    "#BottomNav_Play": "Gioca"
 }

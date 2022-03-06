@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <shared_mutex>
 #include <VFSDevice.h>
 
 #ifdef COMPILING_VFS_CORE
@@ -64,7 +65,9 @@ namespace vfs
 
 		Header2 m_header;
 
-		HandleData m_handles[32];
+		std::vector<HandleData> m_handles;
+
+		std::shared_mutex m_handlesMutex;
 
 		std::vector<Entry> m_entries;
 
@@ -78,6 +81,8 @@ namespace vfs
 		const Entry* FindEntry(const std::string& path);
 
 		void FillFindData(FindData* data, const Entry* entry);
+
+		size_t GetLengthForHandle(THandle handle);
 
 	public:
 		RagePackfile();
@@ -112,5 +117,7 @@ namespace vfs
 
 	public:
 		bool OpenArchive(const std::string& archivePath);
+
+		bool OpenArchive(const std::string& archivePath, std::string* errorState);
 	};
 }

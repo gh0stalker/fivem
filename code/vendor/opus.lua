@@ -18,13 +18,20 @@ return {
 
 		defines { 'USE_ALLOCA', 'inline=__inline', 'OPUS_BUILD' }
 
+		if os.istarget('windows') then
+			defines { 'WIN32' }
+		end
+
 		files_project '../vendor/libopus/' {
 			'src/analysis.c',
 			'src/mlp.c',
 			'src/mlp_data.c',
 	        'src/opus.c',
+	        'src/opus_multistream.c',
 	        'src/opus_decoder.c',
+	        'src/opus_multistream_decoder.c',
 	        'src/opus_encoder.c',
+	        'src/opus_multistream_encoder.c',
 	        'src/repacketizer.c',
 	        'celt/bands.c',
 	        'celt/celt.c',

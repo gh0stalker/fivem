@@ -25,7 +25,13 @@ private:
 	std::unordered_map<std::string, fwRefContainer<UvLoopHolder>> m_uvLoops;
 
 public:
+	fwRefContainer<UvLoopHolder> Get(const std::string& loopTag);
+
 	fwRefContainer<UvLoopHolder> GetOrCreate(const std::string& loopTag);
+
+	fwRefContainer<UvLoopHolder> GetCurrent();
+
+	void SetCurrent(UvLoopHolder* holder);
 
 	void Disown(const std::string& loopTag);
 };

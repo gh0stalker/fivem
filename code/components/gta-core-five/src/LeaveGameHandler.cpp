@@ -8,8 +8,16 @@
 #include "StdInc.h"
 #include "Hooking.h"
 
+#include <CrossBuildRuntime.h>
 #include <GlobalEvents.h>
 #include <GameInit.h>
+
+static void DoKill()
+{
+	OnKillNetwork("Disconnected.");
+
+	OnMsgConfirm();
+}
 
 static void(*g_origTrigger)(uint32_t, uint32_t, uint32_t);
 
@@ -18,14 +26,17 @@ static void CustomTrigger(uint32_t trigger, uint32_t a2, uint32_t a3)
 	// account picker
 	if (trigger == 145)
 	{
-		OnKillNetwork("Disconnected.");
-
-		OnMsgConfirm();
+		DoKill();
 
 		return;
 	}
 
 	g_origTrigger(trigger, a2, a3);
+}
+
+static void ReplayEditorExit()
+{
+	DoKill();
 }
 
 static HookFunction hookFunction([] ()
@@ -35,4 +46,11 @@ static HookFunction hookFunction([] ()
 
 	hook::set_call(&g_origTrigger, call);
 	hook::call(call, CustomTrigger);
+
+	// same for R* editor exit
+	if (!Is372())
+	{
+		auto location = hook::get_pattern<char>("E8 ? ? ? ? 83 3D ? ? ? ? 08 75 05 E8", 0x1A);
+		hook::call(location, ReplayEditorExit);
+	}
 });

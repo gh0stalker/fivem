@@ -10,8 +10,9 @@
 		"citizen:scripting:mono",
 		"vfs:impl:server",
 		"vendor:cpr",
+		"vendor:citizen_util",
+		"vendor:citizen_enet",
 		"vendor:curl",
-		"vendor:enet",
 		"vendor:tbb",
 		"vendor:boost_random",
 		"vendor:linenoise",
@@ -19,9 +20,14 @@
 		"vendor:lz4",
 		"vendor:glm",
 		"vendor:eastl",
-		"vendor:slikenet",
 		"vendor:thread-pool-cpp",
-		"vendor:utfcpp"
+		"vendor:utfcpp",
+		"vendor:breakpad",
+		"vendor:prometheus-cpp",
+		"vendor:folly",
+		"vendor:concurrentqueue",
+		"vendor:xenium",
+		"vendor:rocksdb"
 	],
 	"provides": []
 }

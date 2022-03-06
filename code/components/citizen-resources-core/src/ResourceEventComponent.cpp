@@ -13,6 +13,8 @@
 
 #include <msgpack.hpp>
 
+#include <DebugAlias.h>
+
 static inline bool IsServer()
 {
 #ifdef IS_FXSERVER
@@ -38,33 +40,73 @@ void ResourceEventComponent::AttachToObject(Resource* object)
 	// start/stop handling events
 	object->OnBeforeStart.Connect([=] ()
 	{
-		// pack the resource name
-		msgpack::sbuffer buf;
-		msgpack::packer<msgpack::sbuffer> packer(buf);
-
-		// array of a single string
-		packer.pack_array(1);
-		packer.pack(m_resource->GetName());
-
-		// send the event out to the world
-		std::string event(buf.data(), buf.size());
-
-		return m_managerComponent->TriggerEvent("onResourceStarting", event);
+		/*NETEV onResourceStarting SHARED
+		/#*
+		 * An event that is triggered when a resource is trying to start.
+		 *
+		 * This can be canceled to prevent the resource from starting.
+		 *
+		 * @param resource - The name of the resource that is trying to start.
+		 #/
+		declare function onResourceStarting(resource: string): void;
+		*/
+		return m_managerComponent->TriggerEvent2("onResourceStarting", {}, m_resource->GetName());
 	}, -10000);
 
 	object->OnStart.Connect([=] ()
 	{
+		/*NETEV onClientResourceStart CLIENT
+		/#*
+		 * An event that is *queued* after a resource has started.
+		 *
+		 * @param resource - The name of the resource that has started.
+		 #/
+		declare function onClientResourceStart(resource: string): void;
+		*/
+		/*NETEV onServerResourceStart SERVER
+		/#*
+		 * An event that is *queued* after a resource has started.
+		 *
+		 * @param resource - The name of the resource that has started.
+		 #/
+		declare function onServerResourceStart(resource: string): void;
+		*/
+
 		// on[type]ResourceStart is queued so that clients will only run it during the first tick
 		m_managerComponent->QueueEvent2(fmt::sprintf("on%sResourceStart", IsServer() ? "Server" : "Client"), {}, m_resource->GetName());
 	});
 
 	object->OnStart.Connect([=]()
 	{
+		/*NETEV onResourceStart SHARED
+		/#*
+		 * An event that is triggered *immediately* when a resource has started.
+		 *
+		 * @param resource - The name of the resource that just started.
+		 #/
+		declare function onResourceStart(resource: string): void;
+		*/
 		m_managerComponent->TriggerEvent2("onResourceStart", {}, m_resource->GetName());
 	}, 99999);
 
 	object->OnStop.Connect([=] ()
 	{
+		/*NETEV onClientResourceStop CLIENT
+		/#*
+		 * An event that is triggered after a resource has stopped.
+		 *
+		 * @param resource - The name of the resource that has stopped.
+		 #/
+		declare function onClientResourceStop(resource: string): void;
+		*/
+		/*NETEV onServerResourceStop SERVER
+		/#*
+		 * An event that is triggered after a resource has stopped.
+		 *
+		 * @param resource - The name of the resource that has stopped.
+		 #/
+		declare function onServerResourceStop(resource: string): void;
+		*/
 		m_managerComponent->QueueEvent2(fmt::sprintf("on%sResourceStop", IsServer() ? "Server" : "Client"), {}, m_resource->GetName());
 	});
 
@@ -75,43 +117,27 @@ void ResourceEventComponent::AttachToObject(Resource* object)
 
 	object->OnStop.Connect([=]()
 	{
+		/*NETEV onResourceStop SHARED
+		/#*
+		 * An event that is triggered *immediately* when a resource is stopping.
+		 *
+		 * @param resource - The name of the resource that is stopping.
+		 #/
+		declare function onResourceStop(resource: string): void;
+		*/
 		m_managerComponent->TriggerEvent2("onResourceStop", {}, m_resource->GetName());
 	}, -99999);
-
-	object->OnTick.Connect([=] ()
-	{
-		// take queued events and trigger them
-		while (!m_eventQueue.empty())
-		{
-			// get the event
-			EventData event;
-
-			if (m_eventQueue.try_pop(event))
-			{
-				// and trigger it
-				bool canceled = false;
-
-				HandleTriggerEvent(event.eventName, event.eventPayload, event.eventSource, &canceled);
-			}
-		}
-	});
 }
 
 void ResourceEventComponent::HandleTriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled)
 {
+	// trigger event
 	OnTriggerEvent(eventName, eventPayload, eventSource, eventCanceled);
 }
 
 void ResourceEventComponent::QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource /* = std::string() */)
 {
-	EventData event;
-	event.eventName = eventName;
-	event.eventPayload = eventPayload;
-	event.eventSource = eventSource;
-
-	{
-		m_eventQueue.push(event);
-	}
+	m_managerComponent->QueueEvent(eventName, eventPayload, eventSource, this);
 }
 
 ResourceEventManagerComponent::ResourceEventManagerComponent()
@@ -130,7 +156,7 @@ void ResourceEventManagerComponent::Tick()
 		if (m_eventQueue.try_pop(event))
 		{
 			// and trigger it
-			TriggerEvent(event.eventName, event.eventPayload, event.eventSource);
+			TriggerEvent(event.eventName, event.eventPayload, event.eventSource, event.filter);
 		}
 	}
 }
@@ -138,7 +164,7 @@ void ResourceEventManagerComponent::Tick()
 static thread_local bool g_wasLastEventCanceled;
 static thread_local std::stack<bool*> g_eventCancelationStack;
 
-bool ResourceEventManagerComponent::TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource /* = std::string() */)
+bool ResourceEventManagerComponent::TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource /* = std::string() */, ResourceEventComponent* filter /* = nullptr*/)
 {
 	// add a value to signify event cancelation
 	bool eventCanceled = false;
@@ -153,6 +179,14 @@ bool ResourceEventManagerComponent::TriggerEvent(const std::string& eventName, c
 	{
 		// get the event component
 		const fwRefContainer<ResourceEventComponent>& eventComponent = resource->GetComponent<ResourceEventComponent>();
+
+		if (filter)
+		{
+			if (eventComponent.GetRef() != filter)
+			{
+				return;
+			}
+		}
 
 		// if there's none, return
 		if (!eventComponent.GetRef())
@@ -188,19 +222,23 @@ void ResourceEventManagerComponent::CancelEvent()
 	}
 }
 
-void ResourceEventManagerComponent::QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource /* = std::string() */)
+void ResourceEventManagerComponent::QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource /* = std::string() */, ResourceEventComponent* filter)
 {
 	EventData event;
 	event.eventName = eventName;
 	event.eventPayload = eventPayload;
 	event.eventSource = eventSource;
+	event.filter = filter;
 
 	{
 		m_eventQueue.push(event);
 	}
 
-	// trigger global handlers for the queued event
-	OnQueueEvent(eventName, eventPayload, eventSource);
+	if (!filter)
+	{
+		// trigger global handlers for the queued event
+		OnQueueEvent(eventName, eventPayload, eventSource);
+	}
 }
 
 void ResourceEventManagerComponent::AttachToObject(ResourceManager* object)
@@ -210,6 +248,11 @@ void ResourceEventManagerComponent::AttachToObject(ResourceManager* object)
 	m_manager->OnTick.Connect([=] ()
 	{
 		this->Tick();
+	});
+
+	m_manager->OnAfterReset.Connect([this]()
+	{
+		m_eventQueue.clear();
 	});
 }
 

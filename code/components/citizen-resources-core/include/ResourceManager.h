@@ -16,6 +16,9 @@
 
 #include <ComponentHolder.h>
 
+#include <rapidjson/document.h>
+#include <tl/expected.hpp>
+
 #include <msgpack.hpp>
 
 #ifdef COMPILING_CITIZEN_RESOURCES_CORE
@@ -73,6 +76,11 @@ public:
 	virtual pplx::task<fwRefContainer<Resource>> AddResource(const std::string& uri) = 0;
 
 	//
+	// Adds a resource to the resource manager from the passed resource URI, returning a tl::expected.
+	//
+	virtual pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> AddResourceWithError(const std::string& uri) = 0;
+
+	//
 	// Gets the mounter that is responsible for handling a particular resource URI.
 	//
 	virtual fwRefContainer<ResourceMounter> GetMounterForUri(const std::string& uri) = 0;
@@ -80,7 +88,7 @@ public:
 	//
 	// Obtains a reference to the resource with the passed identity string.
 	//
-	virtual fwRefContainer<Resource> GetResource(const std::string& identifier) = 0;
+	virtual fwRefContainer<Resource> GetResource(const std::string& identifier, bool withProvides = true) = 0;
 
 	//
 	// Iterates over all registered resources.
@@ -105,7 +113,7 @@ public:
 	//
 	// For use in resource mounters, creates a resource with the passed identity.
 	//
-	virtual fwRefContainer<Resource> CreateResource(const std::string& resourceName) = 0;
+	virtual fwRefContainer<Resource> CreateResource(const std::string& resourceName, const fwRefContainer<ResourceMounter>& mounter) = 0;
 
 	//
 	// Executes a single tick for the resource manager.
@@ -116,12 +124,6 @@ public:
 	// Makes this resource manager the current resource manager.
 	//
 	virtual void MakeCurrent() = 0;
-
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
 
 public:
 	//
@@ -144,7 +146,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		std::string retval = CallReferenceInternal(functionReference, std::string(buf.data(), buf.size()));
 
@@ -159,6 +161,10 @@ public:
 
 public:
 	fwEvent<> OnTick;
+
+	fwEvent<> OnAfterReset;
+
+	fwEvent<rapidjson::Document&> OnContentManifestDownloaded;
 
 public:
 	//

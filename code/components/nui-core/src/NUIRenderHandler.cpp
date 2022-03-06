@@ -13,19 +13,21 @@
 
 #include "memdbgon.h"
 
+#include <CrossBuildRuntime.h>
+
 extern OsrImeHandlerWin* g_imeHandler;
 
 NUIRenderHandler::NUIRenderHandler(NUIClient* client)
 	: m_paintingPopup(false), m_owner(client), m_currentDragOp(DRAG_OPERATION_NONE)
 {
-	auto hWnd = FindWindow(L"grcWindow", nullptr);
-	m_dropTarget = DropTargetWin::Create(this, hWnd);
+	auto hWnd = CoreGetGameWindow();
 
-	HRESULT hr = RegisterDragDrop(hWnd, m_dropTarget);
-	if (FAILED(hr))
-	{
-		trace("registering drag/drop failed. hr: %08x\n", hr);
-	}
+	m_dropTarget = DropTargetWin::Create(this, hWnd);
+}
+
+NUIRenderHandler::~NUIRenderHandler()
+{
+	m_dropTarget->CancelCallback();
 }
 
 void NUIRenderHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect)
@@ -34,6 +36,11 @@ void NUIRenderHandler::GetViewRect(CefRefPtr<CefBrowser> browser, CefRect& rect)
 	{
 		NUIWindow* window = m_owner->GetWindow();
 		rect.Set(0, 0, window->GetWidth(), window->GetHeight());
+	}
+	else
+	{
+		// this function *must* succeed, default to 1280x720
+		rect.Set(0, 0, 1280, 720);
 	}
 }
 
@@ -81,7 +88,10 @@ void NUIRenderHandler::OnPaint(CefRefPtr<CefBrowser> browser, PaintElementType t
 		UpdatePopup();
 
 		// mark the render buffer as dirty
-		m_owner->GetWindow()->MarkRenderBufferDirty();
+		if (auto w = m_owner->GetWindow())
+		{
+			w->MarkRenderBufferDirty();
+		}
 
 		// unlock the lock
 		lock.unlock();
@@ -170,11 +180,18 @@ void NUIRenderHandler::UpdatePopup()
 void NUIRenderHandler::PaintView(const RectList& dirtyRects, const void* buffer, int width, int height)
 {
 	NUIWindow* window = m_owner->GetWindow();
+	auto lock = window->GetRenderBufferLock();
 	void* renderBuffer = window->GetRenderBuffer();
 	int roundedWidth = window->GetRoundedWidth();
+	int wheight = window->GetHeight();
 
 	for (auto& rect : dirtyRects)
 	{
+		if ((rect.x + rect.width) > roundedWidth || (rect.y + rect.height) > wheight)
+		{
+			continue;
+		}
+
 		{
 			for (int y = rect.y; y < (rect.y + rect.height); y++)
 			{
@@ -257,7 +274,7 @@ bool NUIRenderHandler::StartDragging(CefRefPtr<CefBrowser> browser, CefRefPtr<Ce
 	m_currentDragOp = DRAG_OPERATION_NONE;
 	POINT pt = {};
 	GetCursorPos(&pt);
-	ScreenToClient(FindWindow(L"grcWindow", nullptr), &pt);
+	ScreenToClient(CoreGetGameWindow(), &pt);
 
 	browser->GetHost()->DragSourceEndedAt(
 		pt.x,

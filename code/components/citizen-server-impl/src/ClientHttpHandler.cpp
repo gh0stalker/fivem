@@ -4,9 +4,10 @@
 #include <ClientHttpHandler.h>
 
 #include <CoreConsole.h>
-#include <pplx/threadpool.h>
+#include <thread_pool.hpp>
 
 #include <json.hpp>
+#include <rapidjson/writer.h>
 
 using json = nlohmann::json;
 
@@ -14,33 +15,16 @@ static std::shared_ptr<ConVar<bool>> g_threadedHttpVar;
 
 namespace fx
 {
-	auto ClientMethodRegistry::GetHandler(const std::string& method) -> std::optional<THandler>
+	auto ClientMethodRegistry::GetHandler(const std::string& method) -> std::optional<std::variant<THandler<TCallback>, THandler<TCallbackFast>>>
 	{
 		auto it = m_methods.find(method);
 
-		return (it == m_methods.end()) ? std::optional<THandler>() : it->second;
-	}
-
-	void ClientMethodRegistry::AddHandler(const std::string& method, const THandler& handler)
-	{
-		m_methods.insert({ method, handler });
-	}
-
-	void ClientMethodRegistry::AddAfterFilter(const std::string& method, const TFilter& handler)
-	{
-		auto it = m_methods.find(method);
-
-		assert(it != m_methods.end());
-
-		auto lastValue = it->second;
-
-		it->second = [=](const std::map<std::string, std::string>& a1, const fwRefContainer<net::HttpRequest>& a2, const TCallback& a3)
+		if (it != m_methods.end())
 		{
-			lastValue(a1, a2, [=](const json& data)
-			{
-				handler(data, a1, a2, a3);
-			});
-		};
+			return it->second;
+		}
+
+		return {};
 	}
 
 	std::map<std::string, std::string> ParsePOSTString(const std::string_view& postDataString)
@@ -116,21 +100,56 @@ namespace fx
 
 				auto runTask = [=]()
 				{
-					(*handler)(postMap, request, [response](const json& data)
+					if (handler->index() == 0)
 					{
-						if (data.is_null())
+						(std::get<0>(*handler))(postMap, request, [response](const json& data)
 						{
-							response->End();
-							return;
-						}
+							if (data.is_null())
+							{
+								response->End();
+								return;
+							}
 
-						response->Write(data.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n");
-					});
+							response->Write(data.dump(-1, ' ', false, json::error_handler_t::replace) + "\r\n");
+						});
+					}
+					else if (handler->index() == 1)
+					{
+						(std::get<1>(*handler))(postMap, request, [response](const rapidjson::Document& data)
+						{
+							if (data.IsNull())
+							{
+								response->End();
+								return;
+							}
+
+							rapidjson::StringBuffer sb;
+							rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+
+							if (!data.Accept(writer))
+							{
+								response->End();
+								return;
+							}
+
+							sb.Put('\r');
+							sb.Put('\n');
+
+							// for TCP write timeout bits, write this in chunks
+							constexpr size_t kChunkSize = 16384;
+
+							for (size_t i = 0; i < sb.GetLength(); i += kChunkSize)
+							{
+								response->Write(std::string{ sb.GetString() + i, std::min(kChunkSize, sb.GetLength() - i) });
+							}
+						});
+					}
 				};
 
 				if (g_threadedHttpVar->GetValue())
 				{
-					crossplat::threadpool::shared_instance().service().post(runTask);
+					static tp::ThreadPool tg;
+					tg.post(runTask);
 				}
 				else
 				{

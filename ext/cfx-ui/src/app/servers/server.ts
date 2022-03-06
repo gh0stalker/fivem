@@ -6,7 +6,6 @@ import { master } from './master';
 import { Avatar } from './avatar';
 
 export class Server {
-    readonly address: string;
     readonly hostname: string;
     readonly sortname: string;
     readonly strippedname: string;
@@ -14,25 +13,79 @@ export class Server {
     readonly data: any;
     readonly int: master.IServerData;
 
+    connectEndPoints: string[];
+    address: string;
+
+	private _live: boolean;
+
+	iconNeedsResolving = true;
+	cachedResolvedIcon: HTMLImageElement;
+
+    bitmap: ImageBitmap;
     onChanged = new EventEmitter<void>();
 
     realIconUri: string;
 
     get iconUri(): string {
+		if (!this.realIconUri) {
+			this.setDefaultIcon();
+		}
+
         return this.realIconUri;
     }
 
     set iconUri(value: string) {
         this.realIconUri = value;
-        this.sanitizedUri = this.sanitizer.bypassSecurityTrustUrl(value);
-        this.sanitizedStyleUri = this.sanitizer.bypassSecurityTrustStyle('url(' + value + ')');
-    }
+
+        if (this.sanitizer) {
+            this.sanitizedUri = this.sanitizer.bypassSecurityTrustUrl(value);
+            this.sanitizedStyleUri = this.sanitizer.bypassSecurityTrustStyle('url(' + value + ')');
+        }
+	}
+
+	get premium(): string {
+		return this.data?.vars?.premium || '';
+	}
 
     sanitizedUri: any;
     sanitizedStyleUri: any;
     currentPlayers: number;
     ping = 9999;
     upvotePower = 0;
+	burstPower = 0;
+    isDefaultIcon = false;
+
+    public static fromObject(sanitizer: DomSanitizer, address: string, object: master.IServerData): Server {
+        return new Server(sanitizer, address, object);
+    }
+
+    public static fromNative(sanitizer: DomSanitizer, object: any): Server {
+        const mappedData = {
+            hostname: object.name || object.hostname,
+            clients: object.clients,
+            svMaxclients: object.maxclients ?? object.sv_maxclients,
+            resources: [],
+            mapname: object.mapname,
+            gametype: object.gametype
+        };
+
+        const server = new Server(sanitizer, object.addr, { ...object.infoBlob || {}, ...object, ...mappedData });
+
+        if (object.infoBlob) {
+            if (object.infoBlob.icon) {
+                server.iconUri = 'data:image/png;base64,' + object.infoBlob.icon;
+            }
+        }
+
+        return server;
+    }
+
+    public setDefaultIcon() {
+        const svg = Avatar.getFor(this.address);
+
+        this.iconUri = `data:image/svg+xml,${encodeURIComponent(svg)}`;
+        this.isDefaultIcon = true;
+    }
 
     public updatePing(newValue: number): void {
         this.ping = newValue;
@@ -55,32 +108,14 @@ export class Server {
         }
     }
 
-    public static fromObject(sanitizer: DomSanitizer, address: string, object: master.IServerData): Server {
-        return new Server(sanitizer, address, object);
-    }
-
-    public static fromNative(sanitizer: DomSanitizer, object: any): Server {
-        const mappedData = {
-            hostname: object.name,
-            clients: object.clients,
-            svMaxclients: object.maxclients,
-            resources: [],
-            mapname: object.mapname,
-            gametype: object.gametype
-        };
-
-        const server = new Server(sanitizer, object.addr, { ...mappedData });
-
-        if (object.infoBlob) {
-            server.iconUri = 'data:image/png;base64,' + object.infoBlob.icon;
-        }
-
-        return server;
-    }
-
     private constructor(private sanitizer: DomSanitizer, address: string, object: master.IServerData) {
         // temp compat behavior
         this.address = address;
+
+        if (!object) {
+            return;
+        }
+
         this.hostname = object.hostname;
         this.currentPlayers = object.clients | 0;
         this.maxPlayers = object.svMaxclients | 0;
@@ -99,14 +134,12 @@ export class Server {
         }
 
         this.upvotePower = object.upvotePower || 0;
+        this.burstPower = object.burstPower || 0;
         this.data = object;
         this.int = object;
+        this.connectEndPoints = object.connectEndPoints;
 
-        if (!object.iconVersion) {
-            const svg = Avatar.getFor(this.address);
-
-            this.iconUri = `data:image/svg+xml,${encodeURIComponent(svg)}`;
-        } else {
+        if (object.iconVersion) {
             this.iconUri = `https://servers-live.fivem.net/servers/icon/${address}/${object.iconVersion}.png`;
         }
     }
@@ -124,23 +157,13 @@ export class ServerIcon {
     }
 }
 
-export class PinConfig {
-    pinIfEmpty = false;
-
-    pinnedServers: string[] = [];
-}
-
-export class PinConfigCached {
-    public data: PinConfig;
-    public pinnedServers: Set<string>;
-
-    constructor(pinConfig: PinConfig) {
-        if (pinConfig) {
-            this.data = pinConfig;
-        } else {
-            this.data = new PinConfig();
-        }
-
-        this.pinnedServers = new Set<string>(this.data.pinnedServers);
-    }
+export class ServerHistoryEntry {
+	address: string;
+	title: string;
+	hostname: string;
+	time: Date;
+	icon: string;
+	token: string;
+	rawIcon: string;
+	vars: { [key: string]: string };
 }

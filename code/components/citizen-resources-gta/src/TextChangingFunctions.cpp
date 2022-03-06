@@ -6,13 +6,17 @@
  */
 
 #include <StdInc.h>
+
 #include <ScriptEngine.h>
 
 #include <Resource.h>
 #include <fxScripting.h>
 
 #include <CustomText.h>
+
+#if defined(GTA_FIVE)
 #include <sfFontStuff.h>
+#endif
 
 static bool AddTextEntryForResource(fx::Resource* resource, uint32_t hashKey, const char* textValue)
 {
@@ -25,6 +29,7 @@ static bool AddTextEntryForResource(fx::Resource* resource, uint32_t hashKey, co
 	if (it == g_owners.end())
 	{
 		g_owners.insert({ hashKey, resource->GetName() });
+
 		game::AddCustomText(hashKey, textValue);
 
 		// on-stop handler, as well, to remove from the list when the resource stops
@@ -33,7 +38,6 @@ static bool AddTextEntryForResource(fx::Resource* resource, uint32_t hashKey, co
 			if (g_owners[hashKey] == resource->GetName())
 			{
 				game::RemoveCustomText(hashKey);
-
 				g_owners.erase(hashKey);
 			}
 		});
@@ -92,6 +96,7 @@ static InitFunction initFunction([] ()
 		context.SetResult<bool>(false);
 	});
 
+#if defined(GTA_FIVE)
 	fx::ScriptEngine::RegisterNativeHandler("REGISTER_FONT_ID", [](fx::ScriptContext& context)
 	{
 		context.SetResult(sf::RegisterFontIndex(context.GetArgument<const char*>(0)));
@@ -140,4 +145,5 @@ static InitFunction initFunction([] ()
 			context.GetArgument<float>(3), context.GetArgument<float>(4),
 			context.GetArgument<float>(5));
 	});
+#endif
 });

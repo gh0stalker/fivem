@@ -15,6 +15,7 @@
 #endif
 
 #include <botan/auto_rng.h>
+#include <botan/system_rng.h>
 
 #include <botan/tls_server.h>
 #include <botan/tls_session_manager.h>
@@ -38,7 +39,11 @@ private:
 
 	TLSServer* m_parentServer;
 
+#ifdef IS_FXSERVER
 	Botan::AutoSeeded_RNG m_rng;
+#else
+	Botan::System_RNG m_rng;
+#endif
 
 	std::unique_ptr<Botan::TLS::Session_Manager> m_sessionManager;
 
@@ -50,11 +55,11 @@ private:
 
 private:
 	template<typename TContainer>
-	inline void DoWrite(TContainer data)
+	inline void DoWrite(TContainer data, TCompleteCallback&& onComplete)
 	{
 		fwRefContainer<TLSServerStream> thisRef = this;
 
-		ScheduleCallback([thisRef, data = std::forward<TContainer>(data)]()
+		ScheduleCallback([thisRef, data = std::forward<TContainer>(data), onComplete = std::move(onComplete)]() mutable
 		{
 			auto tlsServer = thisRef->m_tlsServer;
 
@@ -62,6 +67,7 @@ private:
 			{
 				try
 				{
+					thisRef->m_nextOnComplete = std::move(onComplete);
 					tlsServer->send(data);
 				}
 				catch (const std::exception& e)
@@ -71,7 +77,7 @@ private:
 					thisRef->Close();
 				}
 			}
-		});
+		}, true);
 	}
 
 public:
@@ -79,13 +85,38 @@ public:
 
 	virtual PeerAddress GetPeerAddress() override;
 
-	virtual void Write(std::string&& data) override;
+	virtual void Write(std::string&& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(std::vector<uint8_t>&& data) override;
+	virtual void Write(std::vector<uint8_t>&& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(const std::string& data) override;
+	virtual void Write(const std::string& data, TCompleteCallback&& onComplete) override;
 
-	virtual void Write(const std::vector<uint8_t>& data) override;
+	virtual void Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete) override;
+
+	virtual void Write(std::unique_ptr<char[]> data, size_t len, TCompleteCallback&& onComplete) override
+	{
+		fwRefContainer<TLSServerStream> thisRef = this;
+
+		ScheduleCallback([thisRef, data = std::move(data), len, onComplete = std::move(onComplete)]() mutable
+		{
+			auto tlsServer = thisRef->m_tlsServer;
+
+			if (tlsServer && tlsServer->is_active())
+			{
+				try
+				{
+					thisRef->m_nextOnComplete = std::move(onComplete);
+					tlsServer->send(reinterpret_cast<const uint8_t*>(data.get()), len);
+				}
+				catch (const std::exception & e)
+				{
+					trace("tls send: %s\n", e.what());
+
+					thisRef->Close();
+				}
+			}
+		}, true);
+	}
 
 	virtual void Close() override;
 
@@ -93,27 +124,27 @@ public:
 
 public:
 	// Botan::TLS::Callbacks
-	virtual inline void tls_emit_data(const uint8_t data[], size_t size) override
+	virtual void tls_emit_data(const uint8_t data[], size_t size) override
 	{
 		return WriteToClient(data, size);
 	}
 
-	virtual inline void tls_record_received(uint64_t seq_no, const uint8_t data[], size_t size) override
+	virtual void tls_record_received(uint64_t seq_no, const uint8_t data[], size_t size) override
 	{
 		return ReceivedData(data, size);
 	}
 
-	virtual inline void tls_alert(Botan::TLS::Alert alert) override
+	virtual void tls_alert(Botan::TLS::Alert alert) override
 	{
 		return ReceivedAlert(alert, nullptr, 0);
 	}
 
-	virtual inline void tls_session_activated() override
+	virtual void tls_session_activated() override
 	{
 		HandshakeComplete();
 	}
 
-	virtual inline bool tls_session_established(const Botan::TLS::Session& session) override
+	virtual bool tls_session_established(const Botan::TLS::Session& session) override
 	{
 		//return HandshakeComplete(session);
 		return true;
@@ -121,7 +152,7 @@ public:
 
 	virtual std::string tls_server_choose_app_protocol(const std::vector<std::string>& client_protos) override;
 
-	virtual inline void tls_verify_cert_chain(
+	virtual void tls_verify_cert_chain(
 		const std::vector<Botan::X509_Certificate>& cert_chain,
 		const std::vector<std::shared_ptr<const Botan::OCSP::Response>>& ocsp_responses,
 		const std::vector<Botan::Certificate_Store*>& trusted_roots,
@@ -139,7 +170,7 @@ public:
 		}
 	}
 
-	virtual void ScheduleCallback(const TScheduledCallback& callback) override;
+	virtual void ScheduleCallback(TScheduledCallback&& callback, bool performInline) override;
 
 private:
 	void WriteToClient(const uint8_t buf[], size_t length);
@@ -152,6 +183,8 @@ private:
 
 private:
 	void CloseInternal();
+
+	TCompleteCallback m_nextOnComplete;
 };
 
 class TCP_SERVER_EXPORT TLSServer : public TcpServer
@@ -162,6 +195,8 @@ private:
 	std::shared_ptr<Botan::Credentials_Manager> m_credentials;
 
 	std::set<fwRefContainer<TLSServerStream>> m_connections;
+
+	std::mutex m_connectionsMutex;
 
 	std::vector<std::string> m_protocols;
 
@@ -195,6 +230,7 @@ public:
 
 	inline void CloseStream(TLSServerStream* stream)
 	{
+		std::lock_guard<std::mutex> _(m_connectionsMutex);
 		m_connections.erase(stream);
 	}
 };

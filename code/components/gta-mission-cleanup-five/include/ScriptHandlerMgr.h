@@ -10,7 +10,7 @@
 #ifdef COMPILING_GTA_MISSION_CLEANUP_FIVE
 #define MISCLEAN_EXPORT DLL_EXPORT
 #else
-#define MISCLEAN_EXPORT
+#define MISCLEAN_EXPORT DLL_IMPORT
 #endif
 
 #include <scrEngine.h>
@@ -177,4 +177,31 @@ public:
 
 		m_handlers->Set(scriptId->GetIdentifier(&hashStorage), &handler);
 	}
+};
+
+extern MISCLEAN_EXPORT fwEvent<rage::scrThread*, const std::string&> OnCreateResourceThread;
+extern MISCLEAN_EXPORT fwEvent<rage::scrThread*> OnDeleteResourceThread;
+
+#define MISCLEAN_HAS_SCRIPT_PROCESS_TICK
+
+#include <optional>
+
+class MISCLEAN_EXPORT UpdatingScriptThreadsScope
+{
+public:
+	explicit UpdatingScriptThreadsScope(bool newState);
+
+	UpdatingScriptThreadsScope(const UpdatingScriptThreadsScope&) = delete;
+
+	inline UpdatingScriptThreadsScope& operator=(const UpdatingScriptThreadsScope&) = delete;
+
+	inline UpdatingScriptThreadsScope(UpdatingScriptThreadsScope&& other) noexcept
+	{
+		m_lastProcessTick = std::move(other.m_lastProcessTick);
+	}
+
+	~UpdatingScriptThreadsScope();
+
+private:
+	std::optional<bool> m_lastProcessTick;
 };

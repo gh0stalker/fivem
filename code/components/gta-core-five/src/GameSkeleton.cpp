@@ -8,6 +8,9 @@
 #include <gameSkeleton.h>
 #include <Error.h>
 
+#include <ICoreGameInit.h>
+#include <CrossBuildRuntime.h>
+
 static std::unordered_map<uint32_t, std::string> g_initFunctionNames;
 
 namespace rage
@@ -48,9 +51,20 @@ namespace rage
 	{
 		if (exception->ExceptionRecord->ExceptionCode & 0x80000000)
 		{
-			FatalErrorNoExcept("An exception occurred (%08x at %p) during execution of the %s function for %s. The game will be terminated.",
-				exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress,
-				InitFunctionTypeToString(type), func->GetName());
+			AddCrashometry("init_function", "%s:%s", InitFunctionTypeToString(type), func->GetName());
+
+			if (IsErrorException(exception))
+			{
+				return EXCEPTION_CONTINUE_SEARCH;
+			}
+
+			if ((uintptr_t)exception->ExceptionRecord->ExceptionAddress >= hook::get_adjusted(0x140000000) &&
+				(uintptr_t)exception->ExceptionRecord->ExceptionAddress < hook::get_adjusted(0x146000000))
+			{
+				FatalErrorNoExcept("An exception occurred (%08x at %p) during execution of the %s function for %s. The game will be terminated.",
+					exception->ExceptionRecord->ExceptionCode, exception->ExceptionRecord->ExceptionAddress,
+					InitFunctionTypeToString(type), func->GetName());
+			}
 		}
 
 		return EXCEPTION_CONTINUE_SEARCH;
@@ -167,6 +181,15 @@ namespace rage
 				return;
 			}
 
+			// #TODO1SBIG: remove for non-big
+			if (Instance<ICoreGameInit>::Get()->HasVariable("onesync_big"))
+			{
+				if (entry->m_hash == HashString("CVehiclePopulation") || entry->m_hash == HashString("CPedPopulation"))
+				{
+					//return;
+				}
+			}
+
 			entry->Run();
 		}
 	}
@@ -207,7 +230,7 @@ static HookFunction hookFunction([] ()
 	}
 
 	{
-		hook::jump(hook::get_call(hook::get_pattern("48 8D 0D ? ? ? ? BA 01 00 00 00 E8 ? ? ? ? E8 ? ? ? ?", 12)), hook::get_member(&rage::gameSkeleton::RunUpdate));
+		hook::jump(hook::get_call(hook::get_pattern("48 8D 0D ? ? ? ? BA 02 00 00 00 84 DB 75 05", -17)), hook::get_member(&rage::gameSkeleton::RunUpdate));
 	}
 
 	hook::jump(hook::get_pattern("40 53 48 83 EC 20 48 8B 59 20 EB 0D 48 8B 03 48"), hook::get_member(&rage::gameSkeleton_updateBase::RunGroup));
@@ -492,6 +515,18 @@ static const char* const g_initFunctionKnown[] = {
 	"fwTxdStore",
 	"perfClearingHouse",
 	"strStreamingEngine::SubmitDeferredAsyncPlacementRequests",
+
+	"CAnimSceneManager",
+	"CTextInputBox",
+	"CMultiplayerChat",
+	"CCreditsText",
+	"CReplayMgr",
+	"CReplayCoordinator",
+	"CMousePointer",
+	"CVideoEditorUI",
+	"CVideoEditorInterface",
+	"VideoRecording",
+	"WatermarkRenderer",
 };
 
 static InitFunction initFunction([] ()

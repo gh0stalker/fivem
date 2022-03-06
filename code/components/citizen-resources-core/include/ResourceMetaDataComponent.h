@@ -52,6 +52,8 @@ public:
 
 	std::optional<bool> IsManifestVersionBetween(const guid_t& lowerBound, const guid_t& upperBound);
 
+	std::optional<bool> IsManifestVersionBetween(const std::string& lowerBound, const std::string& upperBound);
+
 	inline Resource* GetResource()
 	{
 		return m_resource;
@@ -60,6 +62,18 @@ public:
 	inline void SetMetaDataLoader(fwRefContainer<ResourceMetaDataLoader> loader)
 	{
 		m_metaDataLoader = loader;
+	}
+
+	inline std::map<std::string, std::vector<std::string>> GetAllEntries()
+	{
+		std::map<std::string, std::vector<std::string>> newMap;
+
+		for (auto it = m_metaDataEntries.begin(), end = m_metaDataEntries.end(); it != end; it++)
+		{
+			newMap[it->first].push_back(it->second);
+		}
+
+		return newMap;
 	}
 
 	inline auto GetEntries(const std::string& key)

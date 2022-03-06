@@ -30,6 +30,15 @@ void SteamLoader::Initialize()
 		// load steamclient*.dll
 		m_hSteamClient = LoadLibrary(steamDllPath.c_str());
 
+		// load and pin crashhandler64.dll (as it seems to be loaded at-will by Steam and then unloaded/breaks on a few systems)
+		HMODULE steamCH = LoadLibraryW(L"crashhandler64.dll");
+
+		if (steamCH)
+		{
+			HMODULE steamCH_pin;
+			GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_PIN, L"crashhandler64.dll", &steamCH_pin);
+		}
+
 		// load the Steam overlay, if 'rtsshooks64.dll' is not present
 		if (GetModuleHandleW(L"rtsshooks64.dll") == nullptr)
 		{
@@ -57,25 +66,35 @@ void* SteamLoader::GetProcAddressInternal(const char* name)
 
 bool SteamLoader::IsSteamRunning(bool ignoreCreateFunc)
 {
-	bool retval = false;
-	uint32_t pid = GetSteamProcessId();
-
-	if (pid != 0)
+	static auto retval = ([this]()
 	{
-		HANDLE steamProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		// #TODOLIBERTY: un-x64ify steam
+#if defined GTA_NY
+		return false;
+#endif
+		bool retval = false;
 
-		if (steamProcess != INVALID_HANDLE_VALUE)
+		uint32_t pid = GetSteamProcessId();
+
+		if (pid != 0)
 		{
-			CloseHandle(steamProcess);
+			HANDLE steamProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
 
-			retval = true;
+			if (steamProcess && steamProcess != INVALID_HANDLE_VALUE)
+			{
+				CloseHandle(steamProcess);
+
+				retval = true;
+			}
 		}
-	}
+
+		return retval;
+	})();
 
 	// safety check to see if CreateInterface is callable
 	if (!GetCreateInterfaceFunc() && !ignoreCreateFunc)
 	{
-		retval = false;
+		return false;
 	}
 
 	return retval;
@@ -123,5 +142,28 @@ void SteamLoader::LoadGameOverlayRenderer(const std::wstring& baseDllPath)
 {
 	std::wstring overlayDllPath = baseDllPath.substr(0, baseDllPath.rfind(L'\\')) + L"\\" OVERLAYRENDERER_DLL;
 
+	// store kernel32!CreateProcessW to unpatch it, as gameoverlayrenderer is very nested and malicious
+	auto kernel32 = GetModuleHandleW(L"kernel32.dll");
+
+	if (!kernel32)
+	{
+		return;
+	}
+
+	auto createProcessW = ::GetProcAddress(kernel32, "CreateProcessW");
+	uint8_t copyStub[5];
+	memcpy(copyStub, createProcessW, 5);
+
+	// load the actual overlay dll
 	LoadLibrary(overlayDllPath.c_str());
+
+	// unprotect
+	DWORD oldProtect;
+	VirtualProtect(createProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+	// copy original code
+	memcpy(createProcessW, copyStub, 5);
+
+	// and reprotect
+	VirtualProtect(createProcessW, 5, oldProtect, &oldProtect);
 }

@@ -29,6 +29,12 @@
    SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 #include "StdInc.h"
+
+#include <CoreConsole.h>
+
+#include <ServerInstanceBase.h>
+#include <ServerInstanceBaseRef.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,11 +44,13 @@
 #include "log.h"
 
 #define DEFAULT_WELCOME "Welcome to uMurmur!"
-#define DEFAULT_MAX_CLIENTS 256
+#define DEFAULT_MAX_CLIENTS 1024
 #define DEFAULT_MAX_BANDWIDTH 76000
 #define DEFAULT_BINDPORT 64738
-#define DEFAULT_BAN_LENGTH (60*60)
+#define DEFAULT_BAN_LENGTH 0
 #define DEFAULT_OPUS_THRESHOLD 100
+
+std::shared_ptr<ConVar<std::string>> mumble_adminPass;
 
 void Conf_init(const char *conffile)
 {
@@ -87,7 +95,7 @@ const char *getStrConf(param_t param)
 		case PASSPHRASE:
 			return "";
 		case ADMIN_PASSPHRASE:
-			return "";
+			return mumble_adminPass->GetValue().c_str();
 		case WELCOMETEXT:
 			return DEFAULT_WELCOME;
 		case DEFAULT_CHANNEL:
@@ -101,6 +109,8 @@ const char *getStrConf(param_t param)
 	return NULL;
 }
 
+static fx::ServerInstanceBase* g_serverInstance;
+
 int getIntConf(param_t param)
 {
 	switch (param) {
@@ -109,7 +119,16 @@ int getIntConf(param_t param)
 		case MAX_BANDWIDTH:
 			return DEFAULT_MAX_BANDWIDTH;
 		case MAX_CLIENTS:
+		{
+			fwRefContainer<console::Context> consoleContext = g_serverInstance->GetComponent<console::Context>();
+			if (auto variableHandle = consoleContext->GetVariableManager()->FindEntryRaw("sv_maxClients"))
+			{
+				// we want to hard-cap this to 2048, but otherwise allow some leeway
+				return std::min(2048, atoi(variableHandle->GetValue().c_str()) * 2);
+			}
+
 			return DEFAULT_MAX_CLIENTS;
+		}
 		case OPUS_THRESHOLD:
 			return DEFAULT_OPUS_THRESHOLD;
 		default:
@@ -124,9 +143,9 @@ bool_t getBoolConf(param_t param)
 {
 	switch (param) {
 		case ALLOW_TEXTMESSAGE:
-			return true;
-		case ENABLE_BAN:
 			return false;
+		case ENABLE_BAN:
+			return true;
 		case SYNC_BANFILE:
 			return false;
 		case SHOW_ADDRESSES:
@@ -227,3 +246,13 @@ int Conf_getNextChannelLink(conf_channel_link_t *chlink, int index)
 
 	return -1;
 }
+
+static InitFunction initFunction([]()
+{
+	mumble_adminPass = std::make_shared<ConVar<std::string>>("mumble_adminPass", ConVar_None, "");
+
+	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
+	{
+		g_serverInstance = instance;
+	});
+});

@@ -98,7 +98,8 @@ const wchar_t* vva(std::wstring_view string, fmt::wprintf_args formatList)
 
 void DoNtRaiseException(EXCEPTION_RECORD* record)
 {
-	typedef NTSTATUS(*NtRaiseExceptionType)(PEXCEPTION_RECORD record, PCONTEXT context, BOOL firstChance);
+#ifdef _M_AMD64
+	typedef NTSTATUS(WINAPI* NtRaiseExceptionType)(PEXCEPTION_RECORD record, PCONTEXT context, BOOL firstChance);
 
 	bool threw = false;
 
@@ -117,105 +118,9 @@ void DoNtRaiseException(EXCEPTION_RECORD* record)
 		// force 'threw' to be stack-allocated by messing with it from here (where it won't execute)
 		OutputDebugStringA((char*)&threw);
 	}
-}
-
-struct SharedTickCount
-{
-	struct Data
-	{
-		uint64_t tickCount;
-
-		Data()
-		{
-			tickCount = GetTickCount64();
-		}
-	};
-
-	SharedTickCount()
-	{
-		m_data = &m_fakeData;
-
-		bool initTime = true;
-		m_fileMapping = CreateFileMapping(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Data), L"CFX_SharedTickCount");
-
-		if (m_fileMapping != nullptr)
-		{
-			if (GetLastError() == ERROR_ALREADY_EXISTS)
-			{
-				initTime = false;
-			}
-
-			m_data = (Data*)MapViewOfFile(m_fileMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Data));
-
-			if (initTime)
-			{
-				m_data = new(m_data) Data();
-			}
-		}
-	}
-
-	inline Data& operator*()
-	{
-		return *m_data;
-	}
-
-	inline Data* operator->()
-	{
-		return m_data;
-	}
-
-private:
-	HANDLE m_fileMapping;
-	Data* m_data;
-
-	Data m_fakeData;
-};
-
-static void PerformFileLog(const char* string)
-{
-	static std::vector<char> lineBuffer(8192);
-	static size_t lineIndex;
-	static std::mutex logMutex;
-
-	static SharedTickCount initTickCount;
-
-	{
-		std::unique_lock<std::mutex> lock(logMutex);
-
-		for (const char* p = string; *p; ++p)
-		{
-			if (*p == '\n')
-			{
-				// flush the line
-				FILE* logFile = _wfopen(MakeRelativeCitPath(L"CitizenFX.log").c_str(), L"ab");
-
-				if (logFile)
-				{
-					// null-terminate the string
-					lineBuffer[lineIndex] = '\0';
-
-					fprintf(logFile, "[%10lld] %s\r\n", GetTickCount64() - initTickCount->tickCount, lineBuffer.data());
-					fclose(logFile);
-				}
-
-				// clear the line
-				lineIndex = 0;
-
-				// skip this char
-				continue;
-			}
-
-			// append the character
-			lineBuffer[lineIndex] = *p;
-			++lineIndex;
-
-			// overflow? if so, resize
-			if (lineIndex >= (lineBuffer.size() - 1))
-			{
-				lineBuffer.resize(lineBuffer.size() * 2);
-			}
-		}
-	}
+#else
+	RaiseException(record->ExceptionCode, record->ExceptionFlags, record->NumberParameters, record->ExceptionInformation);
+#endif
 }
 
 static void RaiseDebugException(const char* buffer, size_t length)
@@ -240,6 +145,28 @@ static void RaiseDebugException(const char* buffer, size_t length)
 }
 #endif
 
+#if defined(_WIN32) && !defined(IS_FXSERVER)
+inline void AsyncTrace(const char* string)
+{
+	using TCoreTraceFunc = decltype(&AsyncTrace);
+
+	static TCoreTraceFunc func;
+
+	if (!func)
+	{
+		func = (TCoreTraceFunc)GetProcAddress(GetModuleHandle(NULL), "AsyncTrace");
+
+		if (!func)
+		{
+			// try getting function proxy from CoreRT, could be we've already loaded a game
+			func = (TCoreTraceFunc)GetProcAddress(GetModuleHandle(L"CoreRT.dll"), "AsyncTrace");
+		}
+	}
+
+	(func) ? func(string) : (void)0;
+}
+#endif
+
 void TraceRealV(const char* channel, const char* func, const char* file, int line, std::string_view string, fmt::printf_args formatList)
 {
 	std::string buffer;
@@ -256,13 +183,7 @@ void TraceRealV(const char* channel, const char* func, const char* file, int lin
 	CoreTrace(channel, func, file, line, buffer.data());
 
 #ifdef _WIN32
-	static CRITICAL_SECTION dbgCritSec;
-
-	if (!dbgCritSec.DebugInfo)
-	{
-		InitializeCriticalSectionAndSpinCount(&dbgCritSec, 100);
-	}
-
+#if defined(_M_AMD64)
 	if (CoreIsDebuggerPresent())
 	{
 		// thanks to anti-debug workarounds (IsBeingDebugged == FALSE), we'll have to raise the exception to the debugger ourselves.
@@ -273,12 +194,13 @@ void TraceRealV(const char* channel, const char* func, const char* file, int lin
 		RaiseDebugException(buffer.c_str(), buffer.length());
 	}
 	else
+#endif
 	{
 		OutputDebugStringA(buffer.c_str());
 	}
 
 #ifndef IS_FXSERVER
-	PerformFileLog(buffer.c_str());
+	AsyncTrace(buffer.data());
 #endif
 #endif
 }
@@ -355,7 +277,7 @@ std::string ToNarrow(const std::wstring& wide)
 	outVec.reserve(wide.size());
 
 #ifdef _WIN32
-	utf8::utf16to8(wide.begin(), wide.end(), std::back_inserter(outVec));
+	utf8::unchecked::utf16to8(wide.begin(), wide.end(), std::back_inserter(outVec));
 #else
 	utf8::utf32to8(wide.begin(), wide.end(), std::back_inserter(outVec));
 #endif

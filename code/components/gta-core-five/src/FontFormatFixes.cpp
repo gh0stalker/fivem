@@ -1,9 +1,14 @@
 #include "StdInc.h"
+
+#include <LaunchMode.h>
 #include <Hooking.h>
 
 #include <regex>
 
 #include <sstream>
+
+#include <nutsnbolts.h>
+#include <EASTL/fixed_vector.h>
 
 #include <MinHook.h>
 
@@ -179,6 +184,18 @@ std::string regex_replace(const std::string& s,
 	return regex_replace(s.cbegin(), s.cend(), re, f);
 }
 
+static uint32_t curTime;
+
+void* operator new[](size_t size, const char* pName, int flags, unsigned debugFlags, const char* file, int line)
+{
+	return ::operator new[](size);
+}
+
+void* operator new[](size_t size, size_t alignment, size_t alignmentOffset, const char* pName, int flags, unsigned debugFlags, const char* file, int line)
+{
+	return ::operator new[](size);
+}
+
 static void ParseHtmlStub(void* styledText, const wchar_t* str, int64_t length, void* pImgInfoArr, bool multiline, bool condenseWhite, void* styleMgr, void* txtFmt, void* paraFmt)
 {
 	if (!txtFmt)
@@ -188,41 +205,85 @@ static void ParseHtmlStub(void* styledText, const wchar_t* str, int64_t length, 
 
 	int sz = ceil(*(uint16_t*)((char*)txtFmt + 62) / 20.0f * 1.2f);
 
-	auto emojifiedText = regex_replace(str, str + length, emojiRegEx, [sz](const auto& m)
+	static thread_local std::map<std::wstring, std::wstring, std::less<>> replacedText;
+	static thread_local uint32_t nextClear;
+
+	if (curTime > nextClear)
 	{
-		auto s = m.str();
+		replacedText.clear();
+		nextClear = curTime + 5000;
+	}
 
-		if (s.find(L"\x200D") == std::string::npos)
+	auto it = replacedText.find(std::wstring_view{ str, size_t(length) });
+
+	if (it == replacedText.end())
+	{
+		auto emojifiedText = regex_replace(str, str + length, emojiRegEx, [](const auto& m)
 		{
-			s = std::regex_replace(s, feofRegEx, L"");
+			auto s = m.str();
+
+			if (s.find(L"\x200D") == std::string::npos)
+			{
+				s = std::regex_replace(s, feofRegEx, L"");
+			}
+
+			std::wstringstream codePointString;
+
+			int i = 0;
+			int p = 0;
+
+			while (i < s.length())
+			{
+				auto c = s[i++];
+				if (p)
+				{
+					codePointString << std::hex << (0x10000 + ((p - 0xD800) << 10) + (c - 0xDC00)) << L"_";
+					p = 0;
+				}
+				else if (0xD800 <= c && c <= 0xDBFF)
+				{
+					p = c;
+				}
+				else
+				{
+					codePointString << std::hex << uint32_t(c) << L"_";
+				}
+			}
+
+			auto cps = codePointString.str();
+
+			return fmt::sprintf(L"<img src='flex_img_%s' width='\uE812' height='\uE812'/>", cps.substr(0, cps.length() - 1));
+		});
+
+		it = replacedText.emplace(str, std::move(emojifiedText)).first;
+	}
+
+	// since the same text may have multiple sizes, we will insert sizes manually now
+	auto sizedString = eastl::fixed_vector<wchar_t, 1024, true>{};
+	sizedString.reserve(it->second.size() + 64);
+
+	auto formattedSize = fmt::sprintf("%d", sz);
+
+	for (wchar_t ch : it->second)
+	{
+		// push size instead
+		if (ch == L'\uE812')
+		{
+			for (char sch : formattedSize)
+			{
+				sizedString.push_back(static_cast<wchar_t>(sch));
+			}
+
+			continue;
 		}
 
-		std::wstringstream codePointString;
+		sizedString.push_back(ch);
+	}
 
-		int i = 0;
-		int p = 0;
+	// maybe unneeded
+	sizedString.push_back('\0');
 
-		while (i < s.length())
-		{
-			auto c = s[i++];
-			if (p) {
-				codePointString << std::hex << (0x10000 + ((p - 0xD800) << 10) + (c - 0xDC00)) << L"_";
-				p = 0;
-			}
-			else if (0xD800 <= c && c <= 0xDBFF) {
-				p = c;
-			}
-			else {
-				codePointString << std::hex << uint32_t(c) << L"_";
-			}
-		}
-
-		auto cps = codePointString.str();
-
-		return fmt::sprintf(L"<img src='flex_img_%s' width='%d' height='%d'/>", cps.substr(0, cps.length() - 1), sz, sz);
-	});
-
-	g_parseHtml(styledText, emojifiedText.c_str(), emojifiedText.size(), pImgInfoArr, multiline, condenseWhite, styleMgr, txtFmt, paraFmt);
+	g_parseHtml(styledText, sizedString.data(), sizedString.size() - 1, pImgInfoArr, multiline, condenseWhite, styleMgr, txtFmt, paraFmt);
 }
 
 static void ParseHtmlUtf8(void* styledText, const char* str, uint64_t length, void* pImgInfoArr, bool multiline, bool condenseWhite, void* styleMgr, void* txtFmt, void* paraFmt)
@@ -242,11 +303,11 @@ static void GfxLog(void* sfLog, int messageType, const char* pfmt, va_list argLi
 
 static void(*g_origGFxEditTextCharacterDef__SetTextValue)(void* self, const char* newText, bool html, bool notifyVariable);
 
+static bool ContainsHtml(const char* in);
+
 static void GFxEditTextCharacterDef__SetTextValue(void* self, const char* newText, bool html, bool notifyVariable)
 {
-	std::string textRef;
-
-	if (!html)
+	if (!html && newText && ContainsHtml(newText))
 	{
 		html = true;
 	}
@@ -260,26 +321,38 @@ struct GSizeF
 	float y;
 };
 
-static GSizeF (*getHtmlTextExtent)(void* self, const char* putf8Str, float width, const void* ptxtParams);
-
-static GSizeF GetHtmlTextExtentWrap(void* self, const char* putf8Str, float width, const void* ptxtParams)
-{
-	// escape (since this is actually non-HTML text extent)
-	//std::string textRef = putf8Str;
-	//EscapeXml<char>(textRef);
-
-	return getHtmlTextExtent(self, putf8Str, width, ptxtParams);
-}
-
 static void(*g_origFormatGtaText)(const char* in, char* out, bool a3, void* a4, float size, bool* html, int maxLength, bool a8);
 
 static std::regex condRe{"&lt;(/?C)&gt;"};
+
+static bool ContainsHtml(const char* in)
+{
+	static thread_local std::map<std::string, bool, std::less<>> emojiCache;
+	static thread_local uint32_t nextClear;
+
+	if (curTime > nextClear)
+	{
+		emojiCache.clear();
+		nextClear = curTime + 5000;
+	}
+
+	if (auto it = emojiCache.find(in); it != emojiCache.end())
+	{
+		return it->second;
+	}
+
+	std::string inStr = in;
+	bool has = inStr.find_first_of("&<") != std::string::npos || std::regex_search(ToWide(inStr), emojiRegEx);
+	emojiCache[inStr] = has;
+
+	return has;
+}
 
 static void FormatGtaTextWrap(const char* in, char* out, bool a3, void* a4, float size, bool* html, int maxLength, bool a8)
 {
 	g_origFormatGtaText(in, out, a3, a4, size, html, maxLength, a8);
 
-	if (!*html)
+	if (!*html && ContainsHtml(in))
 	{
 		*html = true;
 	}
@@ -287,6 +360,11 @@ static void FormatGtaTextWrap(const char* in, char* out, bool a3, void* a4, floa
 
 static HookFunction hookFunction([]()
 {
+	if (CfxIsSinglePlayer())
+	{
+		return;
+	}
+
 	MH_Initialize();
 	MH_CreateHook(hook::get_call(hook::get_pattern("40 88 6C 24 28 44 88 44 24 20 4C 8B C3 48 8B D6", 16)), ParseHtmlStub, (void**)&g_parseHtml);
 	MH_CreateHook(hook::get_pattern("48 8B F1 44 8D 6F 01 48", -48), GFxEditTextCharacterDef__SetTextValue, (void**)&g_origGFxEditTextCharacterDef__SetTextValue);
@@ -301,10 +379,11 @@ static HookFunction hookFunction([]()
 
 	// GFxDrawTextImpl(?)
 
-	// GetTextExtent
-	hook::set_call(&getHtmlTextExtent, hook::get_pattern("48 8B 55 60 45 33 E4 4C 89", -0x5B));
-	hook::jump(hook::get_pattern("0F 29 70 D8 4D 8B F0 48 8B F2 0F 28 F3", -0x1F), GetHtmlTextExtentWrap);
+	OnGameFrame.Connect([]()
+	{
+		curTime = GetTickCount();
+	});
 
-	// 1604
+	// 1604 unused
 	//*(void**)0x1419F4858 = GfxLog;
 });

@@ -18,6 +18,7 @@
 
 #include <CoreConsole.h>
 
+#include <UvLoopManager.h>
 #include <VFSManager.h>
 
 #include <se/Security.h>
@@ -25,6 +26,20 @@
 #ifdef _WIN32
 #include <mmsystem.h>
 #endif
+
+// a list of variables that *need* to be used with +set (to automatically pre-parse from a config script)
+static std::set<std::string, console::IgnoreCaseLess> setList =
+{
+	"onesync",
+	"onesync_enabled",
+	"onesync_population",
+	"netlib",
+	"onesync_enableInfinity",
+	"onesync_enableBeyond",
+	"gamename",
+	"sv_enforceGameBuild",
+	"sv_licenseKey",
+};
 
 namespace fx
 {
@@ -60,6 +75,24 @@ namespace fx
 			consoleCtx->ExecuteBuffer();
 		});
 
+		auto quit = [this](const std::string& reason)
+		{
+			trace("-> Quitting: %s\n", reason);
+			OnRequestQuit(reason);
+
+			m_shouldTerminate = true;
+		};
+
+		m_quitCommand_0 = AddCommand("quit", [quit]()
+		{
+			quit("Quit command executed.");
+		});
+
+		m_quitCommand_1 = AddCommand("quit", [quit](const std::string& reason)
+		{
+			quit(reason);
+		});
+
 		SetComponent(new fx::OptionParser());
 	}
 
@@ -81,7 +114,98 @@ namespace fx
 
 			for (const auto& set : optionParser->GetSetList())
 			{
+				// save this in the default context so V8ScriptRuntime can read this
+				if (set.first == "txAdminServerMode" || set.first == "gamename")
+				{
+					console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ "set", set.first, set.second });
+				}
+
 				consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "set", set.first, set.second });
+			}
+
+			// run early exec so we can set convars
+			{
+				fwRefContainer<console::Context> execContext;
+				console::CreateContext(nullptr, &execContext);
+
+				auto consoleCtxRef = consoleCtx.GetRef();
+
+				auto forwardArgs = [consoleCtxRef](const std::string& cmd, const ProgramArguments& args)
+				{
+					std::vector<std::string> argList(args.Count() + 1);
+					argList[0] = cmd;
+
+					int i = 1;
+					for (const auto& arg : args.GetArguments())
+					{
+						argList[i] = arg;
+						i++;
+					}
+
+					consoleCtxRef->ExecuteSingleCommandDirect(ProgramArguments{ argList });
+					console::GetDefaultContext()->ExecuteSingleCommandDirect(ProgramArguments{ argList });
+				};
+
+				execContext->GetCommandManager()->FallbackEvent.Connect([consoleCtxRef, forwardArgs](const std::string& cmd, const ProgramArguments& args, const std::any& context)
+				{
+					if (consoleCtxRef->GetVariableManager()->FindEntryRaw(cmd))
+					{
+						forwardArgs(cmd, args);
+					}
+					else if (setList.find(cmd) != setList.end())
+					{
+						forwardArgs("set", ProgramArguments{ cmd, args.Get(0) });
+					}
+
+					return false;
+				});
+
+				std::queue<std::string> execList;
+
+				ConsoleCommand fakeExecCommand(execContext.GetRef(), "exec", [&execList](const std::string& path)
+				{
+					execList.push(path);
+				});
+
+				for (const auto& bit : optionParser->GetArguments())
+				{
+					if (bit.Count() > 0)
+					{
+						execContext->ExecuteSingleCommandDirect(bit);
+					}
+				}
+
+				while (!execList.empty())
+				{
+					auto e = execList.front();
+					execList.pop();
+
+					fwRefContainer<vfs::Stream> stream = vfs::OpenRead(e);
+
+					if (!stream.GetRef())
+					{
+						if (e[0] != '@')
+						{
+							console::Printf("cmd", "No such config file: %s\n", e);
+						}
+
+						continue;
+					}
+
+					std::vector<uint8_t> data = stream->ReadToEnd();
+					data.push_back('\n'); // add a newline at the end
+
+					execContext->AddToBuffer(std::string(reinterpret_cast<char*>(&data[0]), data.size()));
+					execContext->ExecuteBuffer();
+				}
+
+				execContext->GetVariableManager()->ForAllVariables([forwardArgs](const std::string& name, int flags, const std::shared_ptr<internal::ConsoleVariableEntryBase>& var)
+				{
+					if (!(flags & ConVar_ServerInfo))
+					{
+						forwardArgs("set", ProgramArguments{ name, var->GetValue() });
+					}
+				});
 			}
 
 			boost::filesystem::path rootPath;
@@ -99,18 +223,32 @@ namespace fx
 			// invoke target events
 			OnServerCreate(this);
 
-			// start sessionmanager
-			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "sessionmanager" });
-
-			// start webadmin
-			consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "webadmin" });
-
-			for (const auto& bit : optionParser->GetArguments())
+			Instance<net::UvLoopManager>::Get()->GetOrCreate("svMain")->EnqueueCallback([this, consoleCtx, optionParser]()
 			{
-				consoleCtx->ExecuteSingleCommandDirect(bit);
-			}
+				se::ScopedPrincipal principalScope(se::Principal{ "system.console" });
 
-			OnInitialConfiguration();
+				// start standard resources
+				//consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "webadmin" });
+				if (console::GetDefaultContext()->GetVariableManager()->FindEntryRaw("txAdminServerMode"))
+				{
+					consoleCtx->ExecuteSingleCommandDirect(ProgramArguments{ "start", "monitor" });
+				}
+
+				// add system console access
+				seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.console" }, se::Object{ "webadmin" }, se::AccessType::Allow);
+				seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "resource.monitor" }, se::Object{ "command.quit" }, se::AccessType::Allow);
+
+				consoleCtx->GetVariableManager()->ShouldSuppressReadOnlyWarning(true);
+
+				for (const auto& bit : optionParser->GetArguments())
+				{
+					consoleCtx->ExecuteSingleCommandDirect(bit);
+				}
+
+				consoleCtx->GetVariableManager()->ShouldSuppressReadOnlyWarning(false);
+
+				OnInitialConfiguration();
+			});
 		}
 
 		// tasks should be running in background threads; we'll just wait until someone wants to get rid of us

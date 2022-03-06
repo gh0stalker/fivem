@@ -7,13 +7,13 @@
 #include <ResourceFilesComponent.h>
 #include <ResourceStreamComponent.h>
 
-#include <array>
+#include <Client.h>
+#include <ClientRegistry.h>
 
-/*template<typename Handle, class Class, typename T1, void(Class::*Callable)(T1)>
-void UvCallback(Handle* handle, T1 a1)
-{
-	(reinterpret_cast<Class*>(handle->data)->*Callable)(a1);
-}*/
+#include <array>
+#include <filesystem>
+
+constexpr const size_t kFileSendSize = 128 * 1024;
 
 namespace fx
 {
@@ -62,7 +62,9 @@ namespace fx
 
 	static auto GetFilesEndpointHandler(fx::ServerInstanceBase* instance)
 	{
-		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response, const std::string& resourceName, const std::string& fileName)
+		auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
+
+		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response, const std::string& resourceName, const std::string& fileName, const fx::ClientSharedPtr& client)
 		{
 			// get resource manager and resource
 			auto resourceManager = instance->GetComponent<fx::ResourceManager>();
@@ -71,7 +73,7 @@ namespace fx
 			if (!resource.GetRef())
 			{
 				response->SetStatusCode(404);
-				response->End("Not found.");
+				response->End(fmt::sprintf("Not found. (missing requested resource: %s)", resourceName));
 				return;
 			}
 
@@ -92,19 +94,38 @@ namespace fx
 				if (sit == streamPairs.end())
 				{
 					response->SetStatusCode(404);
-					response->End("Not found.");
+					response->End(fmt::sprintf("Not found. (missing requested file: %s/%s)", resourceName, fileName));
 					return;
 				}
 
-				fn = sit->second.onDiskPath;
+				if (!sit->second.loadDiskPath.empty())
+				{
+					fn = sit->second.loadDiskPath;
+				}
+				else
+				{
+					fn = sit->second.onDiskPath;
+				}
 			}
 
 			// get the TCP manager for a libuv loop
 			fwRefContainer<net::TcpServerManager> tcpManager = instance->GetComponent<net::TcpServerManager>();
-			auto uvLoop = tcpManager->GetLoop();
+			auto uvLoop = tcpManager->GetCurrentLoop();
 
 			// make a global request we reuse
 			auto req = std::make_shared<uv_fs_t>();
+
+			std::string fnRel = "<>";
+
+			try
+			{
+				std::filesystem::path filePath(fn);
+				fnRel = filePath.lexically_relative(instance->GetRootPath()).string();
+			}
+			catch (std::exception& e)
+			{
+
+			}
 
 			// stat() the file
 			uv_fs_stat(uvLoop, req.get(), fn.c_str(), UvCallbackWrap<uv_fs_t>(req.get(), [=](uv_fs_t* fsReq)
@@ -113,14 +134,12 @@ namespace fx
 				if (req->result < 0)
 				{
 					response->SetStatusCode(500);
-					response->End(fmt::sprintf("Stat of file failed. Error code from libuv: %d", int32_t(req->result)));
+					response->End(fmt::sprintf("Stat of file %s failed. Error code from libuv: %s (%d)", fnRel, uv_strerror(req->result), int32_t(req->result)));
 					return;
 				}
 
 				// store the size and send content-length
 				auto size = fsReq->statbuf.st_size;
-				response->SetHeader("content-length", std::to_string(size));
-				response->SetHeader("transfer-encoding", "identity");
 
 				// free the request
 				uv_fs_req_cleanup(fsReq);
@@ -132,7 +151,7 @@ namespace fx
 					if (req->result < 0)
 					{
 						response->SetStatusCode(500);
-						response->End("Opening file failed.");
+						response->End(fmt::sprintf("Opening file %s failed. Error code from libuv: %s (%d)", fnRel, uv_strerror(req->result), int32_t(req->result)));
 						return;
 					}
 
@@ -142,27 +161,34 @@ namespace fx
 
 					auto filter = filesComponent->CreateFilesFilter(fileName, request);
 
-					if (filter && filter->ShouldTerminate())
+					std::string reason;
+
+					if (filter && filter->ShouldTerminate(&reason))
 					{
 						response->SetStatusCode(403);
-						response->End("Filter says no.");
+						response->End(fmt::sprintf("Filter failed: %s.", reason));
 						return;
 					}
 
-					// write a 200 OK
+					// write header information and a 200 OK
+					response->SetHeader("content-length", std::to_string(size));
+					response->SetHeader("transfer-encoding", "identity");
+
 					response->WriteHead(200);
 
 					// read buffer and file handle
-					auto buffer = std::make_shared<std::array<char, 16384>>();
+					auto buffer = std::make_shared<std::unique_ptr<char[]>>();
+					*buffer = std::unique_ptr<char[]>(new char[kFileSendSize]);
 
-					auto uvBuf = uv_buf_init(buffer->data(), buffer->size());
+					auto uvBufRef = std::make_shared<uv_buf_t>();
+					*uvBufRef = uv_buf_init(buffer->get(), kFileSendSize);
 
 					// mutable read offset pointer
 					auto readOffset = std::make_shared<size_t>(0);
 
 					// to keep a reference to readCallback inside of itself
 					auto readCallback = std::make_shared<std::function<void(uv_fs_t*)>>();
-					*readCallback = [=](uv_fs_t* fsReq)
+					*readCallback = [=](uv_fs_t* fsReq) mutable
 					{
 						// read failed? report back
 						if (fsReq->result < 0)
@@ -182,33 +208,69 @@ namespace fx
 						// filter
 						if (filter)
 						{
-							filter->Filter(buffer->data(), fsReq->result);
+							filter->Filter(buffer->get(), fsReq->result);
 						}
 
 						// write to response
-						response->Write(std::string(buffer->data(), fsReq->result));
-
-						// increment read offset
-						*readOffset += req->result;
-
-						// has the full file been read yet?
-						// if not, call another read
-						if (*readOffset != size)
+						response->Write(std::move(*buffer), fsReq->result, [=](bool result) mutable
 						{
-							uv_fs_read(uvLoop, req.get(), file->get(), &uvBuf, 1, *readOffset, UvCallbackWrap<uv_fs_t>(req.get(), *readCallback));
-						}
-						else
-						{
-							// if so, end response (closing should be done automatically)
-							response->End();
+							if (!*readCallback)
+							{
+								return;
+							}
 
-							// reset the function reference to break the reference cycle
-							*readCallback = nullptr;
-						}
+							if (!result)
+							{
+								// if so, end response (closing should be done automatically)
+								response->End();
+
+								// reset the function reference to break the reference cycle
+								*readCallback = nullptr;
+
+								return;
+							}
+
+							// touch client
+							if (client)
+							{
+								client->Touch();
+							}
+
+							// increment read offset
+							*readOffset += req->result;
+
+							// has the full file been read yet?
+							// if not, call another read
+							if (*readOffset != size)
+							{
+								*buffer = std::unique_ptr<char[]>(new char[kFileSendSize]);
+								*uvBufRef = uv_buf_init(buffer->get(), kFileSendSize);
+
+								uv_fs_read(uvLoop, req.get(), file->get(), uvBufRef.get(), 1, *readOffset, UvCallbackWrap<uv_fs_t>(req.get(), *readCallback));
+							}
+							else
+							{
+								// if so, end response (closing should be done automatically)
+								response->End();
+
+								// reset the function reference to break the reference cycle
+								*readCallback = nullptr;
+							}
+						});
 					};
 
+					// on-close handler
+					request->SetCancelHandler([=]() mutable
+					{
+						// if so, end response (closing should be done automatically)
+						response->End();
+
+						// reset the function reference to break the reference cycle
+						*readCallback = nullptr;
+					});
+
 					// trigger the first read
-					uv_fs_read(uvLoop, req.get(), file->get(), &uvBuf, 1, *readOffset, UvCallbackWrap<uv_fs_t>(req.get(), *readCallback));
+					uv_fs_read(uvLoop, req.get(), file->get(), uvBufRef.get(), 1, *readOffset, UvCallbackWrap<uv_fs_t>(req.get(), *readCallback));
 				}));
 			}));
 		};
@@ -222,7 +284,22 @@ namespace fx
 				return;
 			}
 
-			const auto& path = request->GetPath();
+			auto ra = request->GetRemoteAddress();
+			auto token = request->GetHeader("X-CitizenFX-Token");
+
+			fx::ClientSharedPtr client;
+
+			if (!token.empty())
+			{
+				client = clientRegistry->GetClientByConnectionToken(token);
+			}
+
+			if (!client)
+			{
+				client = clientRegistry->GetClientByTcpEndPoint(ra.substr(0, ra.find_last_of(':')));
+			}
+
+			auto path = std::string{ request->GetPath().c_str(), request->GetPath().size() };
 
 			if (path.length() >= 8)
 			{
@@ -243,7 +320,18 @@ namespace fx
 					std::string filesPathDecoded;
 					UrlDecode(filesPath, filesPathDecoded);
 
-					sendFile(request, response, resourceName, filesPathDecoded);
+					auto queryOffset = filesPathDecoded.rfind('?');
+					if (queryOffset != std::string::npos)
+					{
+						filesPathDecoded = filesPathDecoded.substr(0, queryOffset);
+					}
+
+					if (client)
+					{
+						client->Touch();
+					}
+
+					sendFile(request, response, resourceName, filesPathDecoded, client);
 					return;
 				}
 			}

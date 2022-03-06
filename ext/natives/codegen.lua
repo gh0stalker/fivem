@@ -1,6 +1,6 @@
 -- setup environment for the codegen'd file to execute in
-local codeEnvironment = {
-	
+codeEnvironment = {
+
 }
 
 types = {}
@@ -8,7 +8,9 @@ natives = {}
 rpcNatives = {}
 local curType
 local curNative
+local codeEnvironment = codeEnvironment
 
+local json = require('dkjson')
 local cfx = require('cfx')
 
 function codeEnvironment.type(typeName)
@@ -22,10 +24,17 @@ function codeEnvironment.type(typeName)
 
 	-- set a closure named after the type in the code environment
 	codeEnvironment[typeName] = function(argumentName)
-		return {
+		local t = {
 			type = typeEntry,
 			name = argumentName
 		}
+
+		return setmetatable(t, {
+			__call = function(t, list)
+				t.annotations = json.decode(list)
+				return t
+			end
+		})
 	end
 
 	codeEnvironment[typeName .. 'Ptr'] = function(argumentName)
@@ -110,7 +119,19 @@ function codeEnvironment.arguments(list)
 end
 
 function codeEnvironment.returns(typeName)
-	curNative.returns = types[typeName]
+	if type(typeName) == 'table' then
+		curNative.returns = typeName
+	else
+		curNative.returns = types[typeName]
+	end
+end
+
+function codeEnvironment.game(gameName)
+	curNative.game = gameName
+end
+
+function codeEnvironment.annotations(list)
+	curNative.annotations = json.decode(list)
 end
 
 function codeEnvironment.apiset(setName)
@@ -148,7 +169,7 @@ end
 local function getNative(nativeName)
 	-- get the native
 	local n
-	
+
 	for k, v in ipairs(natives) do
 		if v.name == nativeName and (#v.apiset == 0 or v.apiset[1] == 'client') then
 			n = v
@@ -157,6 +178,33 @@ local function getNative(nativeName)
 	end
 
 	return n
+end
+
+local function getServerNative(nativeName)
+	-- get the native
+	local n
+	
+	for k, v in ipairs(natives) do
+		if v.name == nativeName and #v.apiset > 0 and v.apiset[1] == 'server' then
+			n = v
+			break
+		end
+	end
+
+	return n
+end
+
+local function removeServerNative(nativeName)
+	local n = getServerNative(nativeName)
+
+	if n then
+		for k, v in pairs(natives) do
+			if v == n then
+				table.remove(natives, k)
+				break
+			end
+		end
+	end
 end
 
 function rpcEnvironment.context_rpc(nativeName)
@@ -200,7 +248,25 @@ function rpcEnvironment.context_rpc(nativeName)
 				type = 'Player'
 			})
 		elseif not isPrimitive(v.type) then
-			error(('Type %s is not supported for RPC natives.'):format(v.type.name))
+			if not ctx then
+				if v.pointer then
+					ctx = { idx = k - 1, type = 'ObjDel' }
+					
+					table.insert(args, {
+						translate = true,
+						type = 'ObjDel'
+					})
+				else
+					ctx = { idx = k - 1, type = 'ObjRef' }
+					
+					table.insert(args, {
+						translate = true,
+						type = 'ObjRef'
+					})
+				end
+			else
+				error(('Type %s is not supported for RPC natives.'):format(v.type.name))
+			end
 		else
 			table.insert(args, {
 				type = v.type.name
@@ -214,11 +280,14 @@ function rpcEnvironment.context_rpc(nativeName)
 
 	rn.ctx = ctx
 	rn.args = args
-	
+
+	removeServerNative(nativeName)
 	codeEnvironment.native(nativeName)
 		codeEnvironment.arguments(n.arguments)
 		codeEnvironment.apiset('server')
 		codeEnvironment.returns('void')
+		curNative.rpc = true
+		curNative.ogHash = n.hash
 
 		if n.doc then
 			codeEnvironment.doc(n.doc)
@@ -230,6 +299,52 @@ function rpcEnvironment.context_rpc(nativeName)
 	rn.type = 'ctx'
 
 	table.insert(rpcNatives, rn)
+	
+	return function(tbl)
+		-- single getter
+		if type(tbl) == 'table' and #tbl == 1 then
+			tbl = { getter = tbl[1] }
+		end
+		
+		-- if we need to define a getter
+		if tbl.getter then
+			local rvArg = n.arguments[2].type
+			
+			local function isFloat(arg)
+				return arg.type.nativeType == 'float'
+			end
+			
+			-- check if this is perhaps a vector3
+			if #n.arguments >= 4 and isFloat(n.arguments[2]) and isFloat(n.arguments[3]) and isFloat(n.arguments[4]) then
+				rvArg = types['Vector3']
+			end
+			
+			rn.getter = {
+				returnType = rvArg.name,
+				returnArgStart = 1,
+				name = tbl.getter
+			}
+			
+			local cxtRef
+			
+			if ctx.type == 'Player' then
+				cxtRef = codeEnvironment.Player
+			elseif ctx.type == 'Entity' then
+				cxtRef = codeEnvironment.Entity
+			elseif ctx.type == 'ObjRef' then
+				cxtRef = codeEnvironment.int
+			end
+			
+			if not getServerNative(tbl.getter) then
+				codeEnvironment.native(tbl.getter)
+					codeEnvironment.arguments {
+						cxtRef 'self'
+					}
+					codeEnvironment.apiset('server')
+					codeEnvironment.returns(rvArg)
+			end
+		end
+	end
 end
 
 function rpcEnvironment.entity_rpc(nativeName)
@@ -274,11 +389,14 @@ function rpcEnvironment.entity_rpc(nativeName)
 	end
 
 	rn.args = args
-	
+
+	removeServerNative(nativeName)
 	codeEnvironment.native(nativeName)
 		codeEnvironment.arguments(n.arguments)
 		codeEnvironment.apiset('server')
 		codeEnvironment.returns('Entity')
+		curNative.rpc = true
+		curNative.ogHash = n.hash
 
 		if n.doc then
 			codeEnvironment.doc(n.doc)
@@ -288,6 +406,69 @@ function rpcEnvironment.entity_rpc(nativeName)
 	rn.name = nativeName
 
 	rn.type = 'entity'
+
+	table.insert(rpcNatives, rn)
+end
+
+function rpcEnvironment.object_rpc(nativeName)
+	local n = getNative(nativeName)
+
+	if not n then
+		return
+	end
+
+	if not n.returns then
+		error('Object natives are required to return an object.')
+	end
+
+	if isType(n.returns, 'Entity') then
+		error('Object natives are not entity natives.')
+	end
+
+	local rn = {}
+
+	-- generate native arguments
+	local args = {}
+
+	for k, v in ipairs(n.arguments) do
+		-- is this an entity?
+		if isType(v.type, 'Entity') then
+			table.insert(args, {
+				translate = true,
+				type = 'Entity'
+			})
+		elseif v.type.name == 'Player' then
+			table.insert(args, {
+				translate = true,
+				type = 'Player'
+			})
+		elseif not isPrimitive(v.type) then
+			error(('Type %s is not supported for RPC natives.'):format(v.type.name))
+		else
+			table.insert(args, {
+				type = v.type.name
+			})
+		end
+	end
+
+	rn.args = args
+	
+	removeServerNative(nativeName)
+	codeEnvironment.native(nativeName)
+		codeEnvironment.arguments(n.arguments)
+		codeEnvironment.apiset('server')
+		codeEnvironment.returns(n.returns)
+		curNative.rpc = true
+		curNative.ogHash = n.hash
+
+		if n.doc then
+			codeEnvironment.doc(n.doc)
+		end
+
+	rn.hash = n.hash
+	rn.name = nativeName
+
+	rn.type = 'object'
 
 	table.insert(rpcNatives, rn)
 end
@@ -314,13 +495,13 @@ function parseDocString(native)
 	end
 
 	local summary = trim(docString:match("<summary>(.+)</summary>"))
-	local params = docString:gmatch("<param name=\"([^\"]+)\">([^<]+)</param>")
+	local params = docString:gmatch("<param name=\"([^\"]+)\">([^<]*)</param>")
 	local returns = docString:match("<returns>(.+)</returns>")
 
 	if not summary then
 		return nil
 	end
-	
+
 	summary = trim(summary:gsub('^```(.+)```$', '%1'))
 
 	local paramsData = {}
@@ -339,9 +520,21 @@ function parseDocString(native)
 	}
 end
 
+local gFilterRpc = false
 local gApiSet = 'server'
+local ourGame = 'gta5'
 
 function matchApiSet(native)
+	local game = native.game
+
+	if ourGame and native.game and native.game ~= ourGame then
+		return false
+	end
+
+	if gFilterRpc and not native.rpc then
+		return false
+	end
+
 	local apisets = native.apiset
 
 	if #apisets == 0 then
@@ -364,12 +557,28 @@ local globalNatives = false
 
 if #arg > 0 then
 	if arg[1]:match('gta_universal') then
-		arg[1] = 'out/natives_global.lua'
+		arg[1] = 'inp/natives_global.lua'
 	end
-	
+
+	if arg[1]:match('rdr3_universal') then
+		arg[1] = 'inp/natives_rdr3.lua'
+	end
+
+	if arg[1]:match('ny_universal') then
+		arg[1] = 'inp/natives_ny.lua'
+	end
+
+	if arg[1]:match('rdr3') then
+		ourGame = 'rdr3'
+	end
+
+	if arg[1]:match('_ny') then
+		ourGame = 'ny'
+	end
+
 	loadDefinition(arg[1])
-	
-	if arg[1]:match('natives_global') then
+
+	if arg[1]:match('natives_global') or arg[1]:match('natives_rdr3') or arg[1]:match('natives_ny') then
 		globalNatives = true
 	end
 
@@ -384,12 +593,28 @@ if #arg > 2 then
 	gApiSet = arg[3]
 end
 
+if #arg > 3 then
+	if arg[4] == 'rpc' then
+		gFilterRpc = true
+	end
+end
+
+-- server has Player be charPtr, not int
+if gApiSet == 'server' then
+	types['Player'].nativeType = 'string'
+end
+
+if not gFilterRpc then
+	loadDefinition 'inp/natives_cfx.lua'
+end
+
 if not globalNatives then
-	loadDefinition 'out/natives_cfx.lua'
 	loadDefinition 'codegen_dlc_natives.lua'
 end
 
-loadRpcDefinition 'rpc_spec_natives.lua'
+if arg[1]:match('ves_glo') then
+	loadRpcDefinition 'rpc_spec_natives.lua'
+end
 
 _natives = {}
 
@@ -400,5 +625,7 @@ end
 table.sort(_natives, function(a, b)
 	return a.name < b.name
 end)
+
+_G.gApiSet = gApiSet
 
 dofile('codegen_out_' .. outputType .. '.lua')

@@ -13,11 +13,23 @@
 #include <NetAddress.h>
 #include <ppltasks.h>
 
+namespace lab
+{
+	class AudioContext;
+}
+
 struct MumbleConnectionInfo
 {
 	bool isConnected;
+	bool isConnecting;
 	net::PeerAddress address;
 	std::string username;
+
+	inline MumbleConnectionInfo()
+		: isConnected(false), isConnecting(false)
+	{
+
+	}
 };
 
 enum class MumbleActivationMode
@@ -35,6 +47,26 @@ enum class MumbleVoiceLikelihood
 	HighLikelihood
 };
 
+struct VoiceTargetConfig
+{
+	struct Target
+	{
+		std::vector<std::wstring> users;
+		std::string channel;
+		// ACL is not supported in umurmur, so does not count
+		bool links;
+		bool children;
+
+		inline Target()
+			: links(false), children(false)
+		{
+
+		}
+	};
+
+	std::list<Target> targets;
+};
+
 class IMumbleClient : public fwRefCountable
 {
 public:
@@ -47,6 +79,8 @@ public:
 
 	virtual concurrency::task<void> DisconnectAsync() = 0;
 
+	virtual void RunFrame() = 0;
+
 	virtual MumbleConnectionInfo* GetConnectionInfo() = 0;
 
 	virtual bool IsAnyoneTalking() = 0;
@@ -55,15 +89,39 @@ public:
 
 	virtual void SetChannel(const std::string& channelName) = 0;
 
+	virtual void SetClientVolumeOverride(const std::wstring& clientName, float volume) = 0;
+
+	virtual void SetClientVolumeOverrideByServerId(uint32_t serverId, float volume) = 0;
+
+	virtual std::wstring GetPlayerNameFromServerId(uint32_t serverId) = 0;
+
+	virtual std::string GetVoiceChannelFromServerId(uint32_t serverId) = 0;
+
 	virtual void GetTalkers(std::vector<std::string>* names) = 0;
 
 	virtual void SetPositionHook(const TPositionHook& hook) = 0;
 
 	virtual void SetAudioDistance(float distance) = 0;
 
+	virtual void SetAudioInputDistance(float distance) = 0;
+
+	virtual void SetAudioOutputDistance(float distance) = 0;
+
+	virtual float GetAudioDistance() = 0;
+
 	virtual void SetActorPosition(float position[3]) = 0;
 
 	virtual void SetListenerMatrix(float position[3], float front[3], float up[3]) = 0;
+
+	virtual void UpdateVoiceTarget(int idx, const VoiceTargetConfig& config) = 0;
+
+	virtual void SetVoiceTarget(int idx) = 0;
+
+	virtual void AddListenChannel(const std::string& channelName) = 0;
+
+	virtual void RemoveListenChannel(const std::string& channelName) = 0;
+
+	virtual std::shared_ptr<lab::AudioContext> GetAudioContext(const std::string& name) = 0;
 
 	// settings
 	virtual void SetActivationMode(MumbleActivationMode mode) = 0;

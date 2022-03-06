@@ -7,26 +7,31 @@
 
 #include "StdInc.h"
 
+#ifdef LAUNCHER_PERSONALITY_MAIN
+#include <CfxLocale.h>
 #include <shellapi.h>
 #include <wincrypt.h>
 #include <wintrust.h>
 #include <softpub.h>
+#include <sstream>
+
+#include <CfxState.h>
+#include <HostSharedData.h>
 
 #include <citversion.h>
 
-#pragma comment(lib, "wintrust")
-//#pragma comment(linker,"/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+extern std::string GetObjectURL(std::string_view objectHash, std::string_view suffix = "");
 
-bool Bootstrap_UpdateEXE(int exeSize)
+static bool Bootstrap_UpdateEXE(int exeSize, const std::string& objectHash)
 {
 	_unlink("CitizenFX.exe.new");
 
 	const char* fn = "CitizenFX.exe.new";
-	CL_QueueDownload(va(CONTENT_URL "/%s/bootstrap/CitizenFX.exe.xz", GetUpdateChannel()), fn, exeSize, true);
+	CL_QueueDownload(GetObjectURL(objectHash, ".xz").c_str(), fn, exeSize, compressionAlgo_e::XZ);
 
 	UI_DoCreation(true);
 
-	UI_UpdateText(0, L"Bootstrapping " PRODUCT_NAME L"...");
+	UI_UpdateText(0, fmt::sprintf(gettext(L"Bootstrapping %s..."), PRODUCT_NAME).c_str());
 
 	if (!DL_RunLoop())
 	{
@@ -36,7 +41,6 @@ bool Bootstrap_UpdateEXE(int exeSize)
 
 	UI_DoDestruction();
 
-	// verify the signature on the EXE
 	wchar_t wfn[512];
 	MultiByteToWideChar(CP_ACP, 0, fn, -1, wfn, 512);
 
@@ -51,7 +55,14 @@ bool Bootstrap_UpdateEXE(int exeSize)
 
 	PROCESS_INFORMATION processInfo;
 
-	CreateProcess(wfn, (LPWSTR)va(L"%s -bootstrap \"%s\"", wfn, exePath), NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
+	int argc;
+	LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+	std::wstringstream passThroughStream;
+	for (auto i = 1; i < argc; i++) {
+		passThroughStream << L" " << argv[i];
+	}
+	std::wstring passThrough = passThroughStream.str();
+	CreateProcess(wfn, (LPWSTR)va(L"%s -bootstrap \"%s\"%s", wfn, exePath, passThrough.c_str()), NULL, NULL, FALSE, 0, NULL, NULL, &startupInfo, &processInfo);
 
 	return false;
 }
@@ -60,32 +71,74 @@ bool Install_RunInstallMode();
 
 bool VerifyViability();
 
+extern void ResetUpdateChannel();
+
 bool Bootstrap_DoBootstrap()
 {
 	// first check the bootstrapper version
 	char bootstrapVersion[256];
 
-	int result = DL_RequestURL(va(CONTENT_URL "/%s/bootstrap/version.txt", GetUpdateChannel()), bootstrapVersion, sizeof(bootstrapVersion));
+	auto contentHeaders = std::make_shared<HttpHeaderList>();
+
+	auto fetchContent = [&contentHeaders, &bootstrapVersion](const std::string& updateChannel)
+	{
+		return DL_RequestURL(va(CONTENT_URL "/heads/" CONTENT_NAME "/%s?time=%lld", updateChannel, _time64(NULL)), bootstrapVersion, sizeof(bootstrapVersion), contentHeaders);
+	};
+
+	int result = fetchContent(GetUpdateChannel());
+	bool updateDataValid = true;
 
 	if (result != 0)
 	{
-		if (GetFileAttributes(MakeRelativeCitPath(L"CoreRT.dll").c_str()) == INVALID_FILE_ATTRIBUTES)
+		bool recovered = false;
+
+		// if not production, try to recover
+		if (GetUpdateChannel() != "production")
 		{
-			MessageBox(NULL, va(L"An error (%i, %s) occurred while checking the bootstrapper version. Check if " CONTENT_URL_WIDE L" is available in your web browser.", result, ToWide(DL_RequestURLError())), L"O\x448\x438\x431\x43A\x430", MB_OK | MB_ICONSTOP);
-			return false;
+			int newResult = fetchContent("production");
+
+			if (newResult == 0)
+			{
+				ResetUpdateChannel();
+				recovered = true;
+			}
 		}
 
-		return true;
+		if (!recovered)
+		{
+			if (GetFileAttributes(MakeRelativeCitPath(L"CoreRT.dll").c_str()) == INVALID_FILE_ATTRIBUTES)
+			{
+				MessageBox(NULL, va(L"An error (%i, %s) occurred while checking the bootstrapper version. Check if " CONTENT_URL_WIDE L" is available in your web browser.", result, ToWide(DL_RequestURLError())), L"O\x448\x438\x431\x43A\x430", MB_OK | MB_ICONSTOP);
+				return false;
+			}
+
+			updateDataValid = false;
+		}
 	}
 
-	//int version = atoi(bootstrapVersion);
-	int version;
-	int exeSize;
-	sscanf(bootstrapVersion, "%i %i", &version, &exeSize);
-
-	if (version != BASE_EXE_VERSION && GetFileAttributes(MakeRelativeCitPath(L"nobootstrap.txt").c_str()) == INVALID_FILE_ATTRIBUTES)
+	if (updateDataValid)
 	{
-		return Bootstrap_UpdateEXE(exeSize);
+		int version = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-version"]);
+		int exeSize = std::stoi((*contentHeaders)["x-amz-meta-bootstrap-size"]);
+
+		if (version == 0 || exeSize == 0)
+		{
+			if (GetFileAttributes(MakeRelativeCitPath(L"CoreRT.dll").c_str()) == INVALID_FILE_ATTRIBUTES)
+			{
+				MessageBox(NULL, va(L"An error (%i, %s) occurred while checking the bootstrapper version. Check if " CONTENT_URL_WIDE L" is available in your web browser.", result, ToWide(DL_RequestURLError())), L"O\x448\x438\x431\x43A\x430", MB_OK | MB_ICONSTOP);
+				return false;
+			}
+
+			updateDataValid = false;
+		}
+
+		if (updateDataValid)
+		{
+			if (version != BASE_EXE_VERSION && GetFileAttributes(MakeRelativeCitPath(L"nobootstrap.txt").c_str()) == INVALID_FILE_ATTRIBUTES)
+			{
+				return Bootstrap_UpdateEXE(exeSize, (*contentHeaders)["x-amz-meta-bootstrap-object"]);
+			}
+		}
 	}
 
 	// after self-updating, attempt to run install mode if needed
@@ -103,19 +156,30 @@ bool Bootstrap_DoBootstrap()
 		}
 	}
 
+	static HostSharedData<CfxState> initState("CfxInitState");
+	initState->ranPastInstaller = true;
+
     if (!VerifyViability())
     {
         return false;
     }
 
-#ifdef GTA_NY
-	return Updater_RunUpdate(1, "citiv");
-#else
-	return Updater_RunUpdate(1, "fivereborn");
+	if (updateDataValid)
+	{
+#ifdef GTA_FIVE
+		if (launch::IsSDK())
+		{
+			return Updater_RunUpdate({ CONTENT_NAME, "fxdk-five" });
+		}
 #endif
+
+		return Updater_RunUpdate({ CONTENT_NAME });
+	}
+
+	return true;
 }
 
-void Bootstrap_ReplaceExecutable(const wchar_t* fileName)
+void Bootstrap_ReplaceExecutable(const wchar_t* fileName, const std::wstring& passThrough)
 {
 	wchar_t thisFileName[512];
 	GetModuleFileName(GetModuleHandle(NULL), thisFileName, sizeof(thisFileName) / 2);
@@ -196,7 +260,7 @@ void Bootstrap_ReplaceExecutable(const wchar_t* fileName)
 
 	DeleteFile(va(L"%s.old", fileName));
 
-	ShellExecute(NULL, L"open", fileName, L"", L"", SW_SHOWDEFAULT);
+	ShellExecute(NULL, L"open", fileName, passThrough.c_str(), L"", SW_SHOWDEFAULT);
 }
 
 void Bootstrap_MoveExecutable(const wchar_t* mode)
@@ -230,11 +294,16 @@ bool Bootstrap_RunInit()
 	int argc;
 	LPWSTR* argv = CommandLineToArgvW(GetCommandLine(), &argc);
 
-	if (argc == 3)
+	if (argc >= 3)
 	{
 		if (!_wcsicmp(argv[1], L"-bootstrap"))
 		{
-			Bootstrap_ReplaceExecutable(argv[2]);
+			std::wstringstream passThrough(L"");
+			for (auto i = 3; i < argc; i++) {
+				passThrough << (i > 3 ? L" " : L"") << argv[i];
+			}
+
+			Bootstrap_ReplaceExecutable(argv[2], passThrough.str());
 			LocalFree(argv);
 			return true;
 		}
@@ -258,3 +327,4 @@ bool Bootstrap_RunInit()
 
 	return false;
 }
+#endif

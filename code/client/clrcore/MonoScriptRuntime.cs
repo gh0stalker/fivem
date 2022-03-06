@@ -12,11 +12,15 @@ namespace CitizenFX.Core
 	[Guid("C068E0AB-DD9C-48F2-A7F3-69E866D27F17")]
 	class MonoScriptRuntime : IScriptRuntime, IScriptFileHandlingRuntime, IScriptTickRuntime, IScriptEventRuntime, IScriptRefRuntime, IScriptMemInfoRuntime, IScriptStackWalkingRuntime
 	{
+		// disable IDE warning: this is used to retain a reference to unmanaged stuff
+#pragma warning disable IDE0052 // Remove unread private members
 		private IScriptHost m_scriptHost;
+#pragma warning restore IDE0052 // Remove unread private members
 		private readonly int m_instanceId;
 		private AppDomain m_appDomain;
 		private InternalManager m_intManager;
 		private IntPtr m_parentObject;
+		private IntPtr m_comRuntime;
 
 		private static readonly Random ms_random = new Random();
 
@@ -42,6 +46,7 @@ namespace CitizenFX.Core
 				string resourceName = Marshal.PtrToStringAnsi(nameString);
 
 				bool useTaskScheduler = true;
+				bool useSyncContext = false;
 
 #if IS_FXSERVER
 				string basePath = "";
@@ -52,6 +57,15 @@ namespace CitizenFX.Core
 
 					basePath = Native.API.GetResourcePath(resourceName);
 					useTaskScheduler = Native.API.GetNumResourceMetadata(resourceName, "clr_disable_task_scheduler") == 0;
+					useSyncContext = Native.API.GetNumResourceMetadata(resourceName, "clr_experimental_2021_12_31_use_sync_context") > 0;
+
+					if (host is IScriptHostWithManifest manifestHost)
+					{
+						if (manifestHost.IsManifestVersionV2Between("bodacious", ""))
+						{
+							useTaskScheduler = false;
+						}
+					}
 				}
 #endif
 
@@ -71,6 +85,8 @@ namespace CitizenFX.Core
 					m_intManager.CreateTaskScheduler();
 				}
 
+				m_intManager.SetConfiguration(useSyncContext: useSyncContext);
+
 				m_intManager.SetResourceName(resourceName);
 
 				// TODO: figure out a cleaner solution to Mono JIT corruption so server doesn't have to be slower
@@ -78,6 +94,8 @@ namespace CitizenFX.Core
 				m_intManager.SetScriptHost(new WrapScriptHost(host), m_instanceId);
 #else
 				m_intManager.SetScriptHost(Marshal.GetIUnknownForObject(host), m_instanceId);
+
+				m_comRuntime = Marshal.GetComInterfaceForObject(this, typeof(IScriptRuntime));
 #endif
 			}
 			catch (Exception e)
@@ -119,7 +137,8 @@ namespace CitizenFX.Core
 			return m_instanceId;
 		}
 
-		public int HandlesFile(string filename)
+		[SecuritySafeCritical]
+		public int HandlesFile(string filename, IScriptHostWithResourceData metadata)
 		{
 			return (filename.EndsWith(".net.dll") ? 1 : 0);
 		}
@@ -286,7 +305,7 @@ namespace CitizenFX.Core
 
 		public PushRuntime GetPushRuntime()
 		{
-			return new PushRuntime(this);
+			return new PushRuntime(this, m_comRuntime);
 		}
 
 		public class WrapIStream : MarshalByRefObject, fxIStream, IDisposable
@@ -383,6 +402,11 @@ namespace CitizenFX.Core
 			public void SubmitBoundaryEnd(byte[] d, int l)
 			{
 				m_realHost.SubmitBoundaryEnd(d, l);
+			}
+
+			public IntPtr GetLastErrorText()
+			{
+				return m_realHost.GetLastErrorText();
 			}
 
 			[SecurityCritical]

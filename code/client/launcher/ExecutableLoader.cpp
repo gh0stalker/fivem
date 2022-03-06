@@ -43,7 +43,14 @@ void ExecutableLoader::LoadImports(IMAGE_NT_HEADERS* ntHeader)
 
 		if (!module)
 		{
-			FatalError("Could not load dependent module %s. Error code was %i.\n", name, GetLastError());
+			auto errorCode = GetLastError();
+
+			wchar_t errorText[512];
+			errorText[0] = L'\0';
+
+			FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS | FORMAT_MESSAGE_MAX_WIDTH_MASK, nullptr, errorCode, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), errorText, std::size(errorText), nullptr);
+
+			FatalError("Could not load dependent module %s. Error code %i -> %s\n", name, errorCode, ToNarrow(errorText));
 		}
 
 		// "don't load"
@@ -114,9 +121,80 @@ void ExecutableLoader::LoadSection(IMAGE_SECTION_HEADER* section)
 		uint32_t sizeOfData = fwMin(section->SizeOfRawData, section->Misc.VirtualSize);
 
 		memcpy(targetAddress, sourceAddress, sizeOfData);
+	}
 
-		DWORD oldProtect;
-		VirtualProtect(targetAddress, sizeOfData, PAGE_EXECUTE_READWRITE, &oldProtect);
+	DWORD oldProtect;
+	VirtualProtect(targetAddress, section->Misc.VirtualSize, PAGE_EXECUTE_READWRITE, &oldProtect);
+
+	DWORD protection = 0;
+	if (section->Characteristics & IMAGE_SCN_MEM_NOT_CACHED)
+	{
+		protection |= PAGE_NOCACHE;
+	}
+
+	if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE)
+	{
+		if (section->Characteristics & IMAGE_SCN_MEM_READ)
+		{
+			if (section->Characteristics & IMAGE_SCN_MEM_WRITE)
+			{
+				protection |= PAGE_EXECUTE_READWRITE;
+			}
+			else
+			{
+				protection |= PAGE_EXECUTE_READ;
+			}
+		}
+		else
+		{
+			if (section->Characteristics & IMAGE_SCN_MEM_WRITE)
+			{
+				protection |= PAGE_EXECUTE_WRITECOPY;
+			}
+			else
+			{
+				protection |= PAGE_EXECUTE;
+			}
+		}
+	}
+	else
+	{
+		if (section->Characteristics & IMAGE_SCN_MEM_READ)
+		{
+			if (section->Characteristics & IMAGE_SCN_MEM_WRITE)
+			{
+				protection |= PAGE_READWRITE;
+			}
+			else
+			{
+				protection |= PAGE_READONLY;
+			}
+		}
+		else
+		{
+			if (section->Characteristics & IMAGE_SCN_MEM_WRITE)
+			{
+				protection |= PAGE_WRITECOPY;
+			}
+			else
+			{
+				protection |= PAGE_NOACCESS;
+			}
+		}
+	}	
+
+	if (protection)
+	{
+		m_targetProtections.push_back({ targetAddress, section->Misc.VirtualSize, protection });
+	}
+}
+
+void ExecutableLoader::Protect()
+{
+	for (const auto& protection : m_targetProtections)
+	{
+		DWORD op;
+		VirtualProtect(std::get<0>(protection), std::get<1>(protection), std::get<2>(protection), &op);
 	}
 }
 
@@ -216,6 +294,7 @@ void ExecutableLoader::LoadExceptionTable(IMAGE_NT_HEADERS* ntHeader)
 #endif
 
 static void InitTlsFromExecutable();
+extern HMODULE tlsDll;
 
 void ExecutableLoader::LoadIntoModule(HMODULE module)
 {
@@ -243,7 +322,7 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 
 	LoadSections(ntHeader);
 
-	if (getenv("CitizenFX_ToolMode") == nullptr)
+	//if (getenv("CitizenFX_ToolMode") == nullptr)
 	{
 		LoadSnapshot(ntHeader);
 	}
@@ -263,39 +342,46 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 	// copy over TLS index (source in this case indicates the TLS data to copy from, which is the launcher app itself)
 	if (ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size)
 	{
-#if defined(GTA_NY)
-		const IMAGE_TLS_DIRECTORY* targetTls = GetRVA<IMAGE_TLS_DIRECTORY>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-		const IMAGE_TLS_DIRECTORY* sourceTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-
-		*(DWORD*)(targetTls->AddressOfIndex) = *(DWORD*)(sourceTls->AddressOfIndex);
-#else
 		const IMAGE_TLS_DIRECTORY* targetTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 		const IMAGE_TLS_DIRECTORY* sourceTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
 
-		if (sourceTls->AddressOfIndex)
-		{
-			*(DWORD*)(sourceTls->AddressOfIndex) = 0;
-		}
-
-		// note: 32-bit!
 #if defined(_M_IX86)
-		LPVOID tlsBase = *(LPVOID*)__readfsdword(0x2C);
+		LPVOID* tlsBase = (LPVOID*)__readfsdword(0x2C);
 #elif defined(_M_AMD64)
-		LPVOID tlsBase = *(LPVOID*)__readgsqword(0x58);
+		LPVOID* tlsBase = (LPVOID*)__readgsqword(0x58);
 #endif
 
+#ifndef GTA_NY
+		uint32_t tlsIndex = 0;
+		void* tlsInit = nullptr;
+
+		auto tlsExport = (void(*)(void**, uint32_t*))GetProcAddress(tlsDll, "GetThreadLocalStorage");
+		tlsExport(&tlsInit, &tlsIndex);
+
+		assert(tlsIndex < 64);
+
+		if (sourceTls->StartAddressOfRawData)
+		{
+			DWORD oldProtect;
+			VirtualProtect(tlsInit, sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData, PAGE_READWRITE, &oldProtect);
+
+			memcpy(tlsBase[tlsIndex], reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+			memcpy(tlsInit, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+		}
+
+		if (sourceTls->AddressOfIndex)
+		{
+			hook::put(sourceTls->AddressOfIndex, tlsIndex);
+		}
+#else
 		if (sourceTls->StartAddressOfRawData)
 		{
 			DWORD oldProtect;
 			VirtualProtect((void*)targetTls->StartAddressOfRawData, sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData, PAGE_READWRITE, &oldProtect);
 
-			memcpy(tlsBase, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
+			memcpy(tlsBase[0], reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
 			memcpy((void*)targetTls->StartAddressOfRawData, reinterpret_cast<void*>(sourceTls->StartAddressOfRawData), sourceTls->EndAddressOfRawData - sourceTls->StartAddressOfRawData);
 		}
-		/*#else
-			const IMAGE_TLS_DIRECTORY* targetTls = GetTargetRVA<IMAGE_TLS_DIRECTORY>(ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress);
-
-			m_tlsInitializer(targetTls);*/
 #endif
 	}
 
@@ -305,7 +391,7 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 	// copy over the offset to the new imports directory
 	sourceNtHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT] = ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
 
-#if defined(GTA_FIVE)
+#if defined(GTA_FIVE) || defined(IS_RDR3) || defined(GTA_NY)
 	memcpy(sourceNtHeader, ntHeader, sizeof(IMAGE_NT_HEADERS) + (ntHeader->FileHeader.NumberOfSections * (sizeof(IMAGE_SECTION_HEADER))));
 #endif
 
@@ -326,7 +412,15 @@ bool ExecutableLoader::ApplyRelocations()
 	IMAGE_BASE_RELOCATION* relocation = GetTargetRVA<IMAGE_BASE_RELOCATION>(relocationDirectory->VirtualAddress);
 	IMAGE_BASE_RELOCATION* endRelocation = reinterpret_cast<IMAGE_BASE_RELOCATION*>((char*)relocation + relocationDirectory->Size);
 
-	intptr_t relocOffset = reinterpret_cast<intptr_t>(m_module) - 0x140000000;
+	constexpr uintptr_t base =
+#ifdef _M_AMD64
+	0x140000000
+#else
+	0x400000
+#endif
+	;
+
+	intptr_t relocOffset = reinterpret_cast<intptr_t>(m_module) - static_cast<intptr_t>(base);
 
 	if (relocOffset == 0)
 	{
@@ -388,3 +482,5 @@ HMODULE ExecutableLoader::ResolveLibrary(const char* name)
 {
 	return m_libraryLoader(name);
 }
+
+//

@@ -7,10 +7,14 @@
 
 #include "StdInc.h"
 
-#ifdef GTA_FIVE
+#if defined(GTA_FIVE) || defined(IS_RDR3)
 #include <Hooking.h>
 
+#if defined(IS_RDR3)
+static uintptr_t g_currentStub = 0x148000000;
+#else
 static uintptr_t g_currentStub = 0x146000000;
+#endif
 
 extern "C"
 {
@@ -47,4 +51,62 @@ extern "C"
 		return code;
 	}
 }
+#endif
+
+#ifndef IS_FXSERVER
+#include <Hooking.Patterns.h>
+
+static std::multimap<uint64_t, uintptr_t> g_hints;
+
+extern "C" CORE_EXPORT auto CoreGetPatternHints()
+{
+	return &g_hints;
+}
+
+static InitFunction initFunction([]()
+{
+#ifndef GTA_NY
+	if (wcsstr(GetCommandLineW(), L"_ROSLauncher") || wcsstr(GetCommandLineW(), L"_ROSService"))
+	{
+		if (getenv("CitizenFX_ToolMode"))
+		{
+			g_currentStub = 0x140000000 + 0x02E23600;
+		}
+	}
+#endif
+
+	// don't load hints for chromebrowser subprocess
+	if (wcsstr(GetCommandLineW(), L"_ChromeBrowser"))
+	{
+		return;
+	}
+
+	std::wstring hintsFile = MakeRelativeCitPath(L"citizen\\hints.dat");
+	FILE* hints = _wfopen(hintsFile.c_str(), L"rb");
+	size_t numHints = 0;
+
+	if (hints)
+	{
+		while (!feof(hints))
+		{
+			uint64_t hash;
+			uintptr_t hint;
+
+			fread(&hash, 1, sizeof(hash), hints);
+			fread(&hint, 1, sizeof(hint), hints);
+
+			hook::pattern::hint(hash, hint);
+
+			numHints++;
+		}
+
+		fclose(hints);
+	}
+
+	// over 48k hints? that might be anomalous: regenerate them
+	if (numHints > (48 * 1024))
+	{
+		_wunlink(hintsFile.c_str());
+	}
+});
 #endif

@@ -13,13 +13,296 @@
 
 #include <deque>
 
+struct nghttp2_session_wrap
+{
+	nghttp2_session* session;
+
+	nghttp2_session_wrap(nghttp2_session* session)
+		: session(session)
+	{
+	
+	}
+
+	~nghttp2_session_wrap()
+	{
+		if (session)
+		{
+			nghttp2_session_del(session);
+			session = {};
+		}
+	}
+
+	inline operator nghttp2_session*() const
+	{
+		return session;
+	}
+};
+
+struct ZeroCopyByteBuffer
+{
+	struct Element
+	{
+		std::string string;
+		std::vector<uint8_t> vec;
+		std::unique_ptr<char[]> raw;
+		size_t rawLength;
+		size_t read;
+
+		fu2::unique_function<void(bool)> cb;
+
+		int type;
+
+		Element(std::vector<uint8_t>&& vec, fu2::unique_function<void(bool)>&& cb)
+			: read(0), type(1), vec(std::move(vec)), cb(std::move(cb))
+		{
+			
+		}
+
+		Element(std::string&& str, fu2::unique_function<void(bool)>&& cb)
+			: read(0), type(0), string(std::move(str)), cb(std::move(cb))
+		{
+			
+		}
+
+		Element(std::unique_ptr<char[]> raw, size_t length, fu2::unique_function<void(bool)>&& cb)
+			: read(0), type(2), raw(std::move(raw)), rawLength(length), cb(std::move(cb))
+		{
+
+		}
+
+		// we lied! we copy anyway :(
+		Element(const std::vector<uint8_t>& vec, fu2::unique_function<void(bool)>&& cb)
+			: read(0), type(1), vec(vec), cb(std::move(cb))
+		{
+			this->vec = vec;
+		}
+
+		Element(const std::string& str, fu2::unique_function<void(bool)>&& cb)
+			: read(0), type(0), string(str), cb(std::move(cb))
+		{
+			
+		}
+
+		size_t Size() const
+		{
+			switch (type)
+			{
+			case 0:
+				return string.size();
+			case 1:
+				return vec.size();
+			case 2:
+				return rawLength;
+			}
+
+			return 0;
+		}
+
+		void Advance(size_t len)
+		{
+			read += len;
+		}
+
+		size_t Leftover() const
+		{
+			return Size() - read;
+		}
+	};
+
+	template<typename TContainer>
+	void Push(TContainer&& elem, fu2::unique_function<void(bool)>&& cb)
+	{
+		elements.emplace_back(std::move(elem), std::move(cb));
+	}
+
+	void Push(std::unique_ptr<char[]> data, size_t size, fu2::unique_function<void(bool)>&& cb)
+	{
+		elements.emplace_back(std::move(data), size, std::move(cb));
+	}
+
+	bool Pop(const std::string** str, const std::vector<uint8_t>** vec, size_t* size, size_t* off)
+	{
+		if (elements.empty())
+		{
+			return false;
+		}
+
+		const auto& elem = elements.front();
+		*off = elem.read;
+
+		switch (elem.type)
+		{
+		case 0:
+			*str = &elem.string;
+			*vec = nullptr;
+			break;
+		case 1:
+			*vec = &elem.vec;
+			*str = nullptr;
+			break;
+		case 2:
+			*vec = nullptr;
+			*str = nullptr;
+			*size = elem.rawLength;
+			break;
+		}
+
+		return true;
+	}
+
+	ssize_t PeekLength()
+	{
+		const std::string* s;
+		const std::vector<uint8_t>* v;
+		size_t size = 0;
+		size_t off = 0;
+
+		if (Pop(&s, &v, &size, &off))
+		{
+			if (s)
+			{
+				return s->size() - off;
+			}
+			else if (v)
+			{
+				return v->size() - off;
+			}
+			else if (size)
+			{
+				return size - off;
+			}
+		}
+
+		return -1;
+	}
+
+	bool Take(uint32_t length, std::string* str, std::vector<uint8_t>* vec, std::unique_ptr<char[]>* raw, size_t* rawLength, size_t* off, fu2::unique_function<void(bool)>* cb)
+	{
+		if (elements.empty())
+		{
+			return false;
+		}
+
+		{
+			auto& elem = elements.front();
+			*off = elem.read;
+
+			switch (elem.type)
+			{
+				case 0:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.string.data() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*str = std::move(elem.string);
+					break;
+				}
+				case 1:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.vec.data() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*vec = std::move(elem.vec);
+					break;
+				}
+				case 2:
+				{
+					if (length < elem.Leftover())
+					{
+						*raw = std::unique_ptr<char[]>(new char[length]);
+						*rawLength = length;
+						*off = 0;
+
+						memcpy(raw->get(), elem.raw.get() + elem.read, length);
+						elem.Advance(length);
+
+						return true;
+					}
+
+					*raw = std::move(elem.raw);
+					*rawLength = std::move(elem.rawLength);
+					break;
+				}
+			}
+
+			*cb = std::move(elem.cb);
+		}
+
+		elements.pop_front();
+
+		return true;
+	}
+
+	bool Has(size_t len)
+	{
+		size_t accounted = 0;
+
+		for (const auto& elem : elements)
+		{
+			auto thisLen = std::min(len - accounted, elem.Size() - elem.read);
+			accounted += thisLen;
+
+			if (accounted > len)
+			{
+				return true;
+			}
+		}
+
+		return (len <= accounted);
+	}
+
+	void Advance(size_t len)
+	{
+		while (len > 0)
+		{
+			auto& elem = elements.front();
+			size_t s = elem.Size();
+
+			auto thisLen = std::min(len, s - elem.read);
+			elem.read += thisLen;
+			len -= thisLen;
+
+			if (elem.read >= s)
+			{
+				elements.pop_front();
+			}
+		}
+	}
+
+	bool Empty()
+	{
+		return elements.empty();
+	}
+
+private:
+	std::deque<Element> elements;
+};
+
 namespace net
 {
 class Http2Response : public HttpResponse
 {
 public:
-	inline Http2Response(fwRefContainer<HttpRequest> request, nghttp2_session* session, int streamID)
-		: HttpResponse(request), m_session(session), m_stream(streamID)
+	inline Http2Response(fwRefContainer<HttpRequest> request, const std::shared_ptr<nghttp2_session_wrap>& session, int streamID, const fwRefContainer<net::TcpServerStream>& tcpStream)
+		: HttpResponse(request), m_session(session), m_stream(streamID), m_tcpStream(tcpStream)
 	{
 
 	}
@@ -36,13 +319,17 @@ public:
 			return;
 		}
 
-		if (!m_session)
+		auto session = m_session;
+
+		if (!session)
 		{
 			return;
 		}
 
+		auto statusCodeStr = std::to_string(statusCode);
+
 		m_headers = headers;
-		m_headers.insert({ ":status", std::to_string(statusCode) });
+		m_headers.insert({ ":status", HeaderString{ statusCodeStr.c_str(), statusCodeStr.size() } });
 
 		for (auto& header : m_headerList)
 		{
@@ -52,74 +339,162 @@ public:
 		// don't have transfer_encoding at all!
 		m_headers.erase("transfer-encoding");
 
-		nghttp2_data_provider provider;
-		provider.source.ptr = this;
-		provider.read_callback = [](nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length, uint32_t *data_flags, nghttp2_data_source *source, void *user_data) -> ssize_t
+		auto stream = m_tcpStream;
+
+		if (stream.GetRef())
 		{
-			auto resp = reinterpret_cast<Http2Response*>(source->ptr);
+			fwRefContainer thisRef = this;
 
-			if (resp->m_ended)
+			stream->ScheduleCallback([thisRef, session]()
 			{
-				*data_flags = NGHTTP2_DATA_FLAG_EOF;
-			}
+				nghttp2_data_provider provider;
+				provider.source.ptr = thisRef.GetRef();
+				provider.read_callback = [](nghttp2_session* session, int32_t stream_id, uint8_t* buf, size_t length, uint32_t* data_flags, nghttp2_data_source* source, void* user_data) -> ssize_t
+				{
+					auto resp = reinterpret_cast<Http2Response*>(source->ptr);
 
-			if (resp->m_outData.empty())
-			{
-				return (resp->m_ended) ? 0 : NGHTTP2_ERR_DEFERRED;
-			}
+					if (resp->m_ended)
+					{
+						*data_flags = NGHTTP2_DATA_FLAG_EOF;
+					}
 
-			size_t toRead = std::min(length, resp->m_outData.size());
+					if (resp->m_buffer.Empty())
+					{
+						return (resp->m_ended) ? 0 : NGHTTP2_ERR_DEFERRED;
+					}
 
-			std::copy(resp->m_outData.begin(), resp->m_outData.begin() + toRead, buf);
-			resp->m_outData.erase(resp->m_outData.begin(), resp->m_outData.begin() + toRead);
+					*data_flags |= NGHTTP2_DATA_FLAG_NO_COPY;
+					return std::min(size_t(resp->m_buffer.PeekLength()), length);
+				};
 
-			return toRead;
-		};
+				std::vector<nghttp2_nv> nv(thisRef->m_headers.size());
 
-		std::vector<nghttp2_nv> nv(m_headers.size());
+				size_t i = 0;
+				for (auto& hdr : thisRef->m_headers)
+				{
+					auto& v = nv[i];
 
-		size_t i = 0;
-		for (auto& hdr : m_headers)
-		{
-			auto& v = nv[i];
+					v.flags = 0;
+					v.name = (uint8_t*)hdr.first.c_str();
+					v.namelen = hdr.first.length();
+					v.value = (uint8_t*)hdr.second.c_str();
+					v.valuelen = hdr.second.length();
 
-			v.flags = 0;
-			v.name = (uint8_t*)hdr.first.c_str();
-			v.namelen = hdr.first.length();
-			v.value = (uint8_t*)hdr.second.c_str();
-			v.valuelen = hdr.second.length();
+					++i;
+				}
+				nghttp2_submit_response(*session, thisRef->m_stream, nv.data(), nv.size(), &provider);
+				nghttp2_session_send(*session);
 
-			++i;
+				thisRef->m_sentHeaders = true;
+			});
 		}
-
-		nghttp2_submit_response(m_session, m_stream, nv.data(), nv.size(), &provider);
-		nghttp2_session_send(m_session);
-
-		m_sentHeaders = true;
 	}
 
-	virtual void WriteOut(const std::vector<uint8_t>& data) override
+	template<typename TContainer>
+	void WriteOutInternal(TContainer data, fu2::unique_function<void(bool)> && cb = {})
 	{
-		if (m_session)
+		auto stream = m_tcpStream;
+
+		if (stream.GetRef())
 		{
-			auto origSize = m_outData.size();
+			fwRefContainer thisRef = this;
 
-			m_outData.resize(m_outData.size() + data.size());
-			std::copy(data.begin(), data.end(), m_outData.begin() + origSize);
+			stream->ScheduleCallback([thisRef, data = std::move(data), cb = std::move(cb)]() mutable
+			{
+				auto session = thisRef->m_session;
 
-			nghttp2_session_resume_data(m_session, m_stream);
-			nghttp2_session_send(m_session);
+				if (session)
+				{
+					thisRef->m_buffer.Push(std::forward<TContainer>(data), std::move(cb));
+
+					nghttp2_session_resume_data(*session, thisRef->m_stream);
+					nghttp2_session_send(*session);
+				}
+			});
+		}
+	}
+
+	virtual void WriteOut(const std::vector<uint8_t>& data, fu2::unique_function<void(bool)>&& cb = {}) override
+	{
+		WriteOutInternal<decltype(data)>(data, std::move(cb));
+	}
+
+	virtual void WriteOut(std::vector<uint8_t>&& data, fu2::unique_function<void(bool)>&& cb = {}) override
+	{
+		WriteOutInternal<decltype(data)>(std::move(data), std::move(cb));
+	}
+
+	virtual void WriteOut(const std::string& data, fu2::unique_function<void(bool)>&& cb = {}) override
+	{
+		WriteOutInternal<decltype(data)>(data, std::move(cb));
+	}
+
+	virtual void WriteOut(std::string&& data, fu2::unique_function<void(bool)>&& cb = {}) override
+	{
+		WriteOutInternal<decltype(data)>(std::move(data), std::move(cb));
+	}
+
+	virtual void WriteOut(std::unique_ptr<char[]> data, size_t size, fu2::unique_function<void(bool)>&& cb = {}) override
+	{
+		auto stream = m_tcpStream;
+
+		if (stream.GetRef())
+		{
+			fwRefContainer thisRef = this;
+
+			stream->ScheduleCallback([thisRef, data = std::move(data), size, cb = std::move(cb)]() mutable
+			{
+				auto session = thisRef->m_session;
+
+				if (session)
+				{
+					thisRef->m_buffer.Push(std::move(data), size, std::move(cb));
+
+					nghttp2_session_resume_data(*session, thisRef->m_stream);
+					nghttp2_session_send(*session);
+				}
+			});
 		}
 	}
 
 	virtual void End() override
 	{
+		auto stream = m_tcpStream;
+
+		if (stream.GetRef())
+		{
+			fwRefContainer thisRef = this;
+
+			stream->ScheduleCallback([thisRef]()
+			{
+				thisRef->m_tcpStream = nullptr;
+
+				auto session = thisRef->m_session;
+				thisRef->m_ended = true;
+
+				if (session)
+				{
+					nghttp2_session_resume_data(*session, thisRef->m_stream);
+					nghttp2_session_send(*session);
+				}
+			});
+		}
+		else
+		{
+			m_ended = true;
+		}
+	}
+
+	virtual void CloseSocket() override
+	{
 		m_ended = true;
 
-		if (m_session)
+		auto s = m_tcpStream;
+
+		if (s.GetRef())
 		{
-			nghttp2_session_resume_data(m_session, m_stream);
-			nghttp2_session_send(m_session);
+			s->Close();
+			s = {};
 		}
 	}
 
@@ -137,17 +512,25 @@ public:
 			}
 		}
 
+		m_tcpStream = nullptr;
 		m_session = nullptr;
 	}
 
+	inline ZeroCopyByteBuffer& GetBuffer()
+	{
+		return m_buffer;
+	}
+
 private:
-	nghttp2_session* m_session;
+	std::shared_ptr<nghttp2_session_wrap> m_session;
 
 	int m_stream;
 
 	HeaderMap m_headers;
 
-	std::deque<uint8_t> m_outData;
+	ZeroCopyByteBuffer m_buffer;
+
+	fwRefContainer<net::TcpServerStream> m_tcpStream;
 };
 
 Http2ServerImpl::Http2ServerImpl()
@@ -160,67 +543,144 @@ Http2ServerImpl::~Http2ServerImpl()
 
 }
 
-void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
+namespace h2
 {
 	struct HttpRequestData;
 
 	struct HttpConnectionData
 	{
-		nghttp2_session* session;
+		std::shared_ptr<nghttp2_session_wrap> session;
 
 		fwRefContainer<TcpServerStream> stream;
 
-		Http2ServerImpl* server;
+		Http2ServerImpl* server = nullptr;
 
-		std::set<HttpRequestData*> streams;
+		std::set<fwRefContainer<HttpRequestData>> streams;
 
 		// cache responses independently from streams so 'clean' closes don't invalidate session
-		std::list<fwRefContainer<HttpResponse>> responses;
+		std::set<fwRefContainer<HttpResponse>> responses;
+		std::shared_mutex responsesMutex;
 	};
 
-	struct HttpRequestData
+	class HttpRequestData : public fwRefCountable
 	{
-		HttpConnectionData* connection;
+	public:
+		HttpConnectionData* connection = nullptr;
 
-		std::map<std::string, std::string> headers;
+		HeaderMap headers;
 
 		std::vector<uint8_t> body;
 
 		fwRefContainer<HttpRequest> httpReq;
 
 		fwRefContainer<HttpResponse> httpResp;
-	};
 
+		virtual ~HttpRequestData() override = default;
+	};
+}
+
+void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
+{
 	nghttp2_session_callbacks* callbacks;
 	nghttp2_session_callbacks_new(&callbacks);
 
 	nghttp2_session_callbacks_set_send_callback(callbacks, [](nghttp2_session *session, const uint8_t *data,
 		size_t length, int flags, void *user_data) -> ssize_t
 	{
-		reinterpret_cast<HttpConnectionData*>(user_data)->stream->Write(std::vector<uint8_t>{ data, data + length });
+		reinterpret_cast<h2::HttpConnectionData*>(user_data)->stream->Write(std::vector<uint8_t>{ data, data + length });
 
 		return length;
+	});
+
+	nghttp2_session_callbacks_set_send_data_callback(callbacks, [](nghttp2_session* session, nghttp2_frame* frame, const uint8_t* framehd, size_t length, nghttp2_data_source* source, void* user_data) -> int
+	{
+		auto data = reinterpret_cast<h2::HttpConnectionData*>(user_data);
+		auto resp = reinterpret_cast<Http2Response*>(source->ptr);
+
+		auto& buf = resp->GetBuffer();
+
+		if (buf.Has(length))
+		{
+			static thread_local std::vector<uint8_t> fhd(9);
+			memcpy(&fhd[0], framehd, fhd.size());
+
+			data->stream->Write(fhd);
+
+			std::vector<uint8_t> v;
+			std::string s;
+			std::unique_ptr<char[]> raw;
+			size_t rawLength;
+			size_t off;
+			fu2::unique_function<void(bool)> cb;
+
+			if (buf.Take(length, &s, &v, &raw, &rawLength, &off, &cb))
+			{
+				if (off == 0)
+				{
+					if (!s.empty())
+					{
+						data->stream->Write(std::move(s), std::move(cb));
+					}
+					else if (!v.empty())
+					{
+						data->stream->Write(std::move(v), std::move(cb));
+					}
+					else if (raw)
+					{
+						data->stream->Write(std::move(raw), rawLength, std::move(cb));
+					}
+				}
+				else
+				{
+					if (!s.empty())
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), s.data() + off, length);
+
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
+					else if (!v.empty())
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), v.data() + off, length);
+
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
+					else if (raw)
+					{
+						auto d = std::unique_ptr<char[]>(new char[length]);
+						memcpy(d.get(), raw.get() + off, length);
+
+						data->stream->Write(std::move(d), length, std::move(cb));
+					}
+				}
+			}
+
+			return 0;
+		}
+
+		return NGHTTP2_ERR_WOULDBLOCK;
 	});
 
 	nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, [](nghttp2_session *session,
 		const nghttp2_frame *frame,
 		void *user_data)
 	{
-		auto conn = reinterpret_cast<HttpConnectionData*>(user_data);
+		auto conn = reinterpret_cast<h2::HttpConnectionData*>(user_data);
 
 		if (frame->hd.type != NGHTTP2_HEADERS ||
 			frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
 			return 0;
 		}
 
-		auto reqData = new HttpRequestData;
+		fwRefContainer reqData = new h2::HttpRequestData;
 		reqData->connection = conn;
 		reqData->httpReq = nullptr;
 		reqData->httpResp = nullptr;
 
 		conn->streams.insert(reqData);
 
-		nghttp2_session_set_stream_user_data(session, frame->hd.stream_id, reqData);
+		nghttp2_session_set_stream_user_data(session, frame->hd.stream_id, reqData.GetRef());
 
 		return 0;
 	});
@@ -231,7 +691,7 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 		size_t valuelen, uint8_t flags,
 		void *user_data) -> int
 	{
-		auto conn = reinterpret_cast<HttpConnectionData*>(user_data);
+		auto conn = reinterpret_cast<h2::HttpConnectionData*>(user_data);
 
 		switch (frame->hd.type)
 		{
@@ -240,7 +700,7 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 					break;
 				}
 
-				auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+				auto req = reinterpret_cast<h2::HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
 				
 				req->headers.insert({ {reinterpret_cast<const char*>(name), namelen}, { reinterpret_cast<const char*>(value), valuelen} });
 
@@ -254,7 +714,7 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 		int32_t stream_id, const uint8_t *data,
 		size_t len, void *user_data)
 	{
-		auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, stream_id));
+		auto req = reinterpret_cast<h2::HttpRequestData*>(nghttp2_session_get_stream_user_data(session, stream_id));
 
 		if (req)
 		{
@@ -273,12 +733,14 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 		switch (frame->hd.type) {
 			case NGHTTP2_HEADERS:
 			{
-				auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+				auto req = reinterpret_cast<h2::HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
 				std::shared_ptr<HttpState> reqState = std::make_shared<HttpState>();
 
 				if (req)
 				{
 					HeaderMap headerList;
+					HeaderString method;
+					HeaderString path;
 
 					for (auto& header : req->headers)
 					{
@@ -290,12 +752,24 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 						{
 							headerList.emplace("host", header.second);
 						}
+						else if (header.first == ":method")
+						{
+							method = header.second;
+						}
+						else if (header.first == ":path")
+						{
+							path = header.second;
+						}
 					}
 
-					fwRefContainer<HttpRequest> request = new HttpRequest(2, 0, req->headers[":method"], req->headers[":path"], headerList, req->connection->stream->GetPeerAddress().ToString());
+					fwRefContainer<HttpRequest> request = new HttpRequest(2, 0, method, path, headerList, req->connection->stream->GetPeerAddress());
 					
-					fwRefContainer<HttpResponse> response = new Http2Response(request, session, frame->hd.stream_id);
-					req->connection->responses.push_back(response);
+					fwRefContainer<HttpResponse> response = new Http2Response(request, req->connection->session, frame->hd.stream_id, req->connection->stream);
+
+					{
+						std::unique_lock _(req->connection->responsesMutex);
+						req->connection->responses.insert(response);
+					}
 
 					req->httpResp = response;
 					reqState->blocked = true;
@@ -318,7 +792,7 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 			case NGHTTP2_DATA:
 				if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
 				{
-					auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
+					auto req = reinterpret_cast<h2::HttpRequestData*>(nghttp2_session_get_stream_user_data(session, frame->hd.stream_id));
 
 					if (req->httpReq.GetRef())
 					{
@@ -328,6 +802,10 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 						if (handler)
 						{
 							(*handler)(req->body);
+						}
+						else
+						{
+							req->httpReq->SetPendingData(std::move(req->body));
 						}
 					}
 				}
@@ -341,27 +819,32 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 	nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, [](nghttp2_session *session, int32_t stream_id,
 		uint32_t error_code, void *user_data)
 	{
-		auto req = reinterpret_cast<HttpRequestData*>(nghttp2_session_get_stream_user_data(session, stream_id));
+		auto req = reinterpret_cast<h2::HttpRequestData*>(nghttp2_session_get_stream_user_data(session, stream_id));
 
 		auto resp = req->httpResp.GetRef();
 
 		if (resp)
 		{
 			((net::Http2Response*)resp)->Cancel();
+
+			std::unique_lock _(req->connection->responsesMutex);
+			req->connection->responses.erase(resp);
 		}
 
 		req->connection->streams.erase(req);
-		delete req;
 
 		return 0;
 	});
 
 	// create a server
-	auto data = new HttpConnectionData;
+	auto data = std::make_shared<h2::HttpConnectionData>();
 	data->stream = stream;
 	data->server = this;
 
-	nghttp2_session_server_new(&data->session, callbacks, data);
+	nghttp2_session* session;
+	nghttp2_session_server_new(&session, callbacks, data.get());
+
+	data->session = std::make_shared<nghttp2_session_wrap>(session);
 
 	// clean callbacks
 	nghttp2_session_callbacks_del(callbacks);
@@ -370,22 +853,29 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 	nghttp2_settings_entry iv[1] = {
 		{ NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 } };
 
-	nghttp2_submit_settings(data->session, NGHTTP2_FLAG_NONE, iv, 1);
+	nghttp2_submit_settings(*data->session, NGHTTP2_FLAG_NONE, iv, 1);
 
 	//nghttp2_session_send(data->session);
 
 	// handle receive
-	stream->SetReadCallback([=](const std::vector<uint8_t>& bytes)
+	stream->SetReadCallback([data](const std::vector<uint8_t>& bytes)
 	{
-		nghttp2_session_mem_recv(data->session, bytes.data(), bytes.size());
+		nghttp2_session_mem_recv(*data->session, bytes.data(), bytes.size());
 
-		nghttp2_session_send(data->session);
+		nghttp2_session_send(*data->session);
 	});
 
-	stream->SetCloseCallback([=]()
+	stream->SetCloseCallback([data]()
 	{
 		{
-			for (auto& response : data->responses)
+			decltype(data->responses) responsesCopy;
+
+			{
+				std::shared_lock _(data->responsesMutex);
+				responsesCopy = data->responses;
+			}
+
+			for (auto& response : responsesCopy)
 			{
 				// cancel HTTP responses that we have referenced
 				// (so that we won't reference data->session)
@@ -397,13 +887,12 @@ void Http2ServerImpl::OnConnection(fwRefContainer<TcpServerStream> stream)
 				}
 			}
 
+			std::unique_lock _(data->responsesMutex);
 			data->responses.clear();
 		}
 
-		nghttp2_session_del(data->session);
-		delete data;
+		// free any leftover stream data
+		data->streams.clear();
 	});
-
-
 }
 }

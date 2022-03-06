@@ -100,6 +100,8 @@ namespace FxWebAdmin
                         }
                     });
 
+            services.AddMemoryCache();
+
             services.AddTransient<IClaimsTransformation, FxClaimsTransformer>();
             services.AddSingleton<IdentifierHelpers, IdentifierHelpers>();
 
@@ -123,7 +125,8 @@ namespace FxWebAdmin
                         apm.ApplicationParts.Add(part);
                     }
                 }
-            });
+            })
+            .SetCompatibilityVersion(CompatibilityVersion.Version_2_2);
 
             services.AddServerSentEvents();
         }

@@ -6,7 +6,11 @@
  */
 
 #include "StdInc.h"
+
+#include <jitasm.h>
 #include "Hooking.h"
+
+#include <CrossBuildRuntime.h>
 
 static HookFunction hookFunction([] ()
 {
@@ -16,46 +20,54 @@ static HookFunction hookFunction([] ()
 	{
 		char* location = matches.get(i).get<char>(-11);
 
+		DWORD oldProtect;
+		VirtualProtect(hook::get_address<char*>(location), 14, PAGE_READWRITE, &oldProtect);
 		strcpy(hook::get_address<char*>(location), "fivem_set.bin");
+		VirtualProtect(hook::get_address<char*>(location), 14, oldProtect, &oldProtect);
 
 		location = matches.get(i).get<char>(14);
 
+		VirtualProtect(hook::get_address<char*>(location), 19, PAGE_READWRITE, &oldProtect);
 		strcpy(hook::get_address<char*>(location), "fxu:/fivem_set.bin");
-
+		VirtualProtect(hook::get_address<char*>(location), 19, oldProtect, &oldProtect);
 	}
 
 	// testing hook to not kill blip data when changing to a network game
 	{
-		char* location = hook::pattern("84 C0 0F 84 ? 00 00 00 40 38 3D ? ? ? ? 48").count(1).get(0).get<char>();
-
-		static struct : public jitasm::Frontend
+		// #TODO2060: compiler redid it, 0x1401C16B0 
+		if (!xbr::IsGameBuildOrGreater<2060>())
 		{
-			void* retLoc;
-			void* cmpLoc;
+			char* location = hook::pattern("84 C0 0F 84 ? 00 00 00 40 38 3D ? ? ? ? 48").count(1).get(0).get<char>();
 
-			void InternalMain() override
+			static struct : public jitasm::Frontend
 			{
-				mov(rax, reinterpret_cast<uintptr_t>(cmpLoc));
-				mov(eax, dword_ptr[rax]);
+				void* retLoc;
+				void* cmpLoc;
 
-				cmp(eax, 0xFFFFFFFF);
-				jne("doReturn");
+				void InternalMain() override
+				{
+					mov(rax, reinterpret_cast<uintptr_t>(cmpLoc));
+					mov(eax, dword_ptr[rax]);
 
-				mov(qword_ptr[rsp + 8], rbx);
-				mov(rax, reinterpret_cast<uintptr_t>(retLoc));
+					cmp(eax, 0xFFFFFFFF);
+					jne("doReturn");
 
-				jmp(rax);
+					mov(qword_ptr[rsp + 8], rbx);
+					mov(rax, reinterpret_cast<uintptr_t>(retLoc));
 
-				L("doReturn");
-				ret();
-			}
-		} stub;
-		
-		stub.retLoc = (location - 0x69 + 5);
+					jmp(rax);
 
-		char* cmpLocation = location - 28;
-		stub.cmpLoc = (void*)(cmpLocation + *(int32_t*)cmpLocation + 4);
+					L("doReturn");
+					ret();
+				}
+			} stub;
 
-		hook::jump(location - 0x69, stub.GetCode());
+			stub.retLoc = (location - 0x69 + 5);
+
+			char* cmpLocation = location - 28;
+			stub.cmpLoc = (void*)(cmpLocation + *(int32_t*)cmpLocation + 4);
+
+			hook::jump(location - 0x69, stub.GetCode());
+		}
 	}
 });

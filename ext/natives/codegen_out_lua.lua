@@ -1,6 +1,7 @@
-local USE_SPLIT_LUA = ...
+local USE_SPLIT_LUA, USE_DOC_LUA = ...
+local USE_SPLIT_LUA_DIRECT = USE_SPLIT_LUA and gApiSet ~= 'server'
 
-if USE_SPLIT_LUA then
+if USE_SPLIT_LUA or USE_DOC_LUA then
 	if not os.getenv('NATIVES_DIR') or #os.getenv('NATIVES_DIR') < 2 then
 		error('no dir')
 	end
@@ -28,11 +29,11 @@ end)
 -- output the Lua low-level native definition file
 
 -- header bit
-print("local _i, _f, _v, _r, _ri, _rf, _rl, _s, _rv, _ro, _in, _ii, _fi =\n\tCitizen.PointerValueInt(), Citizen.PointerValueFloat(), Citizen.PointerValueVector(),\n\tCitizen.ReturnResultAnyway(), Citizen.ResultAsInteger(), Citizen.ResultAsFloat(), Citizen.ResultAsLong(), Citizen.ResultAsString(), Citizen.ResultAsVector(), Citizen.ResultAsObject(),\n\tCitizen.InvokeNative, Citizen.PointerValueIntInitialized, Citizen.PointerValueFloatInitialized\n")
+print("local msgpack = msgpack")
+print("local _i, _f, _v, _r, _ri, _rf, _rl, _s, _rv, _ro, _in, _ii, _fi =\n\tCitizen.PointerValueInt(), Citizen.PointerValueFloat(), Citizen.PointerValueVector(),\n\tCitizen.ReturnResultAnyway(), Citizen.ResultAsInteger(), Citizen.ResultAsFloat(), Citizen.ResultAsLong(), Citizen.ResultAsString(), Citizen.ResultAsVector(), Citizen.ResultAsObject2(msgpack.unpack),\n\tCitizen.InvokeNative, Citizen.PointerValueIntInitialized, Citizen.PointerValueFloatInitialized\n")
 
 print("local g = _G")
 print("local rs = rawset")
-print("local msgpack = msgpack")
 
 print("local _tostring = tostring")
 print("local function _ts(num)")
@@ -40,6 +41,11 @@ print("\tif num == 0 or not num then -- workaround for users calling string para
 print("\t\treturn nil")
 print("\tend")
 print("\treturn _tostring(num)")
+print("end")
+
+print("local function _obj(obj)")
+print("\tlocal s = msgpack.pack(obj)")
+print("\treturn s, #s")
 print("end")
 
 print("local function _ch(hash)")
@@ -55,7 +61,9 @@ print("end\n")
 
 print("local Global = setmetatable({}, { __newindex = function(_, n, v)\n\tg[n] = v\n\n\trs(_, n, v)\nend})\n")
 
-print("_ENV = nil\n")
+if not USE_DOC_LUA then
+	print("_ENV = nil\n")
+end
 
 -- functions
 local function printArgumentName(name)
@@ -103,11 +111,16 @@ local function printArgument(argument, native)
 		else
 			return '_i --[[ actually ' .. argument.type.nativeType .. ' ]]'
 		end
+	elseif argument.type.name == 'object' then
+		return ('%s_bytes, %s_len'):format(
+			printArgumentName(argument.name),
+			printArgumentName(argument.name)
+		)
 	elseif argument.type.name == 'func' then
 		return '_mfr(' .. printArgumentName(argument.name) .. ')'
 	elseif argument.type.name == 'Hash' then
 		return '_ch(' .. printArgumentName(argument.name) .. ')'
-	elseif argument.type.name == 'charPtr' then
+	elseif argument.type.nativeType == 'string' then
 		return '_ts(' .. printArgumentName(argument.name) .. ')'
 	end
 
@@ -152,7 +165,7 @@ end
 
 local function printInvocationArguments(native)
 	local args = {
-		native.hash
+		USE_SPLIT_LUA_DIRECT and 'fn' or native.hash
 	}
 
 	if native.arguments then
@@ -162,63 +175,153 @@ local function printInvocationArguments(native)
 	end
 
 	if native.returns then
-		table.insert(args, '_r')
-
 		if native.returns.nativeType ~= 'bool' then
 			table.insert(args, printReturnType(native.returns))
+		else
+			table.insert(args, '_r')
 		end
 	end
 
 	return table.concat(args, ', ')
 end
 
+local function printGatherArguments(native)
+	local s = ''
+
+	if native.arguments then
+		for _, v in pairs(native.arguments) do
+			if v.type.name == 'object' then
+				s = s .. ('\tlocal %s_bytes, %s_len = _obj(%s)\n'):format(
+					printArgumentName(v.name), printArgumentName(v.name), printArgumentName(v.name)
+				)
+			end
+		end
+	end
+
+	return s
+end
+
+local function formatCommentedLine(line, indent)
+	local indentStr = string.rep('\t', indent or 0)
+	return line:gsub('\r\n', '\n'):gsub('\n', '\n-- ' .. indentStr)
+end
+
+local function printLuaType(type)
+	if type.nativeType == 'float' then
+		return 'number'
+	elseif type.nativeType == 'int' or type.nativeType == 'long' then
+		return 'integer'
+	elseif type.nativeType == 'bool' then
+		return 'boolean'
+	end
+
+	return type.nativeType
+end
+
 local function formatDocString(native)
 	local d = parseDocString(native)
 
 	if not d then
-		return ''
+		if USE_DOC_LUA then
+			d = {
+				summary = ''
+			}
+		else
+			return ''
+		end
 	end
 
 	local firstLine, nextLines = d.summary:match("([^\n]+)\n?(.*)")
 
 	if not firstLine then
-		return ''
-	end
-
-	local l = '--- ' .. trim(firstLine) .. "\n"
-
-	for line in nextLines:gmatch("([^\n]+)") do
-		l = l .. '-- ' .. trim(line) .. "\n"
-	end
-
-	if d.hasParams then
-		for _, v in ipairs(d.params) do
-			l = l .. '-- @param ' .. v[1] .. ' ' .. v[2] .. '\n'
+		if not USE_DOC_LUA then
+			return ''
+		else
+			firstLine = ''
+			nextLines = ''
 		end
 	end
 
-	if d.returns then
-		l = l .. '-- @return ' .. d.returns .. '\n'
+	local l = '--- ' .. trim(firstLine) .. "\n"
+	
+	-- doclua wants `---` stuff
+	local docPrefix = USE_DOC_LUA and '--- ' or '-- '
+
+	for line in nextLines:gmatch("([^\n]+)") do
+		l = l .. docPrefix .. trim(line) .. "\n"
+	end
+
+	if USE_DOC_LUA then
+		-- params
+		local paramToDesc = {}
+		
+		if d.hasParams then
+			for _, v in ipairs(d.params) do
+				paramToDesc[printArgumentName(v[1])] = v[2]
+			end
+		end
+	
+		if native.arguments then
+			for _, v in ipairs(native.arguments) do
+				if not v.pointer or isSinglePointerNative(native) then
+					local an = printArgumentName(v.name)
+					l = l .. docPrefix .. '@param ' .. an .. ' ' .. printLuaType(v.type) .. ' ' .. (paramToDesc[an] and ('@comment ' .. paramToDesc[an]) or '') .. '\n'
+				end
+			end
+		end
+		
+		if native.returns then
+			if d.returns then
+				l = l .. docPrefix .. '@return ' .. printLuaType(native.returns) .. ' @comment ' .. formatCommentedLine(d.returns, 2) .. '\n'
+			else
+				l = l .. docPrefix .. '@return ' .. printLuaType(native.returns) .. '\n'
+			end
+		end
+		
+		if native.arguments then
+			for _, v in ipairs(native.arguments) do
+				if v.pointer then
+					local an = printArgumentName(v.name)
+					l = l .. docPrefix .. '@return ' .. printLuaType(v.type) .. ' ' .. an --[[.. (paramToDesc[an] or '')]] .. '\n'
+				end
+			end
+		end
+	else
+		if d.hasParams then
+			for _, v in ipairs(d.params) do
+				l = l .. docPrefix .. '@param ' .. v[1] .. ' ' .. v[2] .. '\n'
+			end
+		end
+
+		if d.returns then
+			l = l .. docPrefix .. '@return ' .. formatCommentedLine(d.returns, 2) .. '\n'
+		end
 	end
 
 	return l
 end
 
+local idx = 0
+
 local function printNative(native)
 	local str = ""
 
 	local function printThis(name)
-		local str = string.format("%sfunction Global.%s(%s)\n", formatDocString(native), name, printArgumentList(native))
-
-		local preCall = ''
-		local postCall = ''
-	
-		if native.returns and native.returns.nativeType == 'object' then
-			preCall = 'msgpack.unpack('
-			postCall = ')'
+		local prefix = ""
+		
+		if USE_SPLIT_LUA_DIRECT then
+			prefix = string.format("local fn = _gn(%s)\n", native.hash)
 		end
 	
-		str = str .. string.format("\treturn %s_in(%s)%s\n", preCall, printInvocationArguments(native), postCall)
+		local str = string.format("%s%sfunction %s%s(%s)\n", prefix, formatDocString(native), USE_DOC_LUA and '' or 'Global.', name, printArgumentList(native))
+
+		if not USE_DOC_LUA then
+			local preCall = ''
+			local postCall = ''
+		
+			str = str .. printGatherArguments(native)		
+			str = str .. string.format("\treturn %s_in%s(%s)%s\n", preCall, USE_SPLIT_LUA_DIRECT and '2' or '', printInvocationArguments(native), postCall)
+		end
 	
 		str = str .. "end\n"
 
@@ -237,6 +340,20 @@ local function printNative(native)
 		for _, alias in ipairs(native.aliases) do
 			saveThis(printFunctionName({ name = alias }), printThis(printFunctionName({ name = alias })))
 		end
+	elseif USE_DOC_LUA then
+		local function saveThis(name, str)
+			local f = io.open(('%s/natives_%d.lua'):format(os.getenv('NATIVES_DIR'), math.floor(idx / 100)), 'a')
+			f:write(str)
+			f:close()
+		end
+		
+		saveThis(printFunctionName(native), printThis(printFunctionName(native)))
+
+		for _, alias in ipairs(native.aliases) do
+			saveThis(printFunctionName({ name = alias }), printThis(printFunctionName({ name = alias })))
+		end
+		
+		idx = idx + 1
 	else
 		str = str .. printThis(printFunctionName(native))
 
@@ -250,7 +367,7 @@ end
 
 for _, v in pairs(_natives) do
 	if matchApiSet(v) then
-		if USE_SPLIT_LUA then
+		if USE_SPLIT_LUA or USE_DOC_LUA then
 			printNative(v)
 		else
 			print(printNative(v))

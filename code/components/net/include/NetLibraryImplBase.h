@@ -42,13 +42,17 @@ public:
 		return SendReliableCommand(type, buffer, length);
 	}
 
-	virtual void SendConnect(const std::string& connectData) = 0;
+	virtual void SendConnect(const std::string& token, const std::string& connectData) = 0;
 
 	virtual bool HasTimedOut() = 0;
 
 	virtual bool IsDisconnected() { return false; }
 
 	virtual void Flush() = 0;
+
+	virtual int32_t GetPing() = 0;
+
+	virtual int32_t GetVariance() = 0;
 };
 
 class INetLibraryInherit

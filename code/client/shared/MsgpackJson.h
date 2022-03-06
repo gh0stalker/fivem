@@ -8,34 +8,34 @@ inline void ConvertToMsgPack(const rapidjson::Value& json, msgpack::object& obje
 	switch (json.GetType())
 	{
 		case rapidjson::kFalseType:
-			object = false;
+			object = msgpack::object{ false };
 			break;
 
 		case rapidjson::kTrueType:
-			object = true;
+			object = msgpack::object{ true };
 			break;
 
 		case rapidjson::kNumberType:
 		{
 			if (json.IsInt())
 			{
-				object = json.GetInt();
+				object = msgpack::object{ json.GetInt() };
 			}
 			else if (json.IsUint())
 			{
-				object = json.GetUint();
+				object = msgpack::object{ json.GetUint() };
 			}
 			else if (json.IsInt64())
 			{
-				object = json.GetInt64();
+				object = msgpack::object{ json.GetInt64() };
 			}
 			else if (json.IsUint64())
 			{
-				object = json.GetUint64();
+				object = msgpack::object{ json.GetUint64() };
 			}
 			else if (json.IsDouble())
 			{
-				object = json.GetDouble();
+				object = msgpack::object{ json.GetDouble() };
 			}
 
 			break;
@@ -81,7 +81,7 @@ inline void ConvertToMsgPack(const rapidjson::Value& json, msgpack::object& obje
 		}
 
 		default:
-			object = msgpack::type::nil();
+			object = msgpack::object{ msgpack::type::nil_t{} };
 			break;
 	}
 }
@@ -95,8 +95,11 @@ inline void ConvertToJSON(const msgpack::object& object, rapidjson::Value& value
 			break;
 
 		case msgpack::type::POSITIVE_INTEGER:
+			value.SetUint64(object.as<uint64_t>());
+			break;
+
 		case msgpack::type::NEGATIVE_INTEGER:
-			value.SetInt(object.as<int>());
+			value.SetInt64(object.as<int64_t>());
 			break;
 
 		case msgpack::type::FLOAT:
@@ -104,6 +107,7 @@ inline void ConvertToJSON(const msgpack::object& object, rapidjson::Value& value
 			break;
 
 		case msgpack::type::STR:
+		case msgpack::type::BIN:
 		{
 			std::string string = object.as<std::string>();
 			value.SetString(string.c_str(), string.size(), allocator);
@@ -128,7 +132,24 @@ inline void ConvertToJSON(const msgpack::object& object, rapidjson::Value& value
 
 		case msgpack::type::MAP:
 		{
-			auto list = object.as<std::map<std::string, msgpack::object>>();
+			std::map<std::string, msgpack::object> list;
+
+			if (object.via.map.ptr)
+			{
+				if (object.via.map.ptr->key.type == msgpack::type::STR)
+				{
+					object.convert(list);
+				}
+				else
+				{
+					auto intList = object.as<std::map<int, msgpack::object>>();
+					for (auto& [key, value] : intList)
+					{
+						list[std::to_string(key)] = std::move(value);
+					}
+				}
+			}
+
 			value.SetObject();
 
 			for (auto& entry : list)

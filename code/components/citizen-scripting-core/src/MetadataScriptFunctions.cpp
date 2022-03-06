@@ -13,6 +13,20 @@
 
 #include <VFSManager.h>
 
+#if __has_include(<CrossBuildRuntime.h>) && defined(_WIN32)
+#include <CrossBuildRuntime.h>
+
+static inline auto GetGameBuild()
+{
+	return xbr::GetGameBuild();
+}
+#else
+static inline auto GetGameBuild()
+{
+	return 0;
+}
+#endif
+
 static InitFunction initFunction([] ()
 {
 	fx::ScriptEngine::RegisterNativeHandler("GET_NUM_RESOURCE_METADATA", [] (fx::ScriptContext& context)
@@ -88,8 +102,26 @@ static InitFunction initFunction([] ()
 			return;
 		}
 
+		const auto& rootPath = resource->GetPath();
+
+		// an empty root path would read from `/...`
+		if (rootPath.empty())
+		{
+			context.SetResult(nullptr);
+			return;
+		}
+
+#ifndef IS_FXSERVER
+		// only load from `resources:/` for client (see CachedResourceMounter)
+		if (rootPath.find("resources:/") != 0) // find != 0 is equivalent to a !starts_with
+		{
+			context.SetResult(nullptr);
+			return;
+		}
+#endif
+
 		// try opening the file from the resource's home directory
-		fwRefContainer<vfs::Stream> stream = vfs::OpenRead(resource->GetPath() + "/" + context.GetArgument<const char*>(1));
+		fwRefContainer<vfs::Stream> stream = vfs::OpenRead(rootPath + "/" + context.GetArgument<const char*>(1));
 
 		if (!stream.GetRef())
 		{
@@ -102,7 +134,19 @@ static InitFunction initFunction([] ()
 		returnedArray = stream->ReadToEnd();
 		returnedArray.push_back(0); // zero-terminate
 
-		context.SetResult(&returnedArray[0]);
+		struct scrString
+		{
+			const void* str;
+			size_t len;
+			uint32_t magic;
+
+			scrString(const void* str, size_t len)
+				: str(str), len(len), magic(0xFEED1212)
+			{
+			}
+		};
+
+		context.SetResult(scrString{ &returnedArray[0], returnedArray.size() - 1 });
 	});
 
 #ifdef IS_FXSERVER
@@ -149,7 +193,7 @@ static InitFunction initFunction([] ()
 		fwRefContainer<vfs::Stream> stream(new vfs::Stream(device, handle));
 
 		// get data + length
-		const char* data = context.GetArgument<const char*>(2);
+		const char* data = context.CheckArgument<const char*>(2);
 		int length = context.GetArgument<int>(3);
 
 		if (length == 0 || length == -1)
@@ -162,4 +206,28 @@ static InitFunction initFunction([] ()
 		context.SetResult(true);
 	});
 #endif
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_GAME_NAME", [](fx::ScriptContext& context)
+	{
+		const char* gameName =
+#ifdef IS_FXSERVER
+		"fxserver"
+#elif defined(GTA_FIVE)
+		"fivem"
+#elif defined(GTA_NY)
+		"libertym"
+#elif defined(IS_RDR3)
+		"redm"
+#else
+		"unknown"
+#endif
+		;
+
+		context.SetResult<const char*>(gameName);
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_GAME_BUILD_NUMBER", [](fx::ScriptContext& context)
+	{
+		context.SetResult<int64_t>(GetGameBuild());
+	});
 });

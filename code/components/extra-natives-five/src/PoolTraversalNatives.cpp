@@ -1,13 +1,19 @@
-﻿#include "StdInc.h"
+#include "StdInc.h"
 
 #include <Hooking.h>
 #include <ScriptEngine.h>
+#include <ScriptSerialization.h>
 
 #include <atPool.h>
 #include <Pool.h>
 
+#ifdef IS_RDR3
+#include <NativeWrappers.h>
+#endif
+
 #include <Local.h>
 
+#ifdef GTA_FIVE
 template<typename TEntry>
 class RefPool
 {
@@ -40,6 +46,16 @@ public:
 		return m_count;
 	}
 };
+#endif
+
+static hook::cdecl_stub<uint32_t(fwEntity*)> getScriptGuidForEntity([]()
+{
+#ifdef GTA_FIVE
+	return hook::get_pattern("48 F7 F9 49 8B 48 08 48 63 D0 C1 E0 08 0F B6 1C 11 03 D8", -0x68);
+#elif IS_RDR3
+	return hook::get_pattern("32 DB E8 ? ? ? ? 48 85 C0 75 ? 8A 05", -35);
+#endif
+});
 
 struct PedPoolTraits
 {
@@ -50,8 +66,14 @@ struct PedPoolTraits
 	{
 		return rage::GetPool<ObjectType>("Peds");
 	}
+
+	static uint32_t getScriptGuid(ObjectType* e)
+	{
+		return getScriptGuidForEntity((ObjectType*)e);
+	}
 };
 
+#ifdef GTA_FIVE
 static RefPool<CVehicle>*** g_vehiclePool;
 
 struct VehiclePoolTraits
@@ -63,7 +85,29 @@ struct VehiclePoolTraits
 	{
 		return **g_vehiclePool;
 	}
+
+	static uint32_t getScriptGuid(ObjectType* e)
+	{
+		return getScriptGuidForEntity((ObjectType*)e);
+	}
 };
+#elif IS_RDR3
+struct VehiclePoolTraits
+{
+	using ObjectType = CVehicle;
+	using PoolType = atPool<CVehicle>;
+
+	static PoolType* GetPool()
+	{
+		return rage::GetPool<ObjectType>("CVehicle");
+	}
+
+	static uint32_t getScriptGuid(ObjectType* e)
+	{
+		return getScriptGuidForEntity((ObjectType*)e);
+	}
+};
+#endif
 
 struct ObjectPoolTraits
 {
@@ -73,6 +117,11 @@ struct ObjectPoolTraits
 	static PoolType* GetPool()
 	{
 		return rage::GetPool<ObjectType>("Object");
+	}
+
+	static uint32_t getScriptGuid(ObjectType* e)
+	{
+		return getScriptGuidForEntity((ObjectType*)e);
 	}
 };
 
@@ -85,12 +134,34 @@ struct PickupPoolTraits
 	{
 		return rage::GetPool<ObjectType>("CPickup");
 	}
+
+	static uint32_t getScriptGuid(ObjectType* e)
+	{
+		return getScriptGuidForEntity((ObjectType*)e);
+	}
 };
 
-static hook::cdecl_stub<uint32_t(fwEntity*)> getScriptGuidForEntity([]()
+template<typename TTraits>
+static void SerializePool(fx::ScriptContext& context)
 {
-	return hook::get_pattern("48 F7 F9 49 8B 48 08 48 63 D0 C1 E0 08 0F B6 1C 11 03 D8", -0x68);
-});
+	std::vector<uint32_t> guids;
+
+	TTraits::PoolType* pool = TTraits::GetPool();
+	for (int i = 0; i < pool->GetSize(); ++i) // size_t i
+	{
+		TTraits::ObjectType* entry = pool->GetAt(i);
+		if (entry)
+		{
+			uint32_t guid = TTraits::getScriptGuid(entry);
+			if (guid != 0)
+			{
+				guids.push_back(guid);
+			}
+		}
+	}
+
+	context.SetResult(fx::SerializeObject(guids));
+}
 
 struct FindHandle
 {
@@ -203,9 +274,28 @@ static InitFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("FIND_FIRST_PICKUP", FindFirstHandler<PickupPoolTraits>);
 	fx::ScriptEngine::RegisterNativeHandler("FIND_NEXT_PICKUP", FindNextHandler<PickupPoolTraits>);
 	fx::ScriptEngine::RegisterNativeHandler("END_FIND_PICKUP", CloseFindHandler);
+
+	fx::ScriptEngine::RegisterNativeHandler("GET_GAME_POOL", [](fx::ScriptContext& context)
+	{
+		std::string pool = context.CheckArgument<const char*>(0);
+		if (pool.compare("CPed") == 0)
+			SerializePool<PedPoolTraits>(context);
+		else if (pool.compare("CObject") == 0)
+			SerializePool<ObjectPoolTraits>(context);
+		else if (pool.compare("CPickup") == 0)
+			SerializePool<PickupPoolTraits>(context);
+		else if (pool.compare("CVehicle") == 0)
+			SerializePool<VehiclePoolTraits>(context);
+		else
+		{
+			throw std::runtime_error(va("Invalid pool: %s", pool));
+		}
+	});
 });
 
+#ifdef GTA_FIVE
 static HookFunction hookFunction([]()
 {
 	g_vehiclePool = hook::get_address<decltype(g_vehiclePool)>(hook::get_pattern("48 8B 05 ? ? ? ? F3 0F 59 F6 48 8B 08", 3));
 });
+#endif

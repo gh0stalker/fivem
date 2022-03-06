@@ -53,12 +53,14 @@ private:
 
 	std::map<std::string, TV8Handler> m_v8Handlers;
 
+	std::map<int64, CefRefPtr<CefV8Value>> m_origEventListeners;
+
 	std::vector<TContextReleaseHandler> m_v8ReleaseHandlers;
 
 protected:
 	virtual void OnBeforeCommandLineProcessing(const CefString& process_type, CefRefPtr<CefCommandLine> command_line) override;
 
-	virtual bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) override;
+	virtual bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process, CefRefPtr<CefProcessMessage> message) override;
 
 	// CefV8Handler implementation
 	virtual bool Execute(const CefString& name, CefRefPtr<CefV8Value> object, const CefV8ValueList& arguments, CefRefPtr<CefV8Value>& retval, CefString& exception) override;

@@ -5,6 +5,8 @@
 #include <ServerInstanceBase.h>
 #include <ServerInstanceBaseRef.h>
 
+#include <KeyedRateLimiter.h>
+
 #include <ResourceCallbackComponent.h>
 
 #include <ResourceManager.h>
@@ -16,7 +18,14 @@
 #include <json.hpp>
 #include <cfx_version.h>
 
+#include <boost/algorithm/string.hpp>
+
+#include <GameServerComms.h>
+
 #include <MonoThreadAttachment.h>
+#include <SharedFunction.h>
+
+#include <TcpListenManager.h>
 
 // HTTP handler
 static auto GetHttpHandler(fx::Resource* resource)
@@ -25,32 +34,6 @@ static auto GetHttpHandler(fx::Resource* resource)
 	{
 
 	};
-}
-
-// blindly copypasted from StackOverflow (to allow std::function to store the funcref types with their move semantics)
-// TODO: we use this twice now, time for a shared header?
-template<class F>
-struct shared_function
-{
-	std::shared_ptr<F> f;
-	shared_function() = default;
-	shared_function(F&& f_) : f(std::make_shared<F>(std::move(f_))) {}
-	shared_function(shared_function const&) = default;
-	shared_function(shared_function&&) = default;
-	shared_function& operator=(shared_function const&) = default;
-	shared_function& operator=(shared_function&&) = default;
-
-	template<class...As>
-	auto operator()(As&&...as) const
-	{
-		return (*f)(std::forward<As>(as)...);
-	}
-};
-
-template<class F>
-shared_function<std::decay_t<F>> make_shared_function(F&& f)
-{
-	return { std::forward<F>(f) };
 }
 
 class ResourceHttpComponent : public fwRefCountable, public fx::IAttached<fx::Resource>
@@ -83,11 +66,37 @@ public:
 
 	void HandleRequest(const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response)
 	{
+		auto limiter = m_resource->GetManager()->GetComponent<fx::ServerInstanceBaseRef>()->Get()->GetComponent<fx::PeerAddressRateLimiterStore>()->GetRateLimiter("http_" + m_resource->GetName(), fx::RateLimiterDefaults{ 10.0, 25.0 });
+		auto address = request->GetRemotePeer();
+
+		if (!fx::IsProxyAddress(address) && !limiter->Consume(address))
+		{
+			response->SetStatusCode(429);
+			response->SetHeader("Content-Type", "text/plain; charset=utf-8");
+			response->End("Rate limit exceeded.");
+
+			return;
+		}
+
 		// get the local path for the request
-		auto localPath = request->GetPath().substr(m_resource->GetName().length() + 2);
+		auto rl = m_endpointPrefix.length();
+
+		if (!boost::algorithm::ends_with(m_endpointPrefix, "/"))
+		{
+			rl++;
+		}
+
+		auto path = std::string{ request->GetPath().c_str() };
+
+		auto localPath = (path.length() >= rl) ? path.substr(rl) : "";
 
 		// pass to the registered handler for the resource
-		if (m_handlerRef)
+		if (!m_handlerRef)
+		{
+			return;
+		}
+
+		gscomms_execute_callback_on_main_thread([this, localPath, request, response]
 		{
 			auto cbComponent = m_resource->GetManager()->GetComponent<fx::ResourceCallbackComponent>();
 
@@ -99,11 +108,11 @@ public:
 
 			for (auto& pair : request->GetHeaders())
 			{
-				headers.insert(pair);
+				headers.insert({ std::string{ pair.first.c_str() }, std::string{ pair.second.c_str() } });
 			}
 
 			requestWrap.headers = headers;
-			requestWrap.method = request->GetRequestMethod();
+			requestWrap.method = std::string{ request->GetRequestMethod().c_str() };
 			requestWrap.address = request->GetRemoteAddress();
 			requestWrap.path = "/" + localPath;
 
@@ -119,9 +128,12 @@ public:
 					{
 						fx::FunctionRef functionRef{ std::string{callback.via.ext.data(), callback.via.ext.size} };
 
-						request->SetCancelHandler(make_shared_function([this, functionRef = std::move(functionRef)]()
+						request->SetCancelHandler(make_shared_function([this, functionRef = std::move(functionRef)]() mutable
 						{
-							m_resource->GetManager()->CallReference<void>(functionRef.GetRef());
+							gscomms_execute_callback_on_main_thread(make_shared_function([this, functionRef = std::move(functionRef)]()
+							{
+								m_resource->GetManager()->CallReference<void>(functionRef.GetRef());
+							}));
 						}));
 					}
 				}
@@ -145,16 +157,19 @@ public:
 					{
 						fx::FunctionRef functionRef{ std::string{callback.via.ext.data(), callback.via.ext.size} };
 
-						request->SetDataHandler(make_shared_function([this, functionRef = std::move(functionRef), isBinary](const std::vector<uint8_t>& bodyArray)
+						request->SetDataHandler(make_shared_function([this, functionRef = std::move(functionRef), isBinary](const std::vector<uint8_t>& bodyArray) mutable
 						{
-							if (isBinary)
+							gscomms_execute_callback_on_main_thread(make_shared_function([this, functionRef = std::move(functionRef), isBinary, bodyArray]()
 							{
-								m_resource->GetManager()->CallReference<void>(functionRef.GetRef(), bodyArray);
-							}
-							else
-							{
-								m_resource->GetManager()->CallReference<void>(functionRef.GetRef(), std::string(bodyArray.begin(), bodyArray.end()));
-							}
+								if (isBinary)
+								{
+									m_resource->GetManager()->CallReference<void>(functionRef.GetRef(), bodyArray);
+								}
+								else
+								{
+									m_resource->GetManager()->CallReference<void>(functionRef.GetRef(), std::string(bodyArray.begin(), bodyArray.end()));
+								}
+							}));
 						}));
 					}
 				}
@@ -181,11 +196,11 @@ public:
 					{
 						if (pair.second.type == msgpack::type::ARRAY)
 						{
-							response->SetHeader(pair.first, pair.second.as<std::vector<std::string>>());
+							response->SetHeader(net::HeaderString{ pair.first.c_str() }, pair.second.as<std::vector<std::string>>());
 						}
 						else
 						{
-							response->SetHeader(pair.first, pair.second.as<std::string>());
+							response->SetHeader(net::HeaderString{ pair.first.c_str() }, pair.second.as<std::string>());
 						}
 					}
 
@@ -212,9 +227,10 @@ public:
 				}
 			});
 
-			MonoEnsureThreadAttached();
+			//MonoEnsureThreadAttached();
+
 			m_resource->GetManager()->CallReference<void>(*m_handlerRef, requestWrap, responseWrap);
-		}
+		});
 	}
 
 	inline void SetHandlerRef(const std::string& ref)
@@ -224,6 +240,8 @@ public:
 
 private:
 	fx::Resource* m_resource;
+
+	std::string m_endpointPrefix;
 
 	std::optional<std::string> m_handlerRef;
 };
@@ -246,9 +264,18 @@ void ResourceHttpComponent::AttachToObject(fx::Resource* object)
 		// get the server's HTTP manager
 		fwRefContainer<fx::HttpServerManager> httpManager = server->GetComponent<fx::HttpServerManager>();
 
+		// #TODOMONITOR: *really* make helper
+		auto monitorVar = m_resource->GetManager()->GetComponent<fx::ServerInstanceBaseRef>()->Get()->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("monitorMode");
+		m_endpointPrefix = fmt::sprintf("/%s/", m_resource->GetName());
+
+		if (monitorVar && monitorVar->GetValue() != "0" && m_resource->GetName() == "monitor")
+		{
+			m_endpointPrefix = "";
+		}
+
 		// add an endpoint
 		httpManager->AddEndpoint(
-			fmt::sprintf("/%s/", m_resource->GetName()),
+			m_endpointPrefix,
 			std::bind(&ResourceHttpComponent::HandleRequest, this, std::placeholders::_1, std::placeholders::_2));
 	}, 9999);
 
@@ -267,7 +294,10 @@ void ResourceHttpComponent::AttachToObject(fx::Resource* object)
 		fwRefContainer<fx::HttpServerManager> httpManager = server->GetComponent<fx::HttpServerManager>();
 
 		// remove an endpoint
-		httpManager->RemoveEndpoint(fmt::sprintf("/%s/", m_resource->GetName()));
+		if (!m_endpointPrefix.empty())
+		{
+			httpManager->RemoveEndpoint(m_endpointPrefix);
+		}
 	}, -9999);
 }
 
@@ -310,6 +340,34 @@ static InitFunction initFunction([]()
 
 				response->End("Redirecting...");
 				return;
+			}
+
+			auto webVar = instance->GetComponent<console::Context>()->GetVariableManager()->FindEntryRaw("web_baseUrl");
+
+			if (webVar)
+			{
+				auto wvv = webVar->GetValue();
+				std::string_view wvvv{
+					wvv
+				};
+
+				auto endPos = wvvv.find(".users.cfx.re");
+
+				if (endPos != std::string::npos)
+				{
+					auto startPos = wvvv.rfind("-", endPos);
+
+					if (startPos != std::string::npos)
+					{
+						auto webUrl = fmt::sprintf("https://cfx.re/join/%s", wvvv.substr(startPos + 1, endPos - (startPos + 1)));
+
+						response->SetStatusCode(302);
+						response->SetHeader("Location", webUrl);
+
+						response->End("Redirecting...");
+						return;
+					}
+				}
 			}
 
 			auto data = nlohmann::json::object(

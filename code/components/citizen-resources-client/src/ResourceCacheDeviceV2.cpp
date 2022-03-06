@@ -18,16 +18,24 @@
 #include <ICoreGameInit.h>
 #include <StreamingEvents.h>
 
-#include <SHA1.h>
+#include <openssl/sha.h>
+
+#include <VFSError.h>
 
 #include <pplawait.h>
 #include <experimental/resumable>
 
+#include <concurrent_queue.h>
+
+#include <CoreConsole.h>
 #include <Error.h>
 
 #include <IteratorView.h>
 
+extern tbb::concurrent_unordered_map<std::string, bool> g_stuffWritten;
 extern std::unordered_multimap<std::string, std::pair<std::string, std::string>> g_referenceHashList;
+
+int GetWeightForFileName(const std::string& fileName);
 
 namespace resources
 {
@@ -36,7 +44,7 @@ size_t RcdBaseStream::GetLength()
 	return m_fetcher->GetLength(m_fileName);
 }
 
-bool RcdBaseStream::EnsureRead()
+bool RcdBaseStream::EnsureRead(const std::function<void(bool, const std::string&)>& cb)
 {
 	if (!m_parentDevice.GetRef() || m_parentHandle == INVALID_DEVICE_HANDLE)
 	{
@@ -44,11 +52,31 @@ bool RcdBaseStream::EnsureRead()
 		{
 			auto task = m_fetcher->FetchEntry(m_fileName);
 
-			if (m_fetcher->IsBlocking())
+			if (task == concurrency::task<RcdFetchResult>{ })
 			{
-				task.wait();
+				throw RcdFetchFailedException(fmt::sprintf("Failed to get entry for %s\n", m_fileName));
 			}
-			else
+
+			if (cb)
+			{
+				task.then([this, cb](concurrency::task<RcdFetchResult> task)
+				{
+					try
+					{
+						task.get();
+
+						cb(true, {});
+					}
+					catch (const std::exception& e)
+					{
+						m_fetcher->PropagateError(e.what());
+
+						cb(false, e.what());
+					}
+				});
+			}
+
+			if (!m_fetcher->IsBlocking())
 			{
 				if (!task.is_done())
 				{
@@ -56,21 +84,30 @@ bool RcdBaseStream::EnsureRead()
 				}
 			}
 
-			m_metaData = task.get().metaData;
+			const auto& result = task.get();
+			m_metaData = result.metaData;
 
-			const auto& localPath = task.get().localPath;
+			const auto& localPath = result.localPath;
 			m_parentDevice = vfs::GetDevice(localPath);
 			assert(m_parentDevice.GetRef());
 
 			m_parentHandle = OpenFile(localPath);
 			assert(m_parentHandle != INVALID_DEVICE_HANDLE);
 		}
+		catch (const RcdFetchFailedException& e)
+		{
+			m_fetcher->UnfetchEntry(m_fileName);
+
+			throw;
+		}
 		catch (const std::exception& e)
 		{
 			// propagate throw for nonblocking
 			if (!m_fetcher->IsBlocking())
 			{
-				throw e;
+				m_fetcher->UnfetchEntry(m_fileName);
+
+				throw;
 			}
 
 			FatalError("Unable to ensure read in RCD: %s\n\nPlease report this issue, together with the information from 'Save information' down below on https://forum.fivem.net/.", e.what());
@@ -104,6 +141,8 @@ size_t RcdStream::Read(void* outBuffer, size_t size)
 	}
 	catch (const std::exception& e)
 	{
+		m_fetcher->PropagateError(e.what());
+
 		trace(__FUNCTION__ ": failing read for %s\n", e.what());
 
 		return -1;
@@ -123,6 +162,8 @@ size_t RcdStream::Seek(intptr_t off, int at)
 	}
 	catch (const std::exception& e)
 	{
+		m_fetcher->PropagateError(e.what());
+
 		trace(__FUNCTION__ ": failing seek for %s\n", e.what());
 
 		return -1;
@@ -150,6 +191,18 @@ RcdBulkStream::~RcdBulkStream()
 
 size_t RcdBulkStream::ReadBulk(uint64_t ptr, void* outBuffer, size_t size)
 {
+	// if this is a read request for 'real' size data, satisfy it with such
+	if (ptr == 0 && size == 16 && m_realSize > 0)
+	{
+		uint8_t* data = (uint8_t*)outBuffer;
+		memset(data, 0, size);
+		data[7] = ((m_realSize >> 0) & 0xFF);
+		data[14] = ((m_realSize >> 8) & 0xFF);
+		data[5] = ((m_realSize >> 16) & 0xFF);
+		data[2] = ((m_realSize >> 24) & 0xFF);
+		return 16;
+	}
+
 	if (size == 0xFFFFFFFC)
 	{
 		return m_fetcher->ExistsOnDisk(m_fileName) ? 2048 : 0;
@@ -171,6 +224,8 @@ size_t RcdBulkStream::ReadBulk(uint64_t ptr, void* outBuffer, size_t size)
 	}
 	catch (const std::exception& e)
 	{
+		m_fetcher->PropagateError(e.what());
+
 		trace(__FUNCTION__ ": failing read for %s\n", e.what());
 
 		return -1;
@@ -209,14 +264,33 @@ std::shared_ptr<RcdStream> ResourceCacheDeviceV2::CreateStream(const std::string
 
 std::shared_ptr<RcdBulkStream> ResourceCacheDeviceV2::OpenBulkStream(const std::string& fileName, uint64_t* ptr)
 {
-	if (!GetEntryForFileName(fileName))
+	auto entry = GetEntryForFileName(fileName);
+
+	if (!entry)
 	{
 		return {};
 	}
 
 	*ptr = 0;
 
-	return std::make_shared<RcdBulkStream>(static_cast<RcdFetcher*>(this), fileName);
+	return std::make_shared<RcdBulkStream>(static_cast<RcdFetcher*>(this), fileName, GetRealSize(entry->get()));
+}
+
+size_t ResourceCacheDeviceV2::GetRealSize(const ResourceCacheEntryList::Entry& entry)
+{
+	size_t realSize = 0;
+
+	if (entry.size == 0xFFFFFF)
+	{
+		const auto& extData = entry.extData;
+
+		if (auto it = extData.find("rawSize"); it != extData.end())
+		{
+			realSize = std::stoi(it->second);
+		}
+	}
+
+	return realSize;
 }
 
 bool ResourceCacheDeviceV2::ExistsOnDisk(const std::string& fileName)
@@ -236,16 +310,20 @@ bool ResourceCacheDeviceV2::ExistsOnDisk(const std::string& fileName)
 	}
 
 	const std::string& localPath = cacheEntry->GetLocalPath();
-	auto device = vfs::GetDevice(localPath);
 
-	if (!device.GetRef())
+	if (g_stuffWritten.find(localPath) == g_stuffWritten.end())
 	{
-		return false;
-	}
+		auto device = vfs::GetDevice(localPath);
 
-	if (device->GetAttributes(localPath) == -1)
-	{
-		return false;
+		if (!device.GetRef())
+		{
+			return false;
+		}
+
+		if (device->GetAttributes(localPath) == -1)
+		{
+			return false;
+		}
 	}
 
 	return true;
@@ -260,20 +338,46 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::FetchEntry(const std::s
 		return {};
 	}
 
-	std::unique_lock<std::mutex> lock(m_lock);
+	std::unique_lock<std::mutex> lock(ms_lock);
 
-	const auto& referenceHash = entry->referenceHash;
-	auto it = m_entries.find(referenceHash);
+	const auto& e = entry->get();
+	const auto& referenceHash = e.referenceHash;
+	auto it = ms_entries.find(referenceHash);
 
-	if (it == m_entries.end())
+	if (it == ms_entries.end() || !it->second)
 	{
-		it = m_entries.insert({ referenceHash, { concurrency::create_task([this, entry]() -> concurrency::task<RcdFetchResult>
+		auto retTask = concurrency::create_task(std::bind(&ResourceCacheDeviceV2::DoFetch, this, *entry));
+
+		if (it != ms_entries.end())
 		{
-			return co_await DoFetch(*entry);
-		}) } }).first;
+			it->second = std::move(retTask);
+		}
+		else
+		{
+			it = ms_entries.emplace(referenceHash, std::move(retTask)).first;
+		}
 	}
 
-	return it->second.task;
+	return *it->second;
+}
+
+void ResourceCacheDeviceV2::UnfetchEntry(const std::string& fileName)
+{
+	auto entry = GetEntryForFileName(fileName);
+
+	if (entry)
+	{
+		std::unique_lock<std::mutex> lock(ms_lock);
+
+		const auto& e = entry->get();
+		const auto& referenceHash = e.referenceHash;
+		auto it = ms_entries.find(referenceHash);
+
+		if (it != ms_entries.end())
+		{
+			it->second = {};
+		}
+	}
 }
 
 concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceCacheEntryList::Entry& entryRef)
@@ -290,6 +394,10 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 		};
 	};
 
+	int tries = 0;
+	std::string lastError = "Unknown error.";
+	bool downloaded = false;
+
 	do
 	{
 		auto cacheEntry = m_cache->GetEntryFor(entry);
@@ -302,11 +410,14 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 			if (localStream.GetRef())
 			{
 				std::array<uint8_t, 8192> data;
-				sha1nfo sha1;
+				SHA_CTX sha1;
 				size_t numRead;
 
+				size_t readNow = 0;
+				size_t readTotal = localStream->GetLength();
+
 				// initialize context
-				sha1_init(&sha1);
+				SHA1_Init(&sha1);
 
 				// read from the stream
 				while ((numRead = localStream->Read(data.data(), data.size())) > 0)
@@ -316,17 +427,21 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 						break;
 					}
 
-					sha1_write(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+					readNow += numRead;
+					fx::OnCacheVerifyStatus(fmt::sprintf("%s%s/%s", m_pathPrefix, entry.resourceName, entry.basename), readNow, readTotal);
+
+					SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
 				}
 
 				// get the hash result and convert it to a string
-				uint8_t* hash = sha1_result(&sha1);
+				uint8_t hash[20];
+				SHA1_Final(hash, &sha1);
 
 				auto hashString = fmt::sprintf("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
 					hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9],
 					hash[10], hash[11], hash[12], hash[13], hash[14], hash[15], hash[16], hash[17], hash[18], hash[19]);
 
-				if (hashString == entry.referenceHash)
+				if (hashString == entry.referenceHash || (downloaded && entry.referenceHash.empty()))
 				{
 					fillResult(*cacheEntry);
 				}
@@ -336,8 +451,17 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 						entry.basename,
 						hashString,
 						entry.referenceHash);
+
+					lastError = fmt::sprintf("%s hash %s does not match %s",
+						entry.basename,
+						hashString,
+						entry.referenceHash);
 				}
 			}
+		}
+		else if (downloaded)
+		{
+			lastError = "Failed to add entry to local storage (download corrupted?)";
 		}
 		
 		if (!result)
@@ -351,7 +475,7 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 			// log the request starting
 			uint32_t initTime = timeGetTime();
 
-			trace(__FUNCTION__ " downloading %s (hash %s) from %s\n",
+			console::DPrintf("citizen:resources:client", __FUNCTION__ " downloading %s (hash %s) from %s\n",
 				entry.basename,
 				entry.referenceHash.empty() ? "[direct]" : entry.referenceHash.c_str(),
 				entry.remoteUrl);
@@ -365,7 +489,7 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 				}
 			};
 
-			//options.weight = GetWeightForFileName(handleData->entry.basename);
+			options.weight = ::GetWeightForFileName(entry.basename);
 
 			std::string connectionToken;
 			if (Instance<ICoreGameInit>::Get()->GetData("connectionToken", &connectionToken))
@@ -373,8 +497,14 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 				options.headers["X-CitizenFX-Token"] = connectionToken;
 			}
 
-			auto req = Instance<HttpClient>::Get()->DoFileGetRequest(entry.remoteUrl, vfs::GetDevice(outFileName), outFileName, options, [tce, outFileName](bool result, const char* errorData, size_t outSize)
+			options.addErrorBody = true;
+
+			std::string referenceHash = entry.referenceHash;
+
+			auto req = Instance<HttpClient>::Get()->DoFileGetRequest(entry.remoteUrl, vfs::GetDevice(outFileName), outFileName, options, [this, referenceHash, tce, outFileName](bool result, const char* errorData, size_t outSize)
 			{
+				RemoveHttpRequest(referenceHash);
+
 				if (result)
 				{
 					auto device = vfs::GetDevice(outFileName);
@@ -387,6 +517,8 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 					tce.set({ false, std::string(errorData, outSize) });
 				}
 			});
+
+			StoreHttpRequest(referenceHash, req);
 
 			auto fetchResult = co_await concurrency::task<FetchResultT>{tce};
 			
@@ -403,18 +535,28 @@ concurrency::task<RcdFetchResult> ResourceCacheDeviceV2::DoFetch(const ResourceC
 
 				AddEntryToCache(outFileName, metaData, entry);
 
-				trace("ResourceCacheDevice: downloaded %s in %d msec (size %d)\n", entry.basename, (timeGetTime() - initTime), size);
+				downloaded = true;
+
+				console::DPrintf("citizen:resources:client", "ResourceCacheDevice: downloaded %s in %d msec (size %d)\n", entry.basename, (timeGetTime() - initTime), size);
 			}
 			else
 			{
 				auto error = std::get<std::string>(std::get<1>(fetchResult));
 
-				trace("ResourceCacheDevice reporting failure: %s", error);
+				lastError = fmt::sprintf("Failure downloading %s: %s", entry.basename, error);
+				trace("^3ResourceCacheDevice reporting failure downloading %s: %s\n", entry.basename, error);
 			}
 		}
+
+		if (tries >= 4)
+		{
+			throw RcdFetchFailedException(lastError);
+		}
+
+		tries++;
 	} while (!result);
 
-	return *result;
+	co_return *result;
 }
 
 fwRefContainer<vfs::Stream> ResourceCacheDeviceV2::GetVerificationStream(const ResourceCacheEntryList::Entry& entry, const ResourceCache::Entry& cacheEntry)
@@ -427,19 +569,79 @@ void ResourceCacheDeviceV2::AddEntryToCache(const std::string& outFileName, std:
 	m_cache->AddEntry(outFileName, metaData);
 }
 
-std::optional<ResourceCacheEntryList::Entry> ResourceCacheDeviceV2::GetEntryForFileName(const std::string& fileName)
+void ResourceCacheDeviceV2::StoreHttpRequest(const std::string& hash, const HttpRequestPtr& request)
+{
+	int changeWeight = -1;
+
+	{
+		std::shared_lock _(m_pendingRequestWeightsMutex);
+		if (auto it = m_pendingRequestWeights.find(hash); it != m_pendingRequestWeights.end())
+		{
+			changeWeight = it->second;
+		}
+	}
+
+	if (changeWeight != -1)
+	{
+		request->SetRequestWeight(changeWeight);
+
+		std::unique_lock _(m_pendingRequestWeightsMutex);
+		m_pendingRequestWeights.erase(hash);
+	}
+
+	{
+		std::unique_lock _(m_requestMapMutex);
+		m_requestMap[hash] = request;
+	}
+}
+
+void ResourceCacheDeviceV2::RemoveHttpRequest(const std::string& hash)
+{
+	std::unique_lock _(m_requestMapMutex);
+	m_requestMap.erase(hash);
+}
+
+void ResourceCacheDeviceV2::SetRequestWeight(const std::string& hash, int newWeight)
+{
+	HttpRequestPtr requestPtr;
+
+	{
+		std::shared_lock _(m_requestMapMutex);
+		if (auto it = m_requestMap.find(hash); it != m_requestMap.end())
+		{
+			requestPtr = it->second;
+		}
+	}
+
+	if (requestPtr)
+	{
+		requestPtr->SetRequestWeight(newWeight);
+	}
+	else if (newWeight != -1)
+	{
+		std::unique_lock _(m_pendingRequestWeightsMutex);
+		m_pendingRequestWeights[hash] = newWeight;
+	}
+	else // if !requestPtr && newWeight == -1
+	{
+		std::unique_lock _(m_pendingRequestWeightsMutex);
+		m_pendingRequestWeights.erase(hash);
+	}
+}
+
+std::optional<std::reference_wrapper<const ResourceCacheEntryList::Entry>> ResourceCacheDeviceV2::GetEntryForFileName(std::string_view fileName)
 {
 	// strip the path prefix
-	std::string relativeName = fileName.substr(m_pathPrefix.length());
+	std::string_view relativeName = fileName.substr(m_pathPrefix.length());
 
 	// relative paths are {resource}/{filepath}
 	int slashOffset = relativeName.find_first_of('/');
-	std::string resourceName = relativeName.substr(0, slashOffset);
-	std::string itemName = relativeName.substr(slashOffset + 1);
+	std::string_view resourceName = relativeName.substr(0, slashOffset);
+	std::string_view itemName = relativeName.substr(slashOffset + 1);
 
 	// get the relative resource
 	fx::ResourceManager* resourceManager = Instance<fx::ResourceManager>::Get();
-	fwRefContainer<fx::Resource> resource = resourceManager->GetResource(resourceName);
+	fwRefContainer<fx::Resource> resource = resourceManager->GetResource(std::string(resourceName));
 
 	// TODO: handle this some better way
 	if (!resource.GetRef())
@@ -458,16 +660,28 @@ std::optional<ResourceCacheEntryList::Entry> ResourceCacheDeviceV2::GetEntryForF
 		return {};
 	}
 
-	return *entry;
+	return entry;
 }
 
 #define VFS_GET_RAGE_PAGE_FLAGS 0x20001
 
+#ifndef IS_RDR3
 struct ResourceFlags
 {
 	uint32_t flag1;
 	uint32_t flag2;
 };
+#else
+struct ResourceFlags
+{
+	uint32_t magic; // 'RSC8'
+	uint32_t version;
+	uint32_t virtPages;
+	uint32_t physPages;
+	uint64_t fileSize;
+	uint64_t fileTime;
+};
+#endif
 
 struct GetRagePageFlagsExtension
 {
@@ -484,6 +698,64 @@ struct GetRcdDebugInfoExtension
 	std::string outData; // out
 };
 
+#define VFS_RCD_REQUEST_HANDLE 0x30003
+
+struct RequestHandleExtension
+{
+	vfs::Device::THandle handle;
+	std::function<void(bool success, const std::string& error)> onRead;
+};
+
+#define VFS_RCD_SET_WEIGHT 0x30004
+
+struct SetWeightExtension
+{
+	const char* fileName;
+	int newWeight;
+};
+
+struct tp_work
+{
+	explicit tp_work(std::function<void()>&& cb)
+	{
+		auto data = new work_data(std::move(cb));
+		work = CreateThreadpoolWork(handle_work, data, NULL);
+	}
+
+	tp_work(const tp_work&) = delete;
+
+	void post()
+	{
+		SubmitThreadpoolWork(work);
+	}
+
+private:
+	static VOID CALLBACK handle_work(
+	_Inout_ PTP_CALLBACK_INSTANCE Instance,
+	_Inout_opt_ PVOID Context,
+	_Inout_ PTP_WORK Work)
+	{
+		work_data* wd = (work_data*)Context;
+		wd->cb();
+
+		delete wd;
+		CloseThreadpoolWork(Work);
+	}
+
+	struct work_data
+	{
+		explicit work_data(std::function<void()>&& cb)
+			: cb(std::move(cb))
+		{
+			
+		}
+
+		std::function<void()> cb;
+	};
+
+	PTP_WORK work;
+};
+
 bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size_t controlSize)
 {
 	if (controlIdx == VFS_GET_RAGE_PAGE_FLAGS)
@@ -494,11 +766,104 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 
 		if (entry)
 		{
-			data->version = atoi(entry->extData["rscVersion"].c_str());
-			data->flags.flag1 = strtoul(entry->extData["rscPagesVirtual"].c_str(), nullptr, 10);
-			data->flags.flag2 = strtoul(entry->extData["rscPagesPhysical"].c_str(), nullptr, 10);
+			auto extData = entry->get().extData;
+
+#ifdef IS_RDR3
+			SYSTEMTIME st;
+			GetSystemTime(&st);
+
+			FILETIME ft;
+			SystemTimeToFileTime(&st, &ft);
+
+			data->version = atoi(extData["rscVersion"].c_str());
+			data->flags.magic = 0x38435352;
+			data->flags.fileSize = entry->get().size;
+			data->flags.fileTime = ((uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime);
+			data->flags.version = atoi(extData["rscVersion"].c_str());
+			data->flags.virtPages = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
+			data->flags.physPages = strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10);
+#elif defined(GTA_FIVE)
+			data->version = atoi(extData["rscVersion"].c_str());
+			data->flags.flag1 = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
+			data->flags.flag2 = strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10);
+#elif defined(GTA_NY)
+			data->version = atoi(extData["rscVersion"].c_str());
+			data->flags.flag1 = strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10);
+			// flag2 would be out of bounds
+#endif
 			return true;
 		}
+	}
+	else if (controlIdx == VFS_RCD_REQUEST_HANDLE)
+	{
+		struct HandleContainer
+		{
+			explicit HandleContainer(ResourceCacheDeviceV2* self, vfs::Device::THandle hdl)
+				: self(self), hdl(hdl)
+			{
+				
+			}
+
+			~HandleContainer()
+			{
+				self->m_handleDeleteQueue.push(hdl);
+			}
+
+			ResourceCacheDeviceV2* self;
+			vfs::Device::THandle hdl;
+		};
+
+		RequestHandleExtension* data = (RequestHandleExtension*)controlData;
+
+		auto handle = std::make_shared<HandleContainer>(this, data->handle);
+		auto hd = GetHandle(handle->hdl);
+		auto cb = data->onRead;
+
+		tp_work work{ [this, handle, hd, cb]()
+			{
+				{
+					THandle hdl;
+
+					while (m_handleDeleteQueue.try_pop(hdl))
+					{
+						CloseBulk(hdl);
+					}
+				}
+
+				try
+				{
+					hd->bulkStream->EnsureRead([this, handle, cb](bool success, const std::string& error)
+					{
+						cb(success, error);
+					});
+				}
+				catch (const resources::RcdFetchFailedException& e)
+				{
+					cb(false, e.what());
+				}
+			} };
+
+		work.post();
+	}
+	else if (controlIdx == VFS_GET_DEVICE_LAST_ERROR)
+	{
+		vfs::GetLastErrorExtension* data = (vfs::GetLastErrorExtension*)controlData;
+
+		data->outError = m_lastError;
+
+		return true;
+	}
+	else if (controlIdx == VFS_RCD_SET_WEIGHT)
+	{
+		auto data = (SetWeightExtension*)controlData;
+		auto entry = GetEntryForFileName(data->fileName);
+
+		if (entry)
+		{
+			SetRequestWeight(entry->get().referenceHash, data->newWeight);
+		}
+
+		return true;
 	}
 	else if (controlIdx == VFS_GET_RCD_DEBUG_INFO)
 	{
@@ -508,16 +873,58 @@ bool ResourceCacheDeviceV2::ExtensionCtl(int controlIdx, void* controlData, size
 
 		if (entry)
 		{
-			data->outData = fmt::sprintf("RSC version: %d\nRSC page flags: virt %08x/phys %08x\nResource name: %s\nReference hash: %s\n",
-				atoi(entry->extData["rscVersion"].c_str()),
-				strtoul(entry->extData["rscPagesVirtual"].c_str(), nullptr, 10),
-				strtoul(entry->extData["rscPagesPhysical"].c_str(), nullptr, 10),
-				entry->resourceName,
-				entry->referenceHash);
+			auto extData = entry->get().extData;
+
+			std::string diskHash = "<unknown>";
+
+			auto cacheEntry = m_cache->GetEntryFor(*entry);
+
+			if (cacheEntry)
+			{
+				auto localStream = GetVerificationStream(*entry, *cacheEntry);
+
+				if (localStream.GetRef())
+				{
+					std::array<uint8_t, 8192> data;
+					SHA_CTX sha1;
+					size_t numRead;
+
+					// initialize context
+					SHA1_Init(&sha1);
+
+					// read from the stream
+					while ((numRead = localStream->Read(data.data(), data.size())) > 0)
+					{
+						if (numRead == -1)
+						{
+							break;
+						}
+
+						SHA1_Update(&sha1, reinterpret_cast<char*>(&data[0]), numRead);
+					}
+
+					// get the hash result and convert it to a string
+					uint8_t hash[20];
+					SHA1_Final(hash, &sha1);
+
+					diskHash = fmt::sprintf("%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+						hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7], hash[8], hash[9],
+						hash[10], hash[11], hash[12], hash[13], hash[14], hash[15], hash[16], hash[17], hash[18], hash[19]);
+				}
+			}
+
+			data->outData = fmt::sprintf("RSC version: %d\nRSC page flags: virt %08x/phys %08x\nResource name: %s\nReference hash: %s\nDisk hash: %s\nFile size: %d\n",
+				atoi(extData["rscVersion"].c_str()),
+				strtoul(extData["rscPagesVirtual"].c_str(), nullptr, 10),
+				strtoul(extData["rscPagesPhysical"].c_str(), nullptr, 10),
+				entry->get().resourceName,
+				entry->get().referenceHash,
+				diskHash,
+				entry->get().size);
 
 			data->outData += "Resources for hash:\n";
 
-			for (auto& views : fx::GetIteratorView(g_referenceHashList.equal_range(entry->referenceHash)))
+			for (auto& views : fx::GetIteratorView(g_referenceHashList.equal_range(entry->get().referenceHash)))
 			{
 				data->outData += fmt::sprintf("-> %s/%s\n", views.second.first, views.second.second);
 			}
@@ -535,7 +942,7 @@ size_t ResourceCacheDeviceV2::GetLength(const std::string& fileName)
 
 	if (entry)
 	{
-		return entry->size;
+		return entry->get().size;
 	}
 
 	return -1;
@@ -546,6 +953,9 @@ ResourceCacheDeviceV2::ResourceCacheDeviceV2(const std::shared_ptr<ResourceCache
 {
 
 }
+
+std::mutex ResourceCacheDeviceV2::ms_lock;
+tbb::concurrent_unordered_map<std::string, std::optional<concurrency::task<RcdFetchResult>>> ResourceCacheDeviceV2::ms_entries;
 }
 
 void MountResourceCacheDeviceV2(std::shared_ptr<ResourceCache> cache)

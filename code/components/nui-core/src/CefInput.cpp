@@ -8,57 +8,203 @@
 #include "StdInc.h"
 #include "CefOverlay.h"
 #include "CrossLibraryInterfaces.h"
-#include "InputHook.h"
 
 #include "CefImeHandler.h"
+#include "NUIRenderHandler.h"
+
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
 
 #include <windowsx.h>
+#include <console/Console.VariableHelpers.h>
+
+using nui::HasFocus;
+
+extern nui::GameInterface* g_nuiGi;
 
 static bool g_hasFocus = false;
 bool g_hasCursor = false;
+bool g_keepInput = false;
 static bool g_hasOverriddenFocus = false;
 extern bool g_mainUIFlag;
 POINT g_cursorPos;
+
+static ConVar<bool> uiLoadingCursor("ui_loadingCursor", ConVar_None, false);
 
 bool isKeyDown(WPARAM wparam)
 {
 	return (GetKeyState(wparam) & 0x8000) != 0;
 }
 
-static bool HasFocus()
+#include <shared_mutex>
+
+#ifdef USE_NUI_ROOTLESS
+std::shared_mutex g_nuiFocusStackMutex;
+std::list<std::string> g_nuiFocusStack;
+#endif
+
+static CefRefPtr<CefBrowser> GetFocusBrowser()
 {
-	return (g_hasFocus || g_hasOverriddenFocus);
+#ifdef USE_NUI_ROOTLESS
+	std::shared_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
+
+	for (const auto& entry : g_nuiFocusStack)
+	{
+		auto browser = nui::GetNUIWindowBrowser(entry);
+
+		if (browser)
+		{
+			return browser;
+		}
+	}
+
+	return {};
+#else
+	return nui::GetBrowser();
+#endif
 }
 
 namespace nui
 {
-	void GiveFocus(bool hasFocus, bool hasCursor)
+	CefBrowser* GetFocusBrowser()
+	{
+		return ::GetFocusBrowser().get();
+	}
+
+	extern fwRefContainer<NUIWindow> FindNUIWindow(fwString windowName);
+
+	bool HasFocus()
+	{
+		return (g_hasFocus || g_hasOverriddenFocus);
+	}
+
+	bool HasFocusKeepInput()
+	{
+		return g_keepInput;
+	}
+
+	void GiveFocus(const std::string& frameName, bool hasFocus, bool hasCursor)
 	{
 		if (!HasFocus() && hasFocus)
 		{
-			InputHook::SetGameMouseFocus(false);
+			g_nuiGi->SetGameMouseFocus(false);
 		}
 		else if (!hasFocus && HasFocus())
 		{
-			InputHook::SetGameMouseFocus(true);
+			g_nuiGi->SetGameMouseFocus(true);
 		}
 
 		g_hasFocus = hasFocus;
 		g_hasCursor = hasCursor;
+
+#ifdef USE_NUI_ROOTLESS
+		auto winName = fmt::sprintf("nui_%s", frameName);
+
+		auto browser = nui::GetNUIWindowBrowser(winName);
+		auto window = FindNUIWindow(winName);
+
+		if (hasFocus)
+		{
+			// deferred-create the window if it's given focus, too
+			if (window.GetRef())
+			{
+				if (!window->GetBrowser())
+				{
+					window->DeferredCreate();
+				}
+			}
+
+			static std::string oldDD;
+			std::unique_lock<std::shared_mutex> lock(g_nuiFocusStackMutex);
+
+			// remove from focus stack so it can be moved on top
+			for (auto it = g_nuiFocusStack.begin(); it != g_nuiFocusStack.end();)
+			{
+				if (*it == winName)
+				{
+					it = g_nuiFocusStack.erase(it);
+				}
+				else
+				{
+					++it;
+				}
+			}
+
+			g_nuiFocusStack.push_front(winName);
+
+			if (oldDD != g_nuiFocusStack.front())
+			{
+				if (browser)
+				{
+					auto rh = browser->GetHost()->GetClient()->GetRenderHandler();
+					NUIRenderHandler* nrh = (NUIRenderHandler*)rh.get();
+
+					RevokeDragDrop(g_nuiGi->GetHWND());
+					
+					HRESULT hr = RegisterDragDrop(g_nuiGi->GetHWND(), nrh->GetDropTarget());
+					if (FAILED(hr))
+					{
+						trace("registering drag/drop failed. hr: %08x\n", hr);
+					}
+				}
+			}
+		}
+		else
+		{
+			RevokeDragDrop(g_nuiGi->GetHWND());
+		}
+
+		if (browser)
+		{
+			browser->GetHost()->SetFocus(hasFocus);
+		}
+		else
+		{
+			if (window.GetRef())
+			{
+				window->PushLoadQueue([window, hasFocus]()
+				{
+					if (window->GetBrowser())
+					{
+						window->GetBrowser()->GetHost()->SetFocus(hasFocus);
+					}
+				});
+			}
+		}
+#endif
 	}
 
 	void OverrideFocus(bool hasFocus)
 	{
 		if (!HasFocus() && hasFocus)
 		{
-			InputHook::SetGameMouseFocus(false);
+			g_nuiGi->SetGameMouseFocus(false);
 		}
 		else if (!hasFocus && HasFocus())
 		{
-			InputHook::SetGameMouseFocus(true);
+			g_nuiGi->SetGameMouseFocus(true);
 		}
 
 		g_hasOverriddenFocus = hasFocus;
+
+		if (uiLoadingCursor.GetValue())
+		{
+			g_hasCursor = hasFocus;
+		}
+	}
+
+	void KeepInput(bool keepInput)
+	{
+		if (keepInput && HasFocus())
+		{
+			g_nuiGi->SetGameMouseFocus(true);
+		}
+		else if (!keepInput && HasFocus())
+		{
+			g_nuiGi->SetGameMouseFocus(false);
+		}
+
+		g_keepInput = keepInput;
 	}
 
 	void ProcessInput()
@@ -173,19 +319,281 @@ int GetCefMouseModifiers(WPARAM wparam) {
 	return modifiers;
 }
 
+int GetCefMouseModifiers() {
+	int modifiers = 0;
+	if (isKeyDown(VK_CONTROL) || isKeyDown(VK_LCONTROL) || isKeyDown(VK_RCONTROL))
+		modifiers |= EVENTFLAG_CONTROL_DOWN;
+	if (isKeyDown(VK_SHIFT) || isKeyDown(VK_LSHIFT) || isKeyDown(VK_RSHIFT))
+		modifiers |= EVENTFLAG_SHIFT_DOWN;
+	if (isKeyDown(VK_MENU))
+		modifiers |= EVENTFLAG_ALT_DOWN;
+	if (isKeyDown(VK_LBUTTON))
+		modifiers |= EVENTFLAG_LEFT_MOUSE_BUTTON;
+	if (isKeyDown(VK_MBUTTON))
+		modifiers |= EVENTFLAG_MIDDLE_MOUSE_BUTTON;
+	if (isKeyDown(VK_RBUTTON))
+		modifiers |= EVENTFLAG_RIGHT_MOUSE_BUTTON;
+
+	// Low bit set from GetKeyState indicates "toggled".
+	if (::GetKeyState(VK_NUMLOCK) & 1)
+		modifiers |= EVENTFLAG_NUM_LOCK_ON;
+	if (::GetKeyState(VK_CAPITAL) & 1)
+		modifiers |= EVENTFLAG_CAPS_LOCK_ON;
+	return modifiers;
+}
+
+static void AlterKeyEventForAltGr(CefKeyEvent& event, WPARAM wParam)
+{
+	// mimic alt-gr check behaviour from
+	// src/ui/events/win/events_win_utils.cc: GetModifiersFromKeyState
+	if ((event.type == KEYEVENT_CHAR) && isKeyDown(VK_RMENU))
+	{
+		// reverse AltGr detection taken from PlatformKeyMap::UsesAltGraph
+		// instead of checking all combination for ctrl-alt, just check current char
+		HKL current_layout = ::GetKeyboardLayout(0);
+
+		// https://docs.microsoft.com/en-gb/windows/win32/api/winuser/nf-winuser-vkkeyscanexw
+		// ... high-order byte contains the shift state,
+		// which can be a combination of the following flag bits.
+		// 2 Either CTRL key is pressed.
+		// 4 Either ALT key is pressed.
+		SHORT scan_res = ::VkKeyScanExW(wParam, current_layout);
+		if (((scan_res >> 8) & 0xFF) == (2 | 4))
+		{ // ctrl-alt pressed
+			event.modifiers &= ~(EVENTFLAG_CONTROL_DOWN | EVENTFLAG_ALT_DOWN);
+			event.modifiers |= EVENTFLAG_ALTGR_DOWN;
+		}
+	}
+}
 
 static HookFunction initFunction([] ()
 {
-	InputHook::QueryMayLockCursor.Connect([](int& argPtr)
+	g_nuiGi->QueryMayLockCursor.Connect([](int& argPtr)
 	{
-		if (HasFocus())
+		if (HasFocus() && !g_keepInput)
 		{
 			argPtr = 0;
 		}
 	});
 
-	//g_hooksDLL->SetHookCallback(StringHash("wndProc"), [] (void* argsPtr)
-	InputHook::OnWndProc.Connect([](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, bool& pass, LRESULT& lresult)
+	static bool g_lastFocus = false;
+
+	static struct NuiInputTarget : InputTarget
+	{
+		void KeyEvent(UINT vKey, UINT scanCode, bool down)
+		{
+			static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
+
+			auto browser = GetFocusBrowser();
+			if (!browser)
+			{
+				return;
+			}
+
+			CefKeyEvent keyEvent;
+
+			keyEvent.windows_key_code = vKey;
+			keyEvent.native_key_code = scanCode;
+			keyEvent.modifiers = GetCefKeyboardModifiers(vKey, scanCode);
+
+			if (down)
+			{
+				keyEvent.type = KEYEVENT_RAWKEYDOWN;
+
+				if (vKey == VK_RETURN && launch::IsSDKGuest())
+				{
+					keyEvent.character = '\r';
+					keyEvent.unmodified_character = '\r';
+					
+					browser->GetHost()->SendKeyEvent(keyEvent);
+
+					keyEvent.type = KEYEVENT_CHAR;
+				}
+
+				if (rgd->inputChar)
+				{
+					keyEvent.character = rgd->inputChar;
+					keyEvent.unmodified_character = rgd->inputChar;
+
+					browser->GetHost()->SendKeyEvent(keyEvent);
+
+					keyEvent.windows_key_code = rgd->inputChar;
+					keyEvent.type = KEYEVENT_CHAR;
+				}
+			}
+			else
+			{
+				keyEvent.type = KEYEVENT_KEYUP;
+			}
+
+			browser->GetHost()->SendKeyEvent(keyEvent);
+		}
+
+		void MouseEvent(int button, int x, int y, bool down)
+		{
+			static int lastClickX;
+			static int lastClickY;
+			static int lastClickCount;
+			static LONG lastClickTime;
+			static CefBrowserHost::MouseButtonType lastClickButton;
+			static bool mouseTracking;
+
+			LONG currentTime = 0;
+			bool cancelPreviousClick = false;
+
+			lastX = x;
+			lastY = y;
+
+			if (down)
+			{
+				currentTime = GetMessageTime();
+				cancelPreviousClick =
+					(abs(lastClickX - x) > (GetSystemMetrics(SM_CXDOUBLECLK) / 2))
+					|| (abs(lastClickY - y) > (GetSystemMetrics(SM_CYDOUBLECLK) / 2))
+					|| ((currentTime - lastClickTime) > GetDoubleClickTime());
+				if (cancelPreviousClick &&
+					(button == -1 /* move */)) {
+					lastClickCount = 0;
+					lastClickX = 0;
+					lastClickY = 0;
+					lastClickTime = 0;
+				}
+			}
+
+			if (button == -1)
+			{
+				auto browser = GetFocusBrowser();
+
+				if (browser)
+				{
+					CefMouseEvent mouse_event;
+					mouse_event.x = x;
+					mouse_event.y = y;
+					mouse_event.modifiers = GetCefMouseModifiers();
+					browser->GetHost()->SendMouseMoveEvent(mouse_event, false);
+				}
+			}
+			else if (down)
+			{
+				CefBrowserHost::MouseButtonType btnType =
+					((button == 0) ? MBT_LEFT : ((button == 1) ? MBT_RIGHT : MBT_MIDDLE));
+				if (!cancelPreviousClick && (btnType == lastClickButton))
+				{
+					++lastClickCount;
+				}
+				else
+				{
+					lastClickCount = 1;
+					lastClickX = x;
+					lastClickY = y;
+				}
+
+				lastClickTime = currentTime;
+				lastClickButton = btnType;
+
+				CefMouseEvent mouse_event;
+				mouse_event.x = x;
+				mouse_event.y = y;
+				mouse_event.modifiers = GetCefMouseModifiers();
+
+				auto browser = GetFocusBrowser();
+
+				if (browser)
+				{
+					browser->GetHost()->SendMouseClickEvent(mouse_event, btnType, false, lastClickCount);
+				}
+			}
+			else
+			{
+				CefBrowserHost::MouseButtonType btnType =
+					((button == 0) ? MBT_LEFT : ((button == 1) ? MBT_RIGHT : MBT_MIDDLE));
+
+				auto browser = GetFocusBrowser();
+
+				if (browser)
+				{
+					CefMouseEvent mouse_event;
+					mouse_event.x = x;
+					mouse_event.y = y;
+					mouse_event.modifiers = GetCefMouseModifiers();
+					browser->GetHost()->SendMouseClickEvent(mouse_event, btnType, true, lastClickCount);
+				}
+			}
+		}
+
+		virtual void KeyDown(UINT vKey, UINT scanCode) override
+		{
+			KeyEvent(vKey, scanCode, true);
+		}
+
+		virtual void KeyUp(UINT vKey, UINT scanCode) override
+		{
+			KeyEvent(vKey, scanCode, false);
+		}
+
+		virtual void MouseDown(int buttonIdx, int x, int y) override
+		{
+			MouseEvent(buttonIdx, x, y, true);
+		}
+
+		virtual void MouseUp(int buttonIdx, int x, int y) override
+		{
+			MouseEvent(buttonIdx, x, y, false);
+		}
+
+		virtual void MouseWheel(int deltaY) override
+		{
+			auto browser = GetFocusBrowser();
+
+			if (browser) {
+				int delta = deltaY * 120;
+
+				CefMouseEvent mouse_event;
+				mouse_event.x = lastX;
+				mouse_event.y = lastY;
+				mouse_event.modifiers = GetCefMouseModifiers();
+
+				browser->GetHost()->SendMouseWheelEvent(mouse_event,
+					isKeyDown(VK_SHIFT) ? delta : 0,
+					!isKeyDown(VK_SHIFT) ? delta : 0);
+			}
+		}
+
+		virtual void MouseMove(int x, int y) override
+		{
+			MouseEvent(-1, x, y, true);
+		}
+
+		int lastX;
+		int lastY;
+
+	} inputTarget;
+
+	g_nuiGi->QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)
+	{
+		auto browser = GetFocusBrowser();
+
+		if (browser)
+		{
+			if (HasFocus() != g_lastFocus)
+			{
+				browser->GetHost()->SendFocusEvent(HasFocus());
+			}
+
+			g_lastFocus = HasFocus();
+		}
+
+		if (HasFocus())
+		{
+			targets.push_back(&inputTarget);
+
+			return false;
+		}
+
+		return true;
+	});
+
+	g_nuiGi->OnWndProc.Connect([](HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, bool& pass, LRESULT& lresult)
 	{
 		if (!pass)
 		{
@@ -203,10 +611,8 @@ static HookFunction initFunction([] ()
 			}
 		}
 
-		static bool g_lastFocus = false;
-
 		// send a focus event to CEF if focus changed
-		auto browser = nui::GetBrowser();
+		auto browser = GetFocusBrowser();
 
 		if (browser)
 		{
@@ -222,40 +628,30 @@ static HookFunction initFunction([] ()
 		{
 			if (!g_imeHandler)
 			{
-				g_imeHandler = new OsrImeHandlerWin(FindWindow(L"grcWindow", nullptr));
+				g_imeHandler = new OsrImeHandlerWin(g_nuiGi->GetHWND());
 			}
 
-			static int lastClickX;
-			static int lastClickY;
-			static int lastClickCount;
-			static LONG lastClickTime;
-			static CefBrowserHost::MouseButtonType lastClickButton;
 			static bool mouseTracking;
-
-			LONG currentTime = 0;
-			bool cancelPreviousClick = false;
-
-			if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN ||
-				msg == WM_MBUTTONDOWN || msg == WM_MOUSEMOVE ||
-				msg == WM_MOUSELEAVE) {
-				currentTime = GetMessageTime();
-				int x = GET_X_LPARAM(lParam);
-				int y = GET_Y_LPARAM(lParam);
-				cancelPreviousClick =
-					(abs(lastClickX - x) > (GetSystemMetrics(SM_CXDOUBLECLK) / 2))
-					|| (abs(lastClickY - y) > (GetSystemMetrics(SM_CYDOUBLECLK) / 2))
-					|| ((currentTime - lastClickTime) > GetDoubleClickTime());
-				if (cancelPreviousClick &&
-					(msg == WM_MOUSEMOVE || msg == WM_MOUSELEAVE)) {
-					lastClickCount = 0;
-					lastClickX = 0;
-					lastClickY = 0;
-					lastClickTime = 0;
-				}
-			}
 
 			switch (msg)
 			{
+			case WM_XBUTTONUP: {
+				auto button = GET_XBUTTON_WPARAM(wParam);
+				auto browser = GetFocusBrowser();
+
+				// we have a MainUI check here so that behavior for *existing* code doesn't change
+				if (browser && nui::HasMainUI())
+				{
+					if (button == XBUTTON1 && browser->CanGoBack())
+					{
+						browser->GoBack();
+					}
+					else if (button == XBUTTON2 && browser->CanGoForward())
+					{
+						browser->GoForward();
+					}
+				}
+			} break;
 			case WM_LBUTTONDOWN:
 			case WM_RBUTTONDOWN:
 			case WM_MBUTTONDOWN:
@@ -264,34 +660,17 @@ static HookFunction initFunction([] ()
 			case WM_MBUTTONDBLCLK: {
 				int x = GET_X_LPARAM(lParam);
 				int y = GET_Y_LPARAM(lParam);
-				CefBrowserHost::MouseButtonType btnType =
-					((msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) ? MBT_LEFT : (
-						(msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) ? MBT_RIGHT : MBT_MIDDLE));
-				if (!cancelPreviousClick && (btnType == lastClickButton)) {
-					++lastClickCount;
-				}
-				else {
-					lastClickCount = 1;
-					lastClickX = x;
-					lastClickY = y;
-				}
-				lastClickTime = currentTime;
-				lastClickButton = btnType;
+				int btnType =
+					((msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) ? 0 : (
+						(msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK) ? 1 : 2));
+				
+				inputTarget.MouseEvent(btnType, x, y, true);
 
-				CefMouseEvent mouse_event;
-				mouse_event.x = x;
-				mouse_event.y = y;
-				mouse_event.modifiers = GetCefMouseModifiers(wParam);
-
-				auto browser = nui::GetBrowser();
-
-				if (browser)
+				if (!g_keepInput)
 				{
-					browser->GetHost()->SendMouseClickEvent(mouse_event, btnType, false, lastClickCount);
+					pass = false;
+					lresult = FALSE;
 				}
-
-				pass = false;
-				lresult = FALSE;
 			} break;
 
 			case WM_LBUTTONUP:
@@ -299,24 +678,18 @@ static HookFunction initFunction([] ()
 			case WM_MBUTTONUP: {
 				int x = GET_X_LPARAM(lParam);
 				int y = GET_Y_LPARAM(lParam);
-				CefBrowserHost::MouseButtonType btnType =
-					(msg == WM_LBUTTONUP ? MBT_LEFT : (
-						msg == WM_RBUTTONUP ? MBT_RIGHT : MBT_MIDDLE));
+				int btnType =
+					((msg == WM_LBUTTONUP) ? 0 : (
+					(msg == WM_RBUTTONUP) ? 1 : 2));
 
-				auto browser = nui::GetBrowser();
+				inputTarget.MouseEvent(btnType, x, y, false);
 
-				if (browser)
+				if (!g_keepInput)
 				{
-					CefMouseEvent mouse_event;
-					mouse_event.x = x;
-					mouse_event.y = y;
-					mouse_event.modifiers = GetCefMouseModifiers(wParam);
-					browser->GetHost()->SendMouseClickEvent(mouse_event, btnType, true,
-						lastClickCount);
+					pass = false;
+					lresult = FALSE;
 				}
 
-				pass = false;
-				lresult = FALSE;
 				break;
 			}
 			case WM_MOUSEMOVE: {
@@ -333,19 +706,13 @@ static HookFunction initFunction([] ()
 					mouseTracking = true;
 				}
 
-				auto browser = nui::GetBrowser();
+				inputTarget.MouseEvent(-1, x, y, true);
 
-				if (browser)
+				if (!g_keepInput)
 				{
-					CefMouseEvent mouse_event;
-					mouse_event.x = x;
-					mouse_event.y = y;
-					mouse_event.modifiers = GetCefMouseModifiers(wParam);
-					browser->GetHost()->SendMouseMoveEvent(mouse_event, false);
+					pass = false;
+					lresult = FALSE;
 				}
-
-				pass = false;
-				lresult = FALSE;
 				break;
 			}
 
@@ -360,7 +727,7 @@ static HookFunction initFunction([] ()
 					mouseTracking = false;
 				}
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser) {
 					// Determine the cursor position in screen coordinates.
@@ -375,39 +742,36 @@ static HookFunction initFunction([] ()
 					browser->GetHost()->SendMouseMoveEvent(mouse_event, true);
 				}
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 			} break;
 
 			case WM_MOUSEWHEEL: {
-				auto browser = nui::GetBrowser();
+				inputTarget.MouseWheel(GET_WHEEL_DELTA_WPARAM(wParam) / 120);
 
-				if (browser) {
-					POINT screen_point = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-					HWND scrolled_wnd = ::WindowFromPoint(screen_point);
-					if (scrolled_wnd != hWnd)
-						break;
-
-					ScreenToClient(hWnd, &screen_point);
-					int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-
-					CefMouseEvent mouse_event;
-					mouse_event.x = screen_point.x;
-					mouse_event.y = screen_point.y;
-					mouse_event.modifiers = GetCefMouseModifiers(wParam);
-
-					browser->GetHost()->SendMouseWheelEvent(mouse_event,
-						isKeyDown(VK_SHIFT) ? delta : 0,
-						!isKeyDown(VK_SHIFT) ? delta : 0);
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
 				}
-
-				pass = false;
-				lresult = FALSE;
 				break;
 			}
 			}
 
-			if (msg == WM_KEYUP || msg == WM_KEYDOWN || msg == WM_CHAR)
+			if (msg == WM_KEYUP || msg == WM_KEYDOWN)
+			{
+				inputTarget.KeyEvent(wParam, lParam, (msg == WM_KEYDOWN));
+
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
+			}
+			else if (msg == WM_CHAR)
 			{
 				CefKeyEvent keyEvent;
 
@@ -424,10 +788,11 @@ static HookFunction initFunction([] ()
 					keyEvent.type = KEYEVENT_CHAR;
 				}
 
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser)
 				{
+					AlterKeyEventForAltGr(keyEvent, wParam);
 					browser->GetHost()->SendKeyEvent(keyEvent);
 				}
 
@@ -435,7 +800,7 @@ static HookFunction initFunction([] ()
 				lresult = FALSE;
 				return;
 			}
-			else if (msg == WM_INPUT && g_hasCursor)
+			else if (msg == WM_INPUT && g_hasCursor && !g_keepInput)
 			{
 				pass = false;
 				lresult = TRUE;
@@ -450,8 +815,11 @@ static HookFunction initFunction([] ()
 					g_imeHandler->ResetComposition();
 				}
 
-				pass = false;
-				lresult = FALSE;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				return;
 			}
 			else if (msg == WM_IME_SETCONTEXT)
@@ -468,13 +836,16 @@ static HookFunction initFunction([] ()
 					g_imeHandler->MoveImeWindow();
 				}
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 				return;
 			}
 			else if (msg == WM_IME_COMPOSITION)
 			{
-				auto browser = nui::GetBrowser();
+				auto browser = GetFocusBrowser();
 
 				if (browser && g_imeHandler) {
 					CefString cTextStr;
@@ -514,8 +885,11 @@ static HookFunction initFunction([] ()
 					}
 				}
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 
 				return;
 			}
@@ -525,12 +899,15 @@ static HookFunction initFunction([] ()
 				g_imeHandler->ResetComposition();
 				g_imeHandler->DestroyImeWindow();
 
-				pass = false;
-				lresult = false;
+				if (!g_keepInput)
+				{
+					pass = false;
+					lresult = FALSE;
+				}
 
 				return;
 			}
-			else if (msg == WM_IME_KEYLAST || msg == WM_IME_KEYDOWN || msg == WM_IME_KEYUP)
+			else if ((msg == WM_IME_KEYLAST || msg == WM_IME_KEYDOWN || msg == WM_IME_KEYUP) && !g_keepInput)
 			{
 				pass = false;
 				lresult = false;

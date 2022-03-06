@@ -31,28 +31,37 @@ static InitFunction initFunction([]()
 			return 5;
 		}
 
-		virtual void RunAuthentication(const std::shared_ptr<fx::Client>& clientPtr, const std::map<std::string, std::string>& postMap, const std::function<void(boost::optional<std::string>)>& cb) override
+		virtual void RunAuthentication(const fx::ClientSharedPtr& clientPtr, const std::map<std::string, std::string>& postMap, const std::function<void(boost::optional<std::string>)>& cb) override
 		{
-			auto& any = clientPtr->GetData("entitlementHash");
+			auto any = clientPtr->GetData("entitlementHash");
 
-			if (any.has_value())
+			if (any)
 			{
-				clientPtr->AddIdentifier(fmt::sprintf("license:%s", std::any_cast<std::string>(any)));
+				clientPtr->AddIdentifier(fmt::sprintf("license:%s", fx::AnyCast<std::string>(any)));
 			}
 
-			auto& jsonAny = clientPtr->GetData("entitlementJson");
+			auto jsonAny = clientPtr->GetData("entitlementJson");
 
-			if (jsonAny.has_value())
+			if (jsonAny)
 			{
 				try
 				{
-					json json = json::parse(std::any_cast<std::string>(jsonAny));
+					auto jsonStr = fx::AnyCast<std::string>(jsonAny);
+					json json = json::parse(jsonStr);
 
 					if (json["tk"].is_array())
 					{
 						for (auto& entry : json["tk"])
 						{
 							clientPtr->AddIdentifier(entry.get<std::string>());
+						}
+					}
+
+					if (json["hw"].is_array())
+					{
+						for (auto& entry : json["hw"])
+						{
+							clientPtr->AddToken(entry.get<std::string>());
 						}
 					}
 				}

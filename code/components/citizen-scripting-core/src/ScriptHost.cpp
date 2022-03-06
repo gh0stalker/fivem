@@ -10,6 +10,7 @@
 #include "om/OMComponent.h"
 
 #include <ScriptEngine.h>
+#include <StructuredTrace.h>
 
 #include <Resource.h>
 #include <ResourceManager.h>
@@ -27,6 +28,172 @@
 #include <msgpack.hpp>
 
 #include <sstream>
+
+inline std::chrono::microseconds usec()
+{
+	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
+}
+
+struct Bookmark
+{
+	fx::Resource* resource;
+	std::chrono::microseconds deadline;
+	IScriptTickRuntimeWithBookmarks* scRT;
+	uint64_t bookmark;
+
+	inline Bookmark(IScriptTickRuntimeWithBookmarks* scRT, std::nullptr_t)
+		: resource(nullptr), deadline(0), scRT(scRT), bookmark(0)
+	{
+		
+	}
+
+	inline Bookmark(fx::Resource* resource,
+					std::chrono::microseconds deadline,
+					IScriptTickRuntimeWithBookmarks * scRT,
+					uint64_t bookmark)
+		: resource(resource), deadline(deadline), scRT(scRT), bookmark(bookmark)
+	{
+	
+	}
+};
+
+static struct  
+{
+	std::list<Bookmark> list;
+	std::list<IScriptTickRuntimeWithBookmarks*> removeList;
+
+	std::unordered_map<IScriptTickRuntimeWithBookmarks*, std::list<Bookmark>::iterator> resourceInsertionIterators;
+
+	bool executing = false;
+	std::list<Bookmark>::iterator* executingIt = nullptr;
+} bookmarkRefs;
+
+static void QueueBookmark(fx::Resource* resource, IScriptTickRuntimeWithBookmarks* scRT, uint64_t bookmark, std::chrono::microseconds deadline)
+{
+	auto refIt = bookmarkRefs.resourceInsertionIterators.find(scRT);
+	assert(refIt != bookmarkRefs.resourceInsertionIterators.end());
+	bookmarkRefs.list.insert(refIt->second, Bookmark{ resource, deadline, scRT, bookmark });
+}
+
+static void CreateBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	bookmarkRefs.resourceInsertionIterators.emplace(scRT, bookmarkRefs.list.insert(bookmarkRefs.list.end(), Bookmark{ scRT, nullptr }));
+}
+
+static void RemoveBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	auto exIt = (bookmarkRefs.executing) ? bookmarkRefs.executingIt : nullptr;
+
+	auto list = &bookmarkRefs.list;
+
+	{
+		for (auto it = list->begin(); it != list->end();)
+		{
+			if (it->scRT == scRT)
+			{
+				if (exIt && *exIt == it)
+				{
+					*exIt = it = list->erase(it);
+				}
+				else
+				{
+					it = list->erase(it);
+				}
+			}
+			else
+			{
+				++it;
+			}
+		}
+	}
+
+	bookmarkRefs.resourceInsertionIterators.erase(scRT);
+}
+
+static void RunBookmarks()
+{
+	bookmarkRefs.executing = true;
+
+	auto now = usec();
+
+	fx::Resource* lastResource = nullptr;
+	IScriptTickRuntimeWithBookmarks* lastScRT = nullptr;
+
+	std::vector<uint64_t> nextBookmarks;
+
+	auto deq = [&]()
+	{
+		if (nextBookmarks.size())
+		{
+			lastResource->Run([&]()
+			{
+				lastScRT->TickBookmarks(nextBookmarks.data(), nextBookmarks.size());
+			});
+
+			nextBookmarks.clear();
+		}
+	};
+
+	for (auto it = bookmarkRefs.list.begin(); it != bookmarkRefs.list.end();)
+	{
+		const auto& entry = *it;
+
+		if (entry.resource && entry.deadline <= now)
+		{
+			auto scRT = entry.scRT;
+
+			if (lastScRT != scRT)
+			{
+				auto saveIt = it;
+				bookmarkRefs.executingIt = &it;
+				deq();
+
+				bookmarkRefs.executingIt = nullptr;
+
+				// if deq() has been changing the executingIt, we should skip the next execution outright
+				// as it was a removed resource
+				if (it != saveIt)
+				{
+					lastScRT = nullptr;
+					lastResource = nullptr;
+					continue;
+				}
+
+				lastScRT = scRT;
+				lastResource = entry.resource;
+			}
+
+			nextBookmarks.push_back(entry.bookmark);
+
+			it = bookmarkRefs.list.erase(it);
+		}
+		else
+		{
+			++it;
+		}
+	}
+
+	deq();
+
+	bookmarkRefs.executing = false;
+}
+
+static InitFunction initBMFunction([]()
+{
+	fx::ResourceManager::OnInitializeInstance.Connect([](fx::ResourceManager* self)
+	{
+		self->OnTick.Connect([]()
+		{
+			RunBookmarks();
+		});
+	});
+});
+
+#ifdef _WIN32
+#define SAFE_BUFFERS __declspec(safebuffers)
+#else
+#define SAFE_BUFFERS
+#endif
 
 #ifdef __has_feature
 #define HAS_FEATURE(x) __has_feature(x)
@@ -90,7 +257,7 @@ result_t StreamWrapper::GetLength(uint64_t *length)
 	return FX_S_OK;
 }
 
-class TestScriptHost : public OMClass<TestScriptHost, IScriptHost, IScriptHostWithResourceData, IScriptHostWithManifest>
+class TestScriptHost : public OMClass<TestScriptHost, IScriptHost, IScriptHostWithResourceData, IScriptHostWithManifest, IScriptHostWithBookmarks>
 {
 public:
 	NS_DECL_ISCRIPTHOST;
@@ -99,21 +266,33 @@ public:
 
 	NS_DECL_ISCRIPTHOSTWITHMANIFEST;
 
+	NS_DECL_ISCRIPTHOSTWITHBOOKMARKS;
+
 private:
 	Resource* m_resource;
+	ScriptMetaDataComponent meta;
+
+	std::string m_lastError;
 
 private:
 	result_t WrapVFSStreamResult(fwRefContainer<vfs::Stream> stream, fxIStream** result);
 
 public:
 	TestScriptHost(Resource* resource)
-		: m_resource(resource)
+		: m_resource(resource), meta(resource)
 	{
 
 	}
 };
 
-result_t TestScriptHost::InvokeNative(fxNativeContext & context)
+result_t TestScriptHost::GetLastErrorText(char** text)
+{
+	*text = const_cast<char*>(m_lastError.c_str());
+
+	return FX_S_OK;
+}
+
+result_t SAFE_BUFFERS TestScriptHost::InvokeNative(fxNativeContext & context)
 {
 #if SCRT_HAS_CALLNATIVEHANDLER
 	// prepare an invocation context
@@ -127,6 +306,7 @@ result_t TestScriptHost::InvokeNative(fxNativeContext & context)
 	catch (std::exception& e)
 	{
 		trace("%s: execution failed: %s\n", __func__, e.what());
+		m_lastError = e.what();
 
 		return FX_E_INVALIDARG;
 	}
@@ -149,6 +329,7 @@ result_t TestScriptHost::InvokeNative(fxNativeContext & context)
 // https://github.com/google/sanitizers/issues/749
 #if !HAS_FEATURE(address_sanitizer)
 			trace("%s: execution failed: %s\n", __func__, e.what());
+			m_lastError = e.what();
 #endif
 
 			return FX_E_INVALIDARG;
@@ -184,6 +365,8 @@ result_t TestScriptHost::WrapVFSStreamResult(fwRefContainer<vfs::Stream> stream,
 
 result_t TestScriptHost::ScriptTrace(char* string)
 {
+	StructuredTrace({ "type", "script_log" }, { "resource", m_resource->GetName() }, { "text", string });
+
 	return FX_S_OK;
 }
 
@@ -201,7 +384,7 @@ result_t TestScriptHost::OpenHostFile(char *fileName, fxIStream * *stream)
 	std::string_view fn = fileName;
 	std::string fileNameStr = m_resource->GetPath() + "/" + fileName;
 
-	if (fn.length() > 1 && fn[0] == '@')
+	if (fn.length() > 1 && fn[0] == '@' && fn.find_first_of('/') != std::string::npos)
 	{
 		std::string_view resName = fn.substr(1, fn.find_first_of('/') - 1);
 		fn = fn.substr(1 + resName.length() + 1);
@@ -237,60 +420,27 @@ result_t TestScriptHost::CanonicalizeRef(int32_t refIdx, int32_t instanceId, cha
 
 result_t TestScriptHost::GetResourceName(char** outResourceName)
 {
-	*outResourceName = const_cast<char*>(m_resource->GetName().c_str());
-	return FX_S_OK;
+	return meta.GetResourceName(outResourceName);
 }
 
 result_t TestScriptHost::GetNumResourceMetaData(char* metaDataName, int32_t* entryCount)
 {
-	fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
-
-	auto entries = metaData->GetEntries(metaDataName);
-
-	*entryCount = static_cast<int32_t>(std::distance(entries.begin(), entries.end()));
-
-	return FX_S_OK;
+	return meta.GetNumResourceMetaData(metaDataName, entryCount);
 }
 
 result_t TestScriptHost::GetResourceMetaData(char* metaDataName, int32_t entryIndex, char** outMetaData)
 {
-	fwRefContainer<ResourceMetaDataComponent> metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
-	
-	auto entries = metaData->GetEntries(metaDataName);
-
-	// and loop over the entries to see if we find anything
-	int i = 0;
-
-	for (auto& entry : entries)
-	{
-		if (entryIndex == i)
-		{
-			*outMetaData = const_cast<char*>(entry.second.c_str());
-			return FX_S_OK;
-		}
-
-		i++;
-	}
-
-	// return not-found
-	return 0x80070490;
+	return meta.GetResourceMetaData(metaDataName, entryIndex, outMetaData);
 }
 
 result_t TestScriptHost::IsManifestVersionBetween(const guid_t & lowerBound, const guid_t & upperBound, bool *_retval)
 {
-	// get the manifest version
-	auto metaData = m_resource->GetComponent<ResourceMetaDataComponent>();
+	return meta.IsManifestVersionBetween(lowerBound, upperBound, _retval);
+}
 
-	auto retval = metaData->IsManifestVersionBetween(lowerBound, upperBound);
-
-	if (retval)
-	{
-		*_retval = *retval;
-
-		return FX_S_OK;
-	}
-
-	return FX_E_INVALIDARG;
+result_t TestScriptHost::IsManifestVersionV2Between(char* lowerBound, char* upperBound, bool* _retval)
+{
+	return meta.IsManifestVersionV2Between(lowerBound, upperBound, _retval);
 }
 
 using Boundary = std::vector<uint8_t>;
@@ -330,6 +480,34 @@ result_t TestScriptHost::SubmitBoundaryEnd(char* boundaryData, int boundarySize)
 	return FX_S_OK;
 }
 
+result_t TestScriptHost::CreateBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	::CreateBookmarks(scRT);
+	return FX_S_OK;
+}
+
+result_t TestScriptHost::ScheduleBookmark(IScriptTickRuntimeWithBookmarks* scRT, uint64_t bookmark, int64_t deadline)
+{
+	auto newDeadline = std::chrono::microseconds{
+		deadline
+	};
+
+	if (deadline < 0)
+	{
+		newDeadline = usec() + std::chrono::milliseconds{ -deadline };
+	}
+
+	QueueBookmark(m_resource, scRT, bookmark, newDeadline);
+
+	return FX_S_OK;
+}
+
+result_t TestScriptHost::RemoveBookmarks(IScriptTickRuntimeWithBookmarks* scRT)
+{
+	::RemoveBookmarks(scRT);
+	return FX_S_OK;
+}
+
 // TODO: don't ship with this in
 OMPtr<IScriptHost> GetScriptHostForResource(Resource* resource)
 {
@@ -352,12 +530,20 @@ class ScriptRuntimeHandler : public OMClass<ScriptRuntimeHandler, IScriptRuntime
 {
 public:
 	NS_DECL_ISCRIPTRUNTIMEHANDLER;
+
+private:
+	result_t PushRuntimeInternal(IScriptRuntime* runtime);
 };
 
 result_t ScriptRuntimeHandler::PushRuntime(IScriptRuntime* runtime)
 {
 	ms_runtimeMutex.lock();
 
+	return PushRuntimeInternal(runtime);
+}
+
+result_t ScriptRuntimeHandler::PushRuntimeInternal(IScriptRuntime* runtime)
+{
 	ms_runtimeStack.push_front(runtime);
 	ms_boundaryStack.push_front({});
 
@@ -369,6 +555,16 @@ result_t ScriptRuntimeHandler::PushRuntime(IScriptRuntime* runtime)
 	}
 	
 	return FX_S_OK;
+}
+
+result_t ScriptRuntimeHandler::TryPushRuntime(IScriptRuntime* runtime)
+{
+	if (!ms_runtimeMutex.try_lock())
+	{
+		return FX_E_INVALIDARG;
+	}
+
+	return PushRuntimeInternal(runtime);
 }
 
 result_t ScriptRuntimeHandler::PopRuntime(IScriptRuntime* runtime)
@@ -420,18 +616,13 @@ result_t ScriptRuntimeHandler::GetInvokingRuntime(IScriptRuntime** runtime)
 		return FX_E_INVALIDARG;
 	}
 
-	// std::stack is bad, even more so as we're copying the entire stack
-	// TODO: redo since we're a deque now
-	auto copyStack = ms_runtimeStack;
-	copyStack.pop_front();
-
-	if (copyStack.empty())
+	if (ms_runtimeStack.size() <= 1)
 	{
 		*runtime = nullptr;
 	}
 	else
 	{
-		auto lastRuntime = copyStack.front();
+		auto lastRuntime = *(ms_runtimeStack.begin() + 1);
 		*runtime = lastRuntime;
 
 		// conventions state we should AddRef anything we return, so we will
@@ -496,14 +687,19 @@ static InitFunction initFunction([]()
 		{
 			msgpack::unpacked up = msgpack::unpack(topLevelStackBlob, topLevelStackSize);
 
-			auto o = up.get().as<std::vector<msgpack::object>>();
+			const auto& ref = up.get();
 
-			for (auto& e : o)
+			if (ref.type == msgpack::type::ARRAY)
 			{
-				msgpack::sbuffer sb;
-				msgpack::pack(sb, e);
+				auto o = ref.as<std::vector<msgpack::object>>();
 
-				vis->SubmitStackFrame(sb.data(), sb.size());
+				for (auto& e : o)
+				{
+					msgpack::sbuffer sb;
+					msgpack::pack(sb, e);
+
+					vis->SubmitStackFrame(sb.data(), sb.size());
+				}
 			}
 		}
 

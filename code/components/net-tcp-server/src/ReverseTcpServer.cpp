@@ -1,5 +1,6 @@
 #include <StdInc.h>
 
+#include <CoreConsole.h>
 #include <ReverseTcpServer.h>
 
 #include <UvLoopManager.h>
@@ -29,7 +30,7 @@ namespace net
 			fwRefContainer<ReverseTcpServerStream> selfRef = *refRef;
 
 			// dequeue pending writes
-			std::function<void()> request;
+			TScheduledCallback request;
 
 			while (selfRef->m_pendingRequests.try_pop(request))
 			{
@@ -48,28 +49,42 @@ namespace net
 		
 	}
 
-	void ReverseTcpServerStream::Write(const std::vector<uint8_t>& data)
+	void ReverseTcpServerStream::Write(const std::vector<uint8_t>& data, TCompleteCallback&& onComplete)
 	{
 		auto worker = m_tcp.lock();
+		auto writeCallback = m_writeCallback;
 
-		if (worker)
+		if (worker && writeCallback)
 		{
-			m_pendingRequests.push([worker, data]()
+			m_pendingRequests.push([worker, data, onComplete = std::move(onComplete)]() mutable
 			{
 				std::unique_ptr<char[]> msg{ new char[data.size()] };
 				memcpy(msg.get(), data.data(), data.size());
 
+				if (onComplete)
+				{
+					worker->once<uvw::WriteEvent>(make_shared_function([onComplete = std::move(onComplete)](const uvw::WriteEvent& e, uvw::TCPHandle& h) mutable
+					{
+						onComplete(true);
+					}));
+				}
+
 				worker->write(std::move(msg), data.size());
 			});
 
-			m_writeCallback->send();
+			writeCallback->send();
 		}
 	}
 
-	void ReverseTcpServerStream::ScheduleCallback(const TScheduledCallback& callback)
+	void ReverseTcpServerStream::ScheduleCallback(TScheduledCallback&& callback, bool performInline)
 	{
-		m_pendingRequests.push(callback);
-		m_writeCallback->send();
+		auto writeCallback = m_writeCallback;
+
+		if (writeCallback)
+		{
+			m_pendingRequests.push(std::move(callback));
+			writeCallback->send();
+		}
 	}
 
 	void ReverseTcpServerStream::ConsumeData(const void* data, size_t length)
@@ -93,13 +108,30 @@ namespace net
 		{
 			auto writeCallback = m_writeCallback;
 
-			m_pendingRequests.push([writeCallback, worker]()
+			if (writeCallback)
 			{
-				worker->close();
-				writeCallback->close();
-			});
+				fwRefContainer thisRef = this;
 
-			m_writeCallback->send();
+				m_pendingRequests.push([thisRef, writeCallback, worker]()
+				{
+					worker->once<uvw::ShutdownEvent>([](const uvw::ShutdownEvent& e, uvw::TCPHandle& h)
+					{
+						h.close();
+					});
+
+					worker->shutdown();
+
+					writeCallback->once<uvw::CloseEvent>([writeCallback](const uvw::CloseEvent&, uvw::AsyncHandle& h)
+					{
+						(void)writeCallback;
+					});
+					writeCallback->close();
+
+					thisRef->m_writeCallback = {};
+				});
+
+				m_writeCallback->send();
+			}
 		}
 	}
 
@@ -132,7 +164,7 @@ namespace net
 
 	void MessageHandler::WriteMessage(uvw::TCPHandle& tcp, const json& json)
 	{
-		auto jsonDump = json.dump();
+		auto jsonDump = json.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
 
 		size_t len = jsonDump.length() + sizeof(uint32_t);
 		std::unique_ptr<char[]> msg{ new char[len] };
@@ -281,7 +313,13 @@ namespace net
 				if (worker)
 				{
 					fwRefContainer<ReverseTcpServerStream> stream{ new ReverseTcpServerStream(thisRef.GetRef(), worker) };
-					stream->m_remotePeerAddress = *net::PeerAddress::FromString(message[1].value("address", "127.0.0.1:65535"));
+
+					auto address = net::PeerAddress::FromString(message[1].value("address", "127.0.0.1:65535"), 30120, net::PeerAddress::LookupType::NoResolution);
+
+					if (address)
+					{
+						stream->m_remotePeerAddress = *address;
+					}
 
 					thisRef->m_streams[worker] = stream;
 
@@ -314,6 +352,7 @@ namespace net
 			thisRef->RemoveWorker(weakWorker.lock());
 		});
 
+		worker->keepAlive(true, std::chrono::duration<unsigned int>{5});
 		worker->connect(*m_curRemote.GetSocketAddress());
 
 		m_work.insert(worker);
@@ -333,7 +372,12 @@ namespace net
 				ccb();
 			}
 
-			it->second->m_writeCallback->close();
+			auto writeCallback = it->second->m_writeCallback;
+
+			if (writeCallback)
+			{
+				writeCallback->close();
+			}
 		}
 
 		m_streams.erase(worker);
@@ -367,12 +411,42 @@ namespace net
 
 		m_control = {};
 
-		auto peer = net::PeerAddress::FromString(m_remote);
-		if (!peer)
+		m_addr = m_loop->resource<uvw::GetAddrInfoReq>();
+
+		auto hostStr = m_remote.substr(0, m_remote.find_last_of(':'));
+		std::string portStr;
+
+		if (auto colonPos = m_remote.find_last_of(':'); colonPos != std::string::npos)
 		{
-			m_reconnectTimer->start(2500ms, 0ms);
-			return;
+			portStr = m_remote.substr(colonPos + 1);
 		}
+
+		fwRefContainer<ReverseTcpServer> thisRef(this);
+
+		m_addr->on<uvw::ErrorEvent>([thisRef](const uvw::ErrorEvent& e, uvw::GetAddrInfoReq& req)
+		{
+			thisRef->m_reconnectTimer->start(2500ms, 0ms);
+		});
+
+		m_addr->on<uvw::AddrInfoEvent>([thisRef](const uvw::AddrInfoEvent& e, uvw::GetAddrInfoReq& req)
+		{
+			if (e.data)
+			{
+				net::PeerAddress peerAddress(e.data->ai_addr, e.data->ai_addrlen);
+				thisRef->ReconnectWithPeer(peerAddress);
+
+				return;	
+			}
+
+			thisRef->m_reconnectTimer->start(2500ms, 0ms);
+		});
+
+		m_addr->addrInfo(hostStr, portStr);
+	}
+
+	void ReverseTcpServer::ReconnectWithPeer(const net::PeerAddress& peer)
+	{
+		using namespace std::chrono_literals;
 
 		m_control = m_loop->resource<uvw::TCPHandle>();
 
@@ -396,7 +470,7 @@ namespace net
 			}
 			else if (type == "error")
 			{
-				trace("Proxy error: %s\n", message[1].get<std::string>());
+				console::DPrintf("net", "Proxy error: %s\n", message[1].get<std::string>());
 			}
 		});
 
@@ -432,7 +506,8 @@ namespace net
 			thisRef->m_reconnectTimer->start(2500ms, 0ms);
 		});
 
-		m_control->connect(*peer->GetSocketAddress());
-		m_curRemote = *peer;
+		m_control->keepAlive(true, std::chrono::duration<unsigned int>{5});
+		m_control->connect(*peer.GetSocketAddress());
+		m_curRemote = peer;
 	}
 }

@@ -98,8 +98,8 @@ end
 local function printReturnType(type)
 	if type.nativeType == 'string' then
 		return 'string'
-	elseif type.nativeType == 'boolean' then
-		return 'bool'
+	elseif type.nativeType == 'bool' then
+		return 'boolean'
 	elseif type.nativeType == 'float' then
 		return 'number'
 	elseif type.nativeType == 'vector3' then
@@ -159,6 +159,7 @@ local function printArgument(argument, native)
 		if argument.type.nativeType == 'int' or argument.type.nativeType == 'float' then
 			if isSinglePointerNative(native) then
 				argType = 'number'
+				retType = 'pointer'
 			else
 				retType = 'number'
 			end
@@ -171,7 +172,7 @@ local function printArgument(argument, native)
 		argType = 'Function'
 	elseif argument.type.name == 'Hash' then
 		argType = 'string | number'
-	elseif argument.type.name == 'charPtr' then
+	elseif argument.type.nativeType == 'string' then
 		argType = 'string'
 	elseif argument.type.nativeType == 'int' then
 		argType = 'number'
@@ -179,6 +180,8 @@ local function printArgument(argument, native)
 		argType = 'number'
 	elseif argument.type.nativeType == 'bool' then
 		argType = 'boolean'
+	elseif argument.type.nativeType == 'object' then
+		argType = 'any'
 	end
 
 	local name = argument.name
@@ -194,6 +197,7 @@ end
 local function formatDefinition(native)
 	local argsDefs = {}
 	local retTypes = {}
+	local pointerArgs = {}
 
 	if native.returns then
 		table.insert(retTypes, printReturnType(native.returns))
@@ -205,6 +209,13 @@ local function formatDefinition(native)
 
 			if argType ~= nil then
 				table.insert(argsDefs, argumentName .. ': ' .. argType)
+			end
+
+			if argType ~= nil and retType == 'pointer' then
+				pointerArgs[#argsDefs] = {
+					name = argumentName,
+					type = argType
+				}
 			elseif retType ~= nil then
 				table.insert(retTypes, retType)
 			end
@@ -212,6 +223,16 @@ local function formatDefinition(native)
 	end
 
 	local retType
+
+	for index, pointer in pairs(pointerArgs) do
+		if (#retTypes > 0 and #argsDefs == 0) or #argsDefs > 1 then
+			argsDefs[index] = pointer.name .. '?: ' .. pointer.type
+		end
+
+		if not (#retTypes == 0 and #argsDefs == 1) then
+			table.insert(retTypes, pointer.type)
+		end
+	end
 
 	if #retTypes > 1 then
 		retType = '[' .. table.concat(retTypes, ', ') .. ']'

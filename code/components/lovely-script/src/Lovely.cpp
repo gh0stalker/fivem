@@ -7,34 +7,18 @@
 
 #include "StdInc.h"
 
+#ifndef GTA_NY
 #include <scrEngine.h>
 
 #include <NetLibrary.h>
 
 #include <FontRenderer.h>
 
-enum NativeIdentifiers : uint64_t
-{
-	GET_PLAYER_PED = 0x43A66C31C68491C0,
-	GET_ENTITY_COORDS = 0x3FEF770D40960D5A,
-	GET_FIRST_BLIP_INFO_ID = 0x1BEDE233E6CD2A1F,
-	GET_NEXT_BLIP_INFO_ID = 0x14F96AA50D6FBEA7,
-	GET_BLIP_INFO_ID_TYPE = 0xBE9B0959FFD0779B,
-	GET_BLIP_COORDS = 0x586AFE3FF72D996E,
-	GET_GROUND_Z_FOR_3D_COORD = 0xC906A7DAB05C8D2B,
-	SET_ENTITY_COORDS = 0x621873ECE1178967,
-	SET_ENTITY_COORDS_NO_OFFSET = 0x239A3351AC1DA385,
-	LOAD_SCENE = 0x4448EB75B4904BDB,
-	REQUEST_MODEL = 0x963D27A58DF860AC,
-	HAS_MODEL_LOADED = 0x98A4EB5D89A0C952,
-	CREATE_VEHICLE = 0xAF35D0D2583051B0,
-	SHUTDOWN_LOADING_SCREEN = 0x078EBE9809CCD637,
-	DO_SCREEN_FADE_IN = 0xD4E8E24955024033,
-	NETWORK_IS_HOST = 0x8DB296B814EDDA07,
-	NETWORK_RESURRECT_LOCAL_PLAYER = 0xEA23C49EAA83ACFB,
-	NETWORK_IS_GAME_IN_PROGRESS = 0x10FAB35428CCC9D7,
-	IS_ENTITY_DEAD = 0x5F9532F3B5CC2551
-};
+#include <ICoreGameInit.h>
+
+#ifdef GTA_FIVE
+#include <ScriptHandlerMgr.h>
+#endif
 
 // BLIP_8 in global.gxt2 -> 'Waypoint'
 #define BLIP_WAYPOINT 8
@@ -57,9 +41,13 @@ inline ISteamComponent* GetSteam()
 class LovelyThread : public GtaThread
 {
 private:
-	bool m_shouldCreate;
+	bool m_shouldCreate = false;
 
-	bool m_hosted;
+	bool m_attached = false;
+	bool m_hosted = false;
+	bool m_lastOff = false;
+
+	int m_blockingArea = -1;
 
 public:
 	LovelyThread(bool shouldCreate)
@@ -69,26 +57,118 @@ public:
 
 	virtual rage::eThreadState Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount) override
 	{
+		m_attached = false;
 		m_hosted = false;
+		m_lastOff = false;
 
 		return GtaThread::Reset(scriptHash, pArgs, argCount);
 	}
 
+	void ProcessPopulationToggle()
+	{
+#ifdef GTA_FIVE
+		if (!m_attached)
+		{
+			CGameScriptHandlerMgr::GetInstance()->AttachScript(this);
+			m_attached = true;
+		}
+
+		// TEMP: force-disable population for 1s big using script
+		// should be done natively someday
+		static auto icgi = Instance<ICoreGameInit>::Get();
+		bool currentOff = (icgi->HasVariable("onesync_big") && !icgi->OneSyncBigIdEnabled) || icgi->HasVariable("strict_entity_lockdown");
+
+		auto setDispatch = [](bool enable)
+		{
+			for (int i = 1; i <= 15; i++)
+			{
+				// ENABLE_DISPATCH_SERVICE
+				NativeInvoke::Invoke<0xDC0F817884CDD856, int>(i, enable);
+			}
+		};
+
+		if (currentOff)
+		{
+			if (!m_lastOff)
+			{
+				setDispatch(false);
+
+				// ADD_SCENARIO_BLOCKING_AREA
+				m_blockingArea = NativeInvoke::Invoke<0x1B5C85C612E5256E, int>(-8192.0, -8192.0, -1024.0, 8192.0f, 8192.0f, 1024.0f, false, true, true, true);
+
+				m_lastOff = true;
+			}
+
+			// SET_PED_DENSITY_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0x95E3D6257B166CF2, int>(0.0f);
+
+			// SET_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0x245A6883D966D537, int>(0.0f);
+
+			// SET_SCENARIO_PED_DENSITY_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0x7A556143A1C03898, int>(0.0f, 0.0f);
+
+			// SET_AMBIENT_VEHICLE_RANGE_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0x90B6DA738A9A25DA, int>(0.0f);
+
+			// SET_PARKED_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0xEAE6DCC7EEE3DB1D, int>(0.0f);
+
+			// SET_RANDOM_VEHICLE_DENSITY_MULTIPLIER_THIS_FRAME
+			NativeInvoke::Invoke<0xB3B3359379FE77D3, int>(0.0f);
+		}
+		else
+		{
+			if (m_lastOff)
+			{
+				setDispatch(true);
+
+				if (m_blockingArea != -1)
+				{
+					// REMOVE_SCENARIO_BLOCKING_AREA
+					NativeInvoke::Invoke<0x31D16B74C6E29D66, int>(m_blockingArea, false);
+					m_blockingArea = -1;
+				}
+
+				m_lastOff = false;
+			}
+		}
+#endif
+	}
+
 	virtual void DoRun() override
 	{
-		uint32_t playerPedId = NativeInvoke::Invoke<GET_PLAYER_PED, uint32_t>(-1);
+		ProcessPopulationToggle();
+
+// PLAYER_PED_ID
+#ifdef GTA_FIVE
+		uint32_t playerPedId = NativeInvoke::Invoke<0xD80958FC74E988A6, uint32_t>();
+#elif defined(IS_RDR3)
+		uint32_t playerPedId = NativeInvoke::Invoke<0x096275889B8E0EE0, uint32_t>();
+#endif
+		
 
 		if (playerPedId != -1 && playerPedId != 0)
 		{
-			CRect rect(0, 0, 22, 22);
-			CRGBA color;
-
+#ifdef GTA_FIVE
+			// NETWORK_IS_SESSION_STARTED
 			if (!NativeInvoke::Invoke<0x9DE624D2FC4B603F, bool>())
 			{
-				color = CRGBA(200, 0, 0, 180);
-				TheFonts->DrawRectangle(rect, color);
+				CRect rect(0, 0, 22, 22);
+				CRGBA color;
+
+				static auto icgi = Instance<ICoreGameInit>::Get();
+
+				if (!icgi->HasVariable("storyMode"))
+				{
+					color = CRGBA(200, 0, 0, 180);
+					TheFonts->DrawRectangle(rect, color);
+				}
 			}
 			else
+#elif defined(IS_RDR3)
+			if (NativeInvoke::Invoke<0x9DE624D2FC4B603F, bool>())
+#endif
 			{
 				auto steam = GetSteam();
 
@@ -116,13 +196,16 @@ public:
 					lastPlayerCount = playerCount;
 				}
 			}
-
-			if (!m_hosted && NativeInvoke::Invoke<NETWORK_IS_HOST, bool>())
+#ifdef GTA_FIVE
+			// NETWORK_IS_HOST
+			if (!m_hosted && NativeInvoke::Invoke<0x8DB296B814EDDA07, bool>())
 			{
+				// NETWORK_SESSION_VALIDATE_JOIN
 				NativeInvoke::Invoke<0xC19F6C8E7865A6FF, int>(1);
 
 				m_hosted = true;
 			}
+#endif
 		}
 	}
 };
@@ -138,3 +221,4 @@ static InitFunction initFunction([] ()
 		rage::scrEngine::CreateThread(&lovelyThread);
 	});
 });
+#endif

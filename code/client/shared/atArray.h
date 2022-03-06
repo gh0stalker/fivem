@@ -30,6 +30,33 @@ public:
 		m_size = 0;
 	}
 
+	atArray(const atArray& right)
+	{
+		m_count = right.m_count;
+		m_size = right.m_size;
+
+		m_offset = (TValue*)rage::GetAllocator()->allocate(m_size * sizeof(TValue), 16, 0);
+		std::uninitialized_copy(right.m_offset, right.m_offset + right.m_count, m_offset);
+	}
+
+	atArray& operator=(const atArray& right)
+	{
+		if (m_offset)
+		{
+			std::destroy(m_offset, m_offset + m_count);
+
+			rage::GetAllocator()->free(m_offset);
+		}
+
+		m_count = right.m_count;
+		m_size = right.m_size;
+
+		m_offset = (TValue*)rage::GetAllocator()->allocate(m_size * sizeof(TValue), 16, 0);
+		std::uninitialized_copy(right.m_offset, right.m_offset + right.m_count, m_offset);	
+
+		return *this;
+	}
+
 	atArray(int capacity)
 	{
 		m_offset = (TValue*)rage::GetAllocator()->allocate(capacity * sizeof(TValue), 16, 0);
@@ -39,6 +66,8 @@ public:
 
 	~atArray()
 	{
+		std::destroy(m_offset, m_offset + m_count);
+
 		rage::GetAllocator()->free(m_offset);
 	}
 

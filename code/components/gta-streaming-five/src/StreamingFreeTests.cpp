@@ -6,6 +6,11 @@
  */
 
 #include "StdInc.h"
+
+#include <unordered_set>
+
+#ifdef GTA_FIVE
+#include <jitasm.h>
 #include "Hooking.h"
 #include <atPool.h>
 
@@ -82,10 +87,26 @@ bool rage::fwAssetStoreBase::IsResourceValid(uint32_t idx)
 {
 	return fwAssetStoreBase__isResourceValid(this, idx);
 }
+#endif
 
-static std::map<std::string, uint32_t> g_streamingNamesToIndices;
+#ifdef _DEBUG
+static std::map<std::string, uint32_t, std::less<>> g_streamingNamesToIndices;
 static std::map<uint32_t, std::string> g_streamingIndexesToNames;
+static std::map<uint32_t, std::string> g_streamingHashesToNames;
+#else
+static std::unordered_map<std::string, uint32_t> g_streamingNamesToIndices;
+static std::unordered_map<uint32_t, std::string> g_streamingIndexesToNames;
+static std::unordered_map<uint32_t, std::string> g_streamingHashesToNames;
+#endif
 
+#ifdef GTA_FIVE
+// TODO: unordered_map with a custom hash
+static std::map<std::tuple<streaming::strStreamingModule*, uint32_t>, uint32_t> g_streamingHashStoresToIndices;
+#endif
+
+extern std::unordered_set<std::string> g_streamingSuffixSet;
+
+#ifdef GTA_FIVE
 template<bool IsRequest>
 rage::strStreamingModule** GetStreamingModuleWithValidate(void* streamingModuleMgr, uint32_t index)
 {
@@ -99,7 +120,9 @@ rage::strStreamingModule** GetStreamingModuleWithValidate(void* streamingModuleM
 	{
 		if (!assetStore->IsResourceValid(index - assetStore->baseIdx))
 		{
-			FatalError("Tried to %s non-existent streaming asset %s (%d) in module %s", (IsRequest) ? "request" : "release", g_streamingIndexesToNames[index].c_str(), index, typeName.c_str());
+			trace("Tried to %s non-existent streaming asset %s (%d) in module %s\n", (IsRequest) ? "request" : "release", g_streamingIndexesToNames[index].c_str(), index, typeName.c_str());
+
+			AddCrashometry("streaming_free_validation", "true");
 		}
 	}
 
@@ -121,18 +144,38 @@ uint32_t* AddStreamingFileWrap(uint32_t* indexRet)
 		}
 #endif
 
+		auto store = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule(*indexRet);
+		auto baseIdx = store->baseIdx;
+
 		if (sfLog)
 		{
-			fprintf(sfLog, "registered %s as %d\n", g_lastStreamingName.c_str(), *indexRet);
+			fprintf(sfLog, "registered %s as %d (%d+%d)\n", g_lastStreamingName.c_str(), *indexRet, baseIdx, *indexRet - baseIdx);
 			fflush(sfLog);
 		}
 
 		g_streamingNamesToIndices[g_lastStreamingName] = *indexRet;
 		g_streamingIndexesToNames[*indexRet] = g_lastStreamingName;
+
+		auto baseFn = g_lastStreamingName.substr(0, g_lastStreamingName.find_last_of('.'));
+		g_streamingHashesToNames[HashString(baseFn.c_str())] = baseFn;
+		g_streamingHashStoresToIndices[{ store, HashString(baseFn.c_str()) }] = *indexRet - baseIdx;
+
+		auto splitIdx = g_lastStreamingName.find_first_of("_");
+
+		if (splitIdx != std::string::npos)
+		{
+			auto splitBit = g_lastStreamingName.substr(splitIdx + 1);
+
+			if (splitBit.find('_') != std::string::npos)
+			{
+				g_streamingSuffixSet.insert(splitBit);
+			}
+		}
 	}
 
 	return indexRet;
 }
+#endif
 
 namespace streaming
 {
@@ -145,8 +188,28 @@ namespace streaming
 	{
 		return g_streamingIndexesToNames[index];
 	}
+
+	const std::string& GetStreamingBaseNameForHash(uint32_t hash)
+	{
+		return g_streamingHashesToNames[hash];
+	}
+
+#ifdef GTA_FIVE
+	uint32_t GetStreamingIndexForLocalHashKey(streaming::strStreamingModule* module, uint32_t hash)
+	{
+		auto entry = g_streamingHashStoresToIndices.find({ module, hash });
+
+		if (entry != g_streamingHashStoresToIndices.end())
+		{
+			return entry->second;
+		}
+
+		return -1;
+	}
+#endif
 }
 
+#ifdef GTA_FIVE
 void(*g_origAssetRelease)(void*, uint32_t);
 
 struct AssetStore
@@ -211,10 +274,12 @@ static void(*g_origMakeDefragmentable)(rage::pgBase*, const rage::datResourceMap
 
 static void MakeDefragmentableHook(rage::pgBase* self, const rage::datResourceMap& map, bool a3)
 {
-	if (self->pageMap)
+	auto pageMap = self->pageMap;
+
+	if (pageMap)
 	{
 		auto newPageMap = new rage::PageMap;
-		memcpy(newPageMap, self->pageMap, offsetof(rage::PageMap, pageInfo) + (3 * sizeof(void*) * (map.numPages1 + map.numPages2)));
+		memcpy(newPageMap, pageMap, offsetof(rage::PageMap, pageInfo) + (3 * sizeof(void*) * (map.numPages1 + map.numPages2)));
 
 		self->pageMap = newPageMap;
 	}
@@ -232,6 +297,65 @@ struct strStreamingInterface
 };
 
 static strStreamingInterface** g_strStreamingInterface;
+
+#include <EntitySystem.h>
+#include <stack>
+#include <atHashMap.h>
+
+static void(*g_origArchetypeDtor)(fwArchetype* at);
+
+static std::map<uint32_t, std::deque<uint32_t>> g_archetypeDeletionStack;
+static atHashMapReal<uint32_t>* g_archetypeHash;
+static char** g_archetypeStart;
+static size_t* g_archetypeLength;
+
+static void ArchetypeDtorHook1(fwArchetype* at)
+{
+	auto& stack = g_archetypeDeletionStack[at->hash];
+
+	if (!stack.empty())
+	{
+		// get our index
+		auto atIdx = *g_archetypeHash->find(at->hash);
+
+		// delete ourselves from the stack
+		for (auto it = stack.begin(); it != stack.end();)
+		{
+			if (*it == atIdx)
+			{
+				it = stack.erase(it);
+			}
+			else
+			{
+				it++;
+			}
+		}
+
+		if (!stack.empty())
+		{
+			// update hash map with the front
+			auto oldArchetype = stack.front();
+
+			*g_archetypeHash->find(at->hash) = oldArchetype;
+		}
+	}
+
+	g_origArchetypeDtor(at);
+}
+
+static void(*g_origArchetypeInit)(void* at, void* a3, fwArchetypeDef* def, void* a4);
+
+static void ArchetypeInitHook(void* at, void* a3, fwArchetypeDef* def, void* a4)
+{
+	g_origArchetypeInit(at, a3, def, a4);
+
+	auto atIdx = g_archetypeHash->find(def->name);
+
+	if (atIdx)
+	{
+		g_archetypeDeletionStack[def->name].push_front(*atIdx);
+	}
+}
 
 static HookFunction hookFunction([] ()
 {
@@ -336,5 +460,24 @@ static HookFunction hookFunction([] ()
 	// pgBase destructor, to free the relocated page map we created
 	MH_CreateHook(hook::get_pattern("48 81 EC 48 0C 00 00 48 8B"), pgBaseDtorHook, (void**)&g_origPgBaseDtor);
 
+	// archetype initfromdefinition
+	MH_CreateHook(hook::get_pattern("C0 E8 02 A8 01 75 0A 48", -0x66), ArchetypeInitHook, (void**)&g_origArchetypeInit);
+
 	MH_EnableHook(MH_ALL_HOOKS);
+
+	// archetype dtor int dereg
+	{
+		auto location = hook::get_pattern("E8 ? ? ? ? 80 7B 60 01 74 39");
+		hook::set_call(&g_origArchetypeDtor, location);
+		hook::call(location, ArchetypeDtorHook1);
+	}
+
+	{
+		auto getArchetypeFn = hook::get_pattern<char>("0F 84 AD 00 00 00 44 0F B7 C0 33 D2", 20);
+
+		g_archetypeHash = (atHashMapReal<uint32_t>*)hook::get_address<void*>(getArchetypeFn);
+		g_archetypeStart = (char**)hook::get_address<void*>(getArchetypeFn + 0x84);
+		g_archetypeLength = (size_t*)hook::get_address<void*>(getArchetypeFn + 0x7D);
+	}
 });
+#endif

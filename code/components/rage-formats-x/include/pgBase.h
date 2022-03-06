@@ -17,6 +17,8 @@
 #define RAGE_FORMATS_ny_pgBase 1
 #elif defined(RAGE_FORMATS_GAME_PAYNE)
 #define RAGE_FORMATS_payne_pgBase 1
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+#define RAGE_FORMATS_rdr3_pgBase 1
 #endif
 
 #if defined(RAGE_FORMATS_GAME_FIVE)
@@ -25,7 +27,7 @@
 
 struct pgPtrRepresentation
 {
-#ifndef RAGE_FORMATS_GAME_FIVE
+#if !defined(RAGE_FORMATS_GAME_FIVE) && !defined(RAGE_FORMATS_GAME_RDR3)
 	uint32_t pointer : 28;
 	uint32_t blockType : 4;
 #else
@@ -135,7 +137,7 @@ union
 {
 	pgPtrRepresentation on_disk;
 
-#if (!defined(RAGE_FORMATS_GAME_FIVE) && defined(_M_IX86)) || (defined(RAGE_FORMATS_GAME_FIVE) && defined(_M_AMD64))
+#if (!defined(RAGE_FORMATS_GAME_FIVE) && defined(_M_IX86)) || (defined(RAGE_FORMATS_GAME_FIVE) && defined(_M_AMD64)) || (defined(RAGE_FORMATS_GAME_RDR3) && defined(_M_AMD64))
 	T* pointer;
 #elif defined(__i386__) || defined(__amd64__)
 	T* pointer;
@@ -222,9 +224,12 @@ public:
 
 	pgPtr(const pgPtr& from)
 	{
+		//on_disk = from.on_disk;
+
 #ifndef RAGE_FORMATS_IN_GAME
 		if (pgStreamManager::IsResolved(&from))
 		{
+			//pgStreamManager::MarkToBePacked(&on_disk, Physical, _ReturnAddress());
 			pgStreamManager::MarkResolved(this);
 		}
 #endif
@@ -234,9 +239,12 @@ public:
 
 	pgPtr& operator=(const pgPtr& arg)
 	{
+		//pointer = arg.pointer;
+
 #ifndef RAGE_FORMATS_IN_GAME
 		if (pgStreamManager::IsResolved(&arg))
 		{
+			//pgStreamManager::MarkToBePacked(&on_disk, Physical, _ReturnAddress());
 			pgStreamManager::MarkResolved(this);
 		}
 #endif
@@ -322,8 +330,10 @@ struct FORMATS_EXPORT BlockMap : public pgStreamableBase
 
 		memset(blocks, 0, sizeof(blocks));
 
-#ifdef RAGE_FORMATS_GAME_FIVE
+#if defined(RAGE_FORMATS_GAME_FIVE)
 		*(uint16_t*)((char*)this + 8) = 0x407;
+#elif defined(RAGE_FORMATS_GAME_RDR3)
+		*(uint16_t*)((char*)this + 8) = 0x202;
 #endif
 	}
 
@@ -353,7 +363,7 @@ public:
 
 	inline pgBase()
 	{
-#ifndef RAGE_FORMATS_GAME_FIVE
+#ifdef RAGE_FORMATS_GAME_NY
 		SetBlockMap();
 #endif
 	}

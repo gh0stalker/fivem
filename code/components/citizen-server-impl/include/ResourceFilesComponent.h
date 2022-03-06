@@ -15,7 +15,7 @@ namespace fx
 
 		virtual void Filter(void* data, size_t length) = 0;
 
-		virtual bool ShouldTerminate() = 0;
+		virtual bool ShouldTerminate(std::string* reason) = 0;
 	};
 
 	class ResourceFilesComponent : public fwRefCountable, public IAttached<fx::Resource>
@@ -26,7 +26,7 @@ namespace fx
 	public:
 		std::map<std::string, std::string> GetFileHashPairs();
 
-		void AddFileToDefaultSet(const std::string& fileName);
+		virtual void AddFileToDefaultSet(const std::string& fileName);
 
 		std::string GetDefaultSetName();
 		

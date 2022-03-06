@@ -15,7 +15,7 @@
 
 namespace fx
 {
-class ResourceManagerImpl : public ResourceManager
+class ResourceManagerImpl final : public ResourceManager
 {
 private:
 	std::recursive_mutex m_resourcesMutex;
@@ -39,7 +39,9 @@ public:
 
 	virtual pplx::task<fwRefContainer<Resource>> AddResource(const std::string& uri) override;
 
-	virtual fwRefContainer<Resource> GetResource(const std::string& identifier) override;
+	virtual pplx::task<tl::expected<fwRefContainer<Resource>, ResourceManagerError>> AddResourceWithError(const std::string& uri) override;
+
+	virtual fwRefContainer<Resource> GetResource(const std::string& identifier, bool withProvides) override;
 
 	virtual void ForAllResources(const std::function<void(const fwRefContainer<Resource>&)>& function) override;
 
@@ -49,7 +51,7 @@ public:
 
 	virtual void RemoveResource(fwRefContainer<Resource> resource) override;
 
-	virtual fwRefContainer<Resource> CreateResource(const std::string& resourceName) override;
+	virtual fwRefContainer<Resource> CreateResource(const std::string& resourceName, const fwRefContainer<ResourceMounter>& mounter) override;
 
 	virtual void Tick() override;
 

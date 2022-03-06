@@ -17,8 +17,30 @@
 #include <scrBind.h>
 #include <IteratorView.h>
 
+#include <CL2LaunchMode.h>
+#include <HostSharedData.h>
+#include <ReverseGameData.h>
+#include <CrossBuildRuntime.h>
+
 #include <sstream>
 #include <string_view>
+
+#include <Error.h>
+
+#include <boost/algorithm/string/case_conv.hpp>
+
+static bool ValidateURL(std::string url)
+{
+	auto lowerURL = boost::algorithm::to_lower_copy(url);
+
+	if (lowerURL.find("file://") == 0)
+	{
+		// log an error so that we have insight as to any frequency of use
+		FatalError("file:// URI requests in DUI are not supported.\nRequested URL: %s", url);
+	}
+
+	return (lowerURL.find("http://") == 0 || lowerURL.find("https://") == 0 || lowerURL.find("nui://") == 0 || lowerURL.find("about:") == 0);
+}
 
 static InitFunction initFunction([] ()
 {
@@ -145,6 +167,11 @@ static InitFunction initFunction([] ()
 				return;
 			}
 
+			if (!url || !ValidateURL(url))
+			{
+				return;
+			}
+
 			fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
 
 			++nuiWindowIdx;
@@ -159,6 +186,11 @@ static InitFunction initFunction([] ()
 
 		void SetURL(const char* url)
 		{
+			if (!url || !ValidateURL(url))
+			{
+				return;
+			}
+
 			nui::SetNUIWindowURL(m_autogenHandle, url);
 		}
 
@@ -299,6 +331,51 @@ static InitFunction initFunction([] ()
 		.AddMethod("SEND_DUI_MOUSE_WHEEL", &NUIWindowWrapper::InjectMouseWheel)
 		.AddMethod("DESTROY_DUI", &NUIWindowWrapper::Destroy);		
 
+	// this *was* a multiset before but some resources would not correctly pair set/unset and then be stuck in 'set' state
+	static std::unordered_set<std::string> focusVotes;
+	static std::unordered_set<std::string> focusCursorVotes;
+	static std::unordered_set<std::string> focusKeepInputVotes;
+
+	static bool lastFocus = false;
+	static bool lastFocusCursor = false;
+	static bool lastFocusKeepInput = false;
+
+	static auto updateFocus = []()
+	{
+		{
+			auto shouldFocus = !focusVotes.empty();
+			auto shouldCursor = !focusCursorVotes.empty();
+
+			if (shouldFocus != lastFocus || shouldCursor != lastFocusCursor)
+			{
+				nui::GiveFocus("", shouldFocus, shouldCursor);
+				lastFocus = shouldFocus;
+				lastFocusCursor = shouldCursor;
+			}
+		}
+
+		{
+			// find if the keep-input list overlaps with the general vote list
+			bool shouldKeepInput = false;
+
+			for (const auto& resource : focusKeepInputVotes)
+			{
+				if (focusVotes.find(resource) != focusVotes.end() ||
+					focusCursorVotes.find(resource) != focusCursorVotes.end())
+				{
+					shouldKeepInput = true;
+					break;
+				}
+			}
+
+			if (shouldKeepInput != lastFocusKeepInput)
+			{
+				nui::KeepInput(shouldKeepInput);
+				lastFocusKeepInput = shouldKeepInput;
+			}
+		}
+	};
+
 	fx::Resource::OnInitializeInstance.Connect([](fx::Resource* resource)
 	{
 		resource->OnStop.Connect([resource]()
@@ -315,7 +392,23 @@ static InitFunction initFunction([] ()
 					nuiWindows.erase(dui.second);
 				}
 			}
+
+			focusVotes.erase(resourceName);
+			focusKeepInputVotes.erase(resourceName);
+			focusCursorVotes.erase(resourceName);
+
+			updateFocus();
 		});
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("IS_NUI_FOCUSED", [] (fx::ScriptContext& context)
+	{
+		context.SetResult(nui::HasFocus());
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("IS_NUI_FOCUS_KEEPING_INPUT", [] (fx::ScriptContext& context)
+	{
+		context.SetResult(nui::HasFocusKeepInput());
 	});
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_NUI_FOCUS", [] (fx::ScriptContext& context)
@@ -337,11 +430,32 @@ static InitFunction initFunction([] ()
 						if (resource->GetName().find('"') == std::string::npos)
 						{
 							bool hasFocus = context.GetArgument<bool>(0);
+							bool hasCursor = context.GetArgument<bool>(1);
 
+#ifndef USE_NUI_ROOTLESS
 							const char* functionName = (hasFocus) ? "focusFrame" : "blurFrame";
 							nui::PostRootMessage(fmt::sprintf(R"({ "type": "%s", "frameName": "%s" } )", functionName, resource->GetName()));
+#endif
 
-							nui::GiveFocus(hasFocus, context.GetArgument<bool>(1));
+							if (hasFocus)
+							{
+								focusVotes.insert(resource->GetName());
+							}
+							else if (auto it = focusVotes.find(resource->GetName()); it != focusVotes.end())
+							{
+								focusVotes.erase(it);
+							}
+
+							if (hasCursor)
+							{
+								focusCursorVotes.insert(resource->GetName());
+							}
+							else if (auto it = focusCursorVotes.find(resource->GetName()); it != focusCursorVotes.end())
+							{
+								focusCursorVotes.erase(it);
+							}
+
+							updateFocus();
 						}
 					}
 				}
@@ -349,13 +463,58 @@ static InitFunction initFunction([] ()
 		}
 	});
 
-	fx::ScriptEngine::RegisterNativeHandler("GET_NUI_CURSOR_POSITION", [](fx::ScriptContext& context)
+	if (launch::IsSDKGuest())
 	{
-		POINT cursorPos;
-		GetCursorPos(&cursorPos);
-		ScreenToClient(FindWindow(L"grcWindow", nullptr), &cursorPos);
+		fx::ScriptEngine::RegisterNativeHandler("GET_NUI_CURSOR_POSITION", [](fx::ScriptContext& context)
+		{
+			static HostSharedData<ReverseGameData> rgd("CfxReverseGameData");
 
-		*context.GetArgument<int*>(0) = cursorPos.x;
-		*context.GetArgument<int*>(1) = cursorPos.y;
+			*context.GetArgument<int*>(0) = rgd->mouseAbsX;
+			*context.GetArgument<int*>(1) = rgd->mouseAbsY;
+		});
+	}
+	else
+	{
+		fx::ScriptEngine::RegisterNativeHandler("GET_NUI_CURSOR_POSITION", [](fx::ScriptContext& context)
+		{
+			POINT cursorPos;
+			GetCursorPos(&cursorPos);
+			ScreenToClient(CoreGetGameWindow(), &cursorPos);
+
+			*context.GetArgument<int*>(0) = cursorPos.x;
+			*context.GetArgument<int*>(1) = cursorPos.y;
+		});
+	}
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_NUI_FOCUS_KEEP_INPUT", [](fx::ScriptContext& context)
+	{
+		fx::OMPtr<IScriptRuntime> runtime;
+
+		if (FX_SUCCEEDED(fx::GetCurrentScriptRuntime(&runtime)))
+		{
+			fx::Resource* resource = reinterpret_cast<fx::Resource*>(runtime->GetParentObject());
+
+			if (resource)
+			{
+				bool shouldKeepInput = context.GetArgument<bool>(0);
+
+				auto& voteList = focusKeepInputVotes;
+
+				if (shouldKeepInput)
+				{
+					voteList.insert(resource->GetName());
+				}
+				else
+				{
+					// remove just one entry
+					if (auto it = voteList.find(resource->GetName()); it != voteList.end())
+					{
+						voteList.erase(it);
+					}
+				}
+
+				updateFocus();
+			}
+		}
 	});
 });

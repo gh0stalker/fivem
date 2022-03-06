@@ -8,6 +8,9 @@
 
 #include <ServerInstanceBase.h>
 
+#include <UvLoopHolder.h>
+#include <uvw.hpp>
+
 namespace fx
 {
 using TCallbackMap = std::map<std::string, fx::ResourceCallbackComponent::CallbackRef>;
@@ -21,9 +24,11 @@ public:
 	using TRejectCallback = std::function<void(const std::string&)>;
 
 public:
-	ClientDeferral(fx::ServerInstanceBase* instance, const std::shared_ptr<fx::Client>& client);
+	ClientDeferral(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client);
 
 	virtual ~ClientDeferral();
+
+	void StartTimer();
 
 	inline void SetResolveCallback(const TResolveCallback& callback)
 	{
@@ -50,6 +55,16 @@ public:
 		m_cardResponseCallback = callback;
 	}
 
+	inline const std::map<std::string, std::string>& GetHandoverData() const
+	{
+		return m_handoverData;
+	}
+
+	inline void SetHandoverData(const std::string& key, const std::string& jsonValue)
+	{
+		m_handoverData[key] = jsonValue;
+	}
+
 	void PresentCard(const std::string& cardJson);
 
 	void HandleCardResponse(const std::string& dataJson);
@@ -57,6 +72,8 @@ public:
 	bool IsDeferred();
 
 	void UpdateDeferrals();
+
+	void RanEvents();
 
 	TCallbackMap GetCallbacks();
 
@@ -78,9 +95,10 @@ private:
 		inline DeferralState()
 			: done(false), rejected(false)
 		{
-
 		}
 	};
+
+	void StartTimerOnLoopThread();
 
 private:
 	TResolveCallback m_resolveCallback;
@@ -89,12 +107,20 @@ private:
 	TCardCallback m_cardCallback;
 	TCardCallback m_cardResponseCallback;
 
-	std::weak_ptr<fx::Client> m_client;
+	fx::ClientWeakPtr m_client;
 
 	std::map<std::string, DeferralState> m_deferralStates;
+	std::map<std::string, std::string> m_handoverData;
+
+	std::string m_nextCard;
 
 	bool m_completed;
+	bool m_ranEvents = false;
+	bool m_pending = false;
 
 	fx::ServerInstanceBase* m_instance;
+
+	fwRefContainer<net::UvLoopHolder> m_loop;
+	std::shared_ptr<uvw::TimerHandle> m_keepAliveTimer;
 };
 }

@@ -9,6 +9,8 @@
 
 #if defined(CEF_USE_ATL)
 
+#include <CrossBuildRuntime.h>
+
 #include <shellapi.h>
 #include <shlobj.h>
 #include <windowsx.h>
@@ -398,7 +400,7 @@ int GetCefMouseModifiers(WPARAM wparam);
 			current_drag_data_ = drag_data->Clone();
 			current_drag_data_->ResetFileContents();
 
-			AttachThreadInput(GetCurrentThreadId(), GetWindowThreadProcessId(FindWindow(L"grcWindow", nullptr), nullptr), TRUE);
+			AttachThreadInput(GetCurrentThreadId(), GetWindowThreadProcessId(CoreGetGameWindow(), nullptr), TRUE);
 
 			HRESULT res = DoDragDrop(dataObject, dropSource, effect, &resEffect);
 			if (res != DRAGDROP_S_DROP)
@@ -437,6 +439,12 @@ int GetCefMouseModifiers(WPARAM wparam);
 		CefBrowserHost::DragOperationsMask mask = DropEffectToDragOperation(*effect);
 		mask = callback_->OnDrop(ev, mask);
 		*effect = DragOperationToDropEffect(mask);
+		return S_OK;
+	}
+
+	HRESULT DropTargetWin::CancelCallback()
+	{
+		callback_ = NULL;
 		return S_OK;
 	}
 

@@ -37,17 +37,6 @@ private:
 
 	ResourceEventManagerComponent* m_managerComponent;
 
-private:
-	struct EventData
-	{
-		std::string eventName;
-		std::string eventSource;
-		std::string eventPayload;
-	};
-
-private:
-	tbb::concurrent_queue<EventData> m_eventQueue;
-
 public:
 	ResourceEventComponent();
 
@@ -59,12 +48,6 @@ public:
 	void HandleTriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource, bool* eventCanceled);
 
 	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
-
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
 
 public:
 	//
@@ -78,7 +61,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		QueueEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}
@@ -103,6 +86,7 @@ private:
 		std::string eventName;
 		std::string eventSource;
 		std::string eventPayload;
+		ResourceEventComponent* filter = nullptr;
 	};
 
 private:
@@ -141,18 +125,12 @@ public:
 	//
 	// Triggers an event immediately. Returns a value indicating whether the event was not canceled.
 	//
-	bool TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
+	bool TriggerEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string(), ResourceEventComponent* filter = nullptr);
 
 	//
 	// Enqueues an event for execution on the next resource manager tick.
 	//
-	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string());
-
-private:
-	struct pass
-	{
-		template<typename ...T> pass(T...) {}
-	};
+	void QueueEvent(const std::string& eventName, const std::string& eventPayload, const std::string& eventSource = std::string(), ResourceEventComponent* filter = nullptr);
 
 public:
 	//
@@ -166,7 +144,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		return TriggerEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}
@@ -182,7 +160,7 @@ public:
 
 		// pack the argument pack as array
 		packer.pack_array(sizeof...(args));
-		pass{ (packer.pack(args), 0)... };
+		(packer.pack(args), ...);
 
 		QueueEvent(std::string(eventName), std::string(buf.data(), buf.size()), std::string(targetSrc.value_or("")));
 	}

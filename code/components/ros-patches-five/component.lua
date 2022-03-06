@@ -1,17 +1,23 @@
-linkoptions "/DELAYLOAD:libcef.dll"
+return function()
+	filter {}
 
-libdirs { "../../../vendor/cef/Release/" }
+	linkoptions "/DELAYLOAD:libcef.dll"
+	links { "libcef_dll", "delayimp", "libGLESv2" }
+	
+	links { "libcef" }
 
-includedirs { "../../../vendor/cef/" }
+	filter {}
+		libdirs { "components/ros-patches-five/lib/" }
 
-links { "libcef_dll", "delayimp", "libGLESv2" }
+	filter 'architecture:x86'
+		libdirs { "../vendor/cef32/Release/" }
+		includedirs { "../vendor/cef32/" }
+		links { "steam_api" }
+	
+	filter 'architecture:x64'
+		libdirs { "../vendor/cef/Release/" }
+		includedirs { "../vendor/cef/" }
+		links { "steam_api64" }
 
-links { "libcef" }
-
-flags { 'Maps' }
-
-filter 'architecture:x64'
-	links { "steam_api64" }
-
-filter()
-	libdirs { "lib/" }
+	add_dependencies { 'vendor:mojo' }
+end

@@ -6,8 +6,8 @@
 		"citizen:resources:client",
 		"nui:core",
 		"scrbind:base",
-		"citizen:scripting:core",
-		"gta:streaming:five"
+		"http-client",
+		"citizen:scripting:core"
 	],
 	"provides": []
 }

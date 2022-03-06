@@ -7,9 +7,11 @@ return {
 		targetname "msgpack-c"
 		language "C++"
 		kind "StaticLib"
+		defines { "MSGPACK_DLLEXPORT=" }
 
 		files
 		{
+			"../vendor/msgpack-c/include/**.hpp",
 			"../vendor/msgpack-c/src/*.c" 
 		}
 	end
