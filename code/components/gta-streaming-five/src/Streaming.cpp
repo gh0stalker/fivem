@@ -1,5 +1,6 @@
 #include <StdInc.h>
 #include <Hooking.h>
+#include <Hooking.Stubs.h>
 #include <Streaming.h>
 
 static void* g_storeMgr;
@@ -7,6 +8,11 @@ static void* g_storeMgr;
 static hook::cdecl_stub<void(bool)> g_loadObjectsNow([]()
 {
 	return hook::get_call(hook::get_pattern("41 B8 14 00 00 00 03 D3 E8", 0xF));
+});
+
+static hook::cdecl_stub<void(void*, uint32_t* fileIdx, const char* registerName, uint32_t handle, uint32_t collectionId, void* unk, bool unk2, void* unk3, bool unk4)> g_registerObject([]()
+{
+	return hook::get_call<void*>(hook::get_pattern<char>("B2 01 48 8B CD 45 8A E0 4D 0F 45 F9 E8", -0x25) + 0xE9);
 });
 
 static hook::cdecl_stub<void(void*, uint32_t, int)> g_requestObject([]()
@@ -22,6 +28,11 @@ static hook::cdecl_stub<bool(void*, uint32_t)> g_releaseObject([]()
 static hook::cdecl_stub<bool(void*, uint32_t, int)> g_releaseSystemObject([]()
 {
 	return hook::get_pattern("8B CA 4D 8B 11 45 0F B7 5C CA 06 45", -0xB);
+});
+
+static hook::cdecl_stub<bool(void*, uint32_t)> g_unregisterObject([]()
+{
+	return hook::get_pattern("8B C2 48 8B 11 F6 44 C2");
 });
 
 static hook::cdecl_stub<streaming::strStreamingModule**(void*, uint32_t)> g_getStreamingModule([]()
@@ -82,57 +93,35 @@ namespace rage
 	{
 		return g_streamingAllocator;
 	}
-
-	class strStreamingInfoManager
-	{
-	public:
-		void RegisterObject(uint32_t* fileIdx, const char* registerName, uint32_t handle, uint32_t collectionId, void* unk, bool unk2, void* unk3, bool unk4);
-	};
-
-	class strStreamingEngine
-	{
-	public:
-		static strStreamingInfoManager* GetInfo();
-	};
-
-	static hook::cdecl_stub<void(strStreamingInfoManager*, uint32_t* fileIdx, const char* registerName, uint32_t handle, uint32_t collectionId, void* unk, bool unk2, void* unk3, bool unk4)> _strStreamingInfoManager_RegisterObject([]() -> void*
-	{
-		return hook::get_call(hook::get_pattern<char>("B2 01 48 8B CD 45 8A E0 4D 0F 45 F9 E8", -0x25) + 0xE9);
-	});
-
-	void strStreamingInfoManager::RegisterObject(uint32_t* fileIdx, const char* registerName, uint32_t handle, uint32_t collectionId, void* unk, bool unk2, void* unk3, bool unk4)
-	{
-		return _strStreamingInfoManager_RegisterObject(this, fileIdx, registerName, handle, collectionId, unk, unk2, unk3, unk4);
-	}
-
-	strStreamingInfoManager* strStreamingEngine::GetInfo()
-	{
-		static auto mgr = hook::get_address<strStreamingInfoManager*>(hook::get_pattern<char>("B2 01 48 8B CD 45 8A E0 4D 0F 45 F9 E8", -0x25) + 0xBA);
-		return mgr;
-	}
 }
 
-static rage::fiCollection* (__thiscall* _rage_pgStreamer_ctor)(void*);
+rage::fiCollection** g_fiCollections;
+static void* (*g_orig_rage_pgStreamer_ctor)(void*);
+int currentIdx = 1;
 
-bool GetRawStreamerForFile(const char* fileName, rage::fiCollection** collection)
+void AddRawStreamer()
 {
-	if (strncmp(fileName, "faux_pack", 9) == 0 || strncmp(fileName, "addons:/", 8) == 0)
-	{
-		static auto fakeStreamer = ([]()
-		{
-			auto alloc8ed = rage::GetAllocator()->Allocate(2048, 16, 0);
-			auto stat = (char*)_rage_pgStreamer_ctor;
-			hook::put<int>(stat + 0x3F, *(int*)(stat + 0x3F) + 8);
+	auto alloc8ed = rage::GetAllocator()->Allocate(2048, 16, 0);
 
-			return _rage_pgStreamer_ctor(alloc8ed);
-		})();
+	auto swap = g_fiCollections[0];
+	g_orig_rage_pgStreamer_ctor(alloc8ed);
+	g_fiCollections[0] = swap;
 
-		*collection = fakeStreamer;
-		return true;
-	}
+	g_fiCollections[currentIdx++] = static_cast<rage::fiCollection*>(alloc8ed);
+}
 
-	*collection = nullptr;
-	return false;
+void* rage_pgStreamer_ctor(void* self)
+{
+	// the game's own raw streamer
+	auto ret = g_orig_rage_pgStreamer_ctor(self);
+
+	// for fivem
+	AddRawStreamer();
+
+	// for mod loader
+	AddRawStreamer();
+
+	return ret;
 }
 
 namespace streaming
@@ -176,6 +165,11 @@ namespace streaming
 		g_loadObjectsNow(a1);
 	}
 
+	void Manager::RegisterObject(uint32_t* fileIdx, const char* registerName, uint32_t handle, uint32_t collectionId, void* unk, bool unk2, void* unk3, bool unk4)
+	{
+		return g_registerObject(this, fileIdx, registerName, handle, collectionId, unk, unk2, unk3, unk4);
+	}
+
 	void Manager::RequestObject(uint32_t objectId, int flags)
 	{
 		g_requestObject(this, objectId, flags);
@@ -189,6 +183,11 @@ namespace streaming
 	bool Manager::ReleaseObject(uint32_t objectId, int flags)
 	{
 		return g_releaseSystemObject(this, objectId, flags);
+	}
+
+	bool Manager::UnregisterObject(uint32_t objectId)
+	{
+		return g_unregisterObject(this, objectId);
 	}
 
 	strStreamingModule* strStreamingModuleMgr::GetStreamingModule(int index)
@@ -210,7 +209,7 @@ namespace streaming
 	{
 		rage::fiCollection* rawStreamer = nullptr;
 
-		if (GetRawStreamerForFile(fileName, &rawStreamer))
+		if (auto collectionIdx = GetRawStreamerForFile(fileName, &rawStreamer))
 		{
 			auto fileIdx = rawStreamer->GetEntryByName(fileName);
 			if (fileIdx != uint16_t(-1))
@@ -223,7 +222,7 @@ namespace streaming
 				}
 
 				uint8_t unkVal;
-				rage::strStreamingEngine::GetInfo()->RegisterObject(fileId, registerName, fileIdx | (1 << 16), 1, &unkVal, unkTrue, nullptr, false);
+				Manager::GetInstance()->RegisterObject(fileId, registerName, fileIdx | collectionIdx << 16, collectionIdx, &unkVal, unkTrue, nullptr, false);
 			}
 
 			return fileId;
@@ -231,22 +230,47 @@ namespace streaming
 
 		return g_registerRawStreamingFile(fileId, fileName, unkTrue, registerAs, errorIfFailed);
 	}
+
+	int GetCollectionIndexForFileName(const char* fileName)
+	{
+		// anything related to mods installed by the users themselves
+		if (strncmp(fileName, "faux_pack", 9) == 0 || strncmp(fileName, "addons:/", 8) == 0)
+		{
+			return 2;
+		}
+		// for now, only texture dictionaries have a custom streamer as its the most used
+		auto len = strlen(fileName);
+		if (len > 4 && strcmp(fileName + len - 3, "ytd") == 0)
+		{
+			return 1;
+		}
+
+		return 0;
+	}
+
+	STREAMING_EXPORT int GetRawStreamerForFile(const char* fileName, rage::fiCollection** collection)
+	{
+		auto idx = GetCollectionIndexForFileName(fileName);
+		*collection = g_fiCollections[idx];
+		return idx;
+	}
+
+	STREAMING_EXPORT rage::fiCollection* GetRawStreamerByIndex(uint16_t idx)
+	{
+		return g_fiCollections[idx];
+	}
 }
 
 static HookFunction hookFunction([] ()
 {
-	{
-		auto location = hook::get_pattern<char>("74 1A 8B 15 ? ? ? ? 48 8D 0D ? ? ? ? 41", 11);
+	g_storeMgr = hook::get_address<void*>(hook::get_pattern<char>("74 1A 8B 15 ? ? ? ? 48 8D 0D ? ? ? ? 41", 11));
+	g_streamingAllocator = hook::get_address<decltype(g_streamingAllocator)>(hook::get_pattern("44 8B 46 04 48 8D 0D ? ? ? ? 49 8B D2 44", 7));
 
-		g_storeMgr = (void*)(location + *(int32_t*)location + 4);
-	}
+	g_orig_rage_pgStreamer_ctor = hook::trampoline(hook::get_pattern("48 8B CB 33 D2 41 B8 00 02 00 00 E8", -0x29), rage_pgStreamer_ctor);
 
-	{
-		g_streamingAllocator = hook::get_address<decltype(g_streamingAllocator)>(hook::get_pattern("44 8B 46 04 48 8D 0D ? ? ? ? 49 8B D2 44", 7));
-	}
+	// the first 3 indexes are for rawstreamers, rest is for packfiles
+	auto addr = hook::get_pattern<char>("41 0F B7 D2 4C 8D");
+	hook::put<uint32_t>(addr, 0x02528D41); // lea    edx,[r10+0x2]
 
-	_rage_pgStreamer_ctor = (decltype(_rage_pgStreamer_ctor))hook::get_pattern("48 8B CB 33 D2 41 B8 00 02 00 00 E8", -0x29);
-
-	// start off fiCollection packfiles at 2, not 1
-	hook::put<uint32_t>(hook::get_pattern("41 0F B7 D2 4C 8D"), 0x01528D41); // lea    edx,[r10+0x1]
+	g_fiCollections = hook::get_address<rage::fiCollection**>(addr + 7);
 });

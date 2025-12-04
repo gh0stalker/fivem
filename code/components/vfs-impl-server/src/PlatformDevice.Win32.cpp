@@ -10,12 +10,22 @@
 
 namespace vfs
 {
-Device::THandle LocalDevice::Open(const std::string& fileName, bool readOnly)
+Device::THandle LocalDevice::Open(const std::string& fileName, bool readOnly, bool append)
 {
 	std::wstring wideName = ToWide(fileName);
 
+	DWORD dwDesiredAccess = GENERIC_READ;
+	if (!readOnly && append)
+	{
+		dwDesiredAccess |= FILE_APPEND_DATA;
+	}
+	else if (!readOnly)
+	{
+		dwDesiredAccess |= GENERIC_WRITE;
+	}
+
 	HANDLE hFile = CreateFileW(wideName.c_str(),
-	    (readOnly) ? GENERIC_READ : (GENERIC_READ | GENERIC_WRITE),
+	    dwDesiredAccess,
 	    FILE_SHARE_READ | FILE_SHARE_WRITE,
 	    nullptr,
 	    OPEN_EXISTING,
@@ -41,15 +51,25 @@ Device::THandle LocalDevice::OpenBulk(const std::string& fileName, uint64_t* ptr
 	return reinterpret_cast<THandle>(hFile);
 }
 
-Device::THandle LocalDevice::Create(const std::string& filename)
+Device::THandle LocalDevice::Create(const std::string& filename, bool createIfExists, bool append)
 {
 	std::wstring wideName = ToWide(filename);
+	
+	DWORD dwDesiredAccess = GENERIC_READ;
+	if (append)
+	{
+		dwDesiredAccess |= FILE_APPEND_DATA;
+	}
+	else
+	{
+		dwDesiredAccess |= GENERIC_WRITE;
+	}
 
 	HANDLE hFile = CreateFileW(wideName.c_str(),
-	    GENERIC_READ | GENERIC_WRITE,
+	    dwDesiredAccess,
 	    FILE_SHARE_READ,
 	    nullptr,
-	    CREATE_ALWAYS,
+	    createIfExists ? CREATE_ALWAYS : CREATE_NEW,
 	    FILE_ATTRIBUTE_NORMAL,
 	    nullptr);
 
@@ -141,6 +161,11 @@ size_t LocalDevice::Seek(THandle handle, intptr_t offset, int seekType)
 	}
 	else if (seekType == SEEK_END)
 	{
+		moveMethod = FILE_END;
+	}
+	else
+	{
+		// prevent uninitialized variable
 		moveMethod = FILE_END;
 	}
 
@@ -253,6 +278,11 @@ void LocalDevice::FindClose(THandle handle)
 	::FindClose(reinterpret_cast<HANDLE>(handle));
 }
 
+uint32_t LocalDevice::GetAttributes(const std::string& filename)
+{
+	return ::GetFileAttributesW(ToWide(filename).c_str());
+}
+
 bool LocalDevice::ExtensionCtl(int controlIdx, void* controlData, size_t controlSize)
 {
 	if (controlIdx == VFS_GET_FILE_ID && controlSize == sizeof(GetFileIdExtension))
@@ -335,4 +365,25 @@ bool LocalDevice::ExtensionCtl(int controlIdx, void* controlData, size_t control
 
 	return false;
 }
+
+bool LocalDevice::Flush(THandle handle)
+{
+	assert(handle != Device::InvalidHandle);
+
+	return FlushFileBuffers(reinterpret_cast<HANDLE>(handle));
+}
+
+bool LocalDevice::Truncate(THandle handle,  uint64_t length)
+{
+	auto h = reinterpret_cast<HANDLE>(handle);
+
+	LARGE_INTEGER li;
+	li.QuadPart = length;
+	if (!SetFilePointerEx(h, li, nullptr, FILE_BEGIN))
+	{
+		return false;
+	}
+	return SetEndOfFile(h) != 0;
+}
+
 }

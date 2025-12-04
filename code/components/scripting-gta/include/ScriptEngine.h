@@ -13,7 +13,7 @@
 #define SCRT_EXPORT DLL_IMPORT
 #endif
 
-#include <boost/optional.hpp>
+#include "DebugAlias.h"
 
 #define SCRT_HAS_CALLNATIVEHANDLER 1
 
@@ -30,6 +30,7 @@ namespace fx
 
 	protected:
 		void* m_argumentBuffer;
+		void* m_resultBuffer;
 
 		int m_numArguments;
 		int m_numResults;
@@ -71,6 +72,12 @@ namespace fx
 				throw std::runtime_error(va("Argument at index %d was null.", index));
 			}
 
+			if constexpr (std::is_pointer_v<T>)
+			{
+				uint8_t probe = *(uint8_t*)argument;
+				debug::Alias(&probe);
+			}
+
 			return argument;
 		}
 
@@ -98,7 +105,7 @@ namespace fx
 		template<typename T>
 		inline void SetResult(const T& value)
 		{
-			auto functionData = (uintptr_t*)m_argumentBuffer;
+			auto functionData = (uintptr_t*)m_resultBuffer;
 
 			if (sizeof(T) < ArgumentSize)
 			{
@@ -114,7 +121,7 @@ namespace fx
 		template<typename T>
 		inline T GetResult()
 		{
-			auto functionData = (uintptr_t*)m_argumentBuffer;
+			auto functionData = (uintptr_t*)m_resultBuffer;
 
 			return *reinterpret_cast<T*>(functionData);
 		}
@@ -123,16 +130,21 @@ namespace fx
 		{
 			return m_argumentBuffer;
 		}
+
+		inline void* GetResultBuffer()
+		{
+			return m_resultBuffer;
+		}
 	};
 
 	class ScriptContextRaw : public ScriptContext
 	{
 	public:
-		inline ScriptContextRaw(void* functionBuffer, int numArguments)
+		inline ScriptContextRaw(void* args, void* rets, int nargs)
 		{
-			m_argumentBuffer = functionBuffer;
-
-			m_numArguments = numArguments;
+			m_argumentBuffer = args;
+			m_resultBuffer = rets;
+			m_numArguments = nargs;
 			m_numResults = 0;
 		}
 	};
@@ -146,6 +158,7 @@ namespace fx
 		inline ScriptContextBuffer()
 		{
 			m_argumentBuffer = &m_functionData;
+			m_resultBuffer = &m_functionData; // TODO: Use separate arg and result buffers
 
 			m_numArguments = 0;
 			m_numResults = 0;
@@ -157,7 +170,9 @@ namespace fx
 	class SCRT_EXPORT ScriptEngine
 	{
 	public:
-		static boost::optional<TNativeHandler> GetNativeHandler(uint64_t nativeIdentifier);
+		static TNativeHandler GetNativeHandler(uint64_t nativeIdentifier);
+
+		static TNativeHandler* GetNativeHandlerPtr(uint64_t nativeIdentifier);
 
 		static bool CallNativeHandler(uint64_t nativeIdentifier, ScriptContext& context);
 
@@ -171,19 +186,14 @@ namespace fx
 class FxNativeInvoke
 {
 private:
-	static inline void Invoke(fx::ScriptContext& cxt, const boost::optional<fx::TNativeHandler>& handler)
-	{
-		(*handler)(cxt);
-	}
-
 public:
 	template<typename R, typename... Args>
-	static inline R Invoke(const boost::optional<fx::TNativeHandler>& handler, Args... args)
+	static inline R Invoke(const fx::TNativeHandler& handler, Args... args)
 	{
 		fx::ScriptContextBuffer cxt;
 		(cxt.Push(args), ...);
 
-		Invoke(cxt, handler);
+		handler(cxt);
 
 		if constexpr (!std::is_void_v<R>)
 		{

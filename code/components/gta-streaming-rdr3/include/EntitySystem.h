@@ -17,14 +17,47 @@ class STREAMING_EXPORT fwArchetype
 {
 public:
 	virtual ~fwArchetype() = default;
+
+public:
+	void* dynamicArchetypeComponent;
+	char pad[16];
+	float bsCenter[3];
+	float radius;
+	float aabbMin[4];
+	float aabbMax[4];
+	char pad2[16];
+	uint32_t hash;
+	char pad3[12];
 };
 
 namespace rage
 {
 struct fwModelId
 {
-	uint64_t id;
+	union
+	{
+		uint32_t value;
+
+		struct
+		{
+			uint16_t modelIndex;
+			uint16_t mapTypesIndex : 12;
+			uint16_t flags : 4;
+		};
+	};
+
+	fwModelId()
+		: modelIndex(0xFFFF), mapTypesIndex(0xFFF), flags(0)
+	{
+	}
+
+	fwModelId(uint32_t idx)
+		: value(idx)
+	{
+	}
 };
+
+static_assert(sizeof(fwModelId) == 4);
 
 class STREAMING_EXPORT fwArchetypeManager
 {
@@ -128,11 +161,96 @@ public:
 		return m_entityType;
 	}
 
+	inline fwArchetype* GetArchetype()
+	{
+		return m_archetype;
+	}
+
 private:
-	char m_pad[40]; // +8
+	char m_pad[24]; // +8
+	fwArchetype* m_archetype; // +32
+	char m_pad2[8]; // +40
 	uint8_t m_entityType; // +48
-	char m_pad2[15]; // +49
+	char m_pad3[15]; // +49
 	rage::PreciseTransform m_transform; // +64
-	char m_pad3[96]; // +128
+	char m_pad4[96]; // +128
 	void* m_netObject; // +224
 };
+
+namespace rage
+{
+class fwInteriorLocation
+{
+public:
+	inline fwInteriorLocation()
+	{
+		m_interiorIndex = -1;
+		m_isPortal = false;
+		m_unk = false;
+		m_innerIndex = -1;
+	}
+
+	inline fwInteriorLocation(uint16_t interiorIndex, bool isPortal, uint16_t innerIndex)
+		: fwInteriorLocation()
+	{
+		m_interiorIndex = interiorIndex;
+		m_isPortal = isPortal;
+		m_innerIndex = innerIndex;
+	}
+
+	inline uint16_t GetInteriorIndex()
+	{
+		return m_interiorIndex;
+	}
+
+	inline uint16_t GetRoomIndex()
+	{
+		assert(!m_isPortal);
+
+		return m_innerIndex;
+	}
+
+	inline uint16_t GetPortalIndex()
+	{
+		assert(m_isPortal);
+
+		return m_innerIndex;
+	}
+
+	inline bool IsPortal()
+	{
+		return m_isPortal;
+	}
+
+private:
+	uint16_t m_interiorIndex;
+	uint16_t m_isPortal : 1;
+	uint16_t m_unk : 1;
+	uint16_t m_innerIndex : 14;
+};
+}
+
+class CPickup : public fwEntity
+{
+};
+
+class CObject : public fwEntity
+{
+};
+
+class CVehicle : public fwEntity
+{
+};
+
+class CPed : public fwEntity
+{
+};
+
+struct PopulationCreationState
+{
+	float position[3];
+	uint32_t model;
+	bool allowed;
+};
+
+STREAMING_EXPORT extern fwEvent<PopulationCreationState*> OnCreatePopulationPed;

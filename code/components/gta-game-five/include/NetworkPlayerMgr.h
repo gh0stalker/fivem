@@ -8,17 +8,9 @@
 #pragma once
 
 #include <CrossBuildRuntime.h>
+#include <XBRVirtual.h>
 #include <netPeerAddress.h>
-
-#define DECLARE_ACCESSOR(x) \
-	decltype(impl.m2372.x)& x()        \
-	{                       \
-		return (xbr::IsGameBuildOrGreater<2372>()) ? impl.m2372.x : (xbr::IsGameBuildOrGreater<2060>()) ? impl.m2060.x : impl.m1604.x;   \
-	} \
-	const decltype(impl.m2372.x)& x() const                         \
-	{                                                    \
-		return (xbr::IsGameBuildOrGreater<2372>()) ? impl.m2372.x : (xbr::IsGameBuildOrGreater<2060>()) ? impl.m2060.x : impl.m1604.x;  \
-	}
+#include <Hooking.h>
 
 #ifdef COMPILING_GTA_GAME_FIVE
 #define GTA_GAME_EXPORT DLL_EXPORT
@@ -36,69 +28,41 @@ struct rlGamerInfo
 
 namespace rage
 {
-	class netPlayer
+	class GTA_GAME_EXPORT netPlayer : XBR_VIRTUAL_BASE_2802(0)
 	{
 	public:
-		virtual ~netPlayer() = 0;
+		//virtual ~netPlayer() = 0;
+		// TODO: real dtors
+		XBR_VIRTUAL_METHOD(void, Dtor, ())
 
-		virtual void Reset() = 0;
+		XBR_VIRTUAL_METHOD(void, Reset, ())
 
-		virtual void m_10() = 0;
+		XBR_VIRTUAL_METHOD(void, m_10, ())
 
-		virtual const char* GetName() = 0;
+		XBR_VIRTUAL_METHOD(const char*, GetName, ())
 
-		virtual void m_20() = 0;
-
-		virtual void m_28() = 0;
-
-		virtual void* GetGamerInfo_raw() = 0;
+		void* GetGamerInfoBase();
 
 		template<int Build>
 		inline auto GetGamerInfo()
 		{
-			return (rlGamerInfo<Build>*)GetGamerInfo_raw();
+			return (rlGamerInfo<Build>*)GetGamerInfoBase();
 		}
 	};
 }
 
-class CNetGamePlayer : public rage::netPlayer
+// using XBRVirt is safe here because it's right below so the counter increments right away
+class GTA_GAME_EXPORT CNetGamePlayer : public rage::netPlayer
 {
 public:
-	virtual void m_38() = 0;
-
-private:
-	template<int ActiveIndexPad, int PlayerInfoPad, int EndPad>
-	struct Impl
-	{
-		uint8_t pad[8];
-		void* nonPhysicalPlayerData;
-		uint8_t pad2[8 + ActiveIndexPad];
-		uint8_t activePlayerIndex; // 1604: +44, 2060: +52, 2372: +32
-		uint8_t physicalPlayerIndex;
-		uint8_t pad3[2];
-		uint8_t pad4[120 + PlayerInfoPad];
-		void* playerInfo; // 1604: +148, 2060: +176, 2372: +160
-		char end[EndPad];
-	};
-
-	union
-	{
-		Impl<12, 0, 28> m1604;
-		Impl<20, 0, 0> m2060;
-		Impl<0, 4, 16> m2372;
-	} impl;
+	XBR_VIRTUAL_METHOD(void, m_38, ())
 
 public:
-	void* GetPlayerInfo()
-	{
-		return (xbr::IsGameBuildOrGreater<2372>()) ? impl.m2372.playerInfo : (xbr::IsGameBuildOrGreater<2060>()) ? impl.m2060.playerInfo : impl.m1604.playerInfo;
-	}
-
-public:
-	DECLARE_ACCESSOR(nonPhysicalPlayerData);
-	DECLARE_ACCESSOR(activePlayerIndex);
-	DECLARE_ACCESSOR(physicalPlayerIndex);
-	DECLARE_ACCESSOR(playerInfo);
+	void*& nonPhysicalPlayerData();
+	uint8_t& activePlayerIndex();
+	uint8_t& physicalPlayerIndex();
+	void*& GetPlayerInfo();
+	static size_t GetClassSize();
 };
 
 class CNetworkPlayerMgr
@@ -106,3 +70,5 @@ class CNetworkPlayerMgr
 public:
 	static GTA_GAME_EXPORT CNetGamePlayer* GetPlayer(int playerIndex);
 };
+
+#undef DECLARE_ACCESSOR

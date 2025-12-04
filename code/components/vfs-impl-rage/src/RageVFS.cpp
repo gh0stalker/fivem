@@ -24,7 +24,8 @@
 #include <optional>
 #include <queue>
 
-static bool g_vfsInit;
+static bool g_vfsInitStarted;
+static bool g_vfsInitDone;
 
 class RageVFSDeviceAdapter : public rage::fiCustomDevice
 {
@@ -311,11 +312,11 @@ private:
 public:
 	RageVFSDevice(rage::fiDevice* device);
 
-	virtual THandle Open(const std::string& fileName, bool readOnly) override;
+	virtual THandle Open(const std::string& fileName, bool readOnly, bool append = false) override;
 
 	virtual THandle OpenBulk(const std::string& fileName, uint64_t* ptr) override;
 
-	virtual THandle Create(const std::string& filename) override;
+	virtual THandle Create(const std::string& filename, bool createIfExists = true, bool append = false) override;
 
 	virtual size_t Read(THandle handle, void* outBuffer, size_t size) override;
 
@@ -354,6 +355,13 @@ public:
 	virtual bool ExtensionCtl(int controlIdx, void* controlData, size_t controlSize) override;
 
 	bool IsCollection();
+
+	std::string GetAbsolutePath() const override
+	{
+		return "";
+	}
+
+	bool Flush(THandle handle) override;
 };
 
 RageVFSDevice::RageVFSDevice(rage::fiDevice* device)
@@ -381,7 +389,7 @@ static std::enable_if_t<(sizeof(size_t) > sizeof(T)), size_t> WrapInt(T value)
 	return static_cast<size_t>(value);
 }
 
-THandle RageVFSDevice::Open(const std::string& fileName, bool readOnly)
+THandle RageVFSDevice::Open(const std::string& fileName, bool readOnly, bool append)
 {
 	return m_device->Open(fileName.substr(m_pathPrefixLength).c_str(), readOnly);
 }
@@ -391,7 +399,7 @@ THandle RageVFSDevice::OpenBulk(const std::string& fileName, uint64_t* ptr)
 	return m_device->OpenBulk(fileName.substr(m_pathPrefixLength).c_str(), ptr);
 }
 
-THandle RageVFSDevice::Create(const std::string& filename)
+THandle RageVFSDevice::Create(const std::string& filename, bool createIfExists, bool append)
 {
 	return m_device->Create(filename.substr(m_pathPrefixLength).c_str());
 }
@@ -543,6 +551,11 @@ bool RageVFSDevice::ExtensionCtl(int controlIdx, void* controlData, size_t contr
 	return false;
 }
 
+bool RageVFSDevice::Flush(THandle handle)
+{
+	return true;
+}
+
 #ifndef GTA_NY
 bool RageVFSDeviceAdapter::IsCollection()
 {
@@ -588,6 +601,11 @@ private:
 public:
 	virtual fwRefContainer<vfs::Device> GetDevice(const std::string& path) override;
 
+	virtual fwRefContainer<vfs::Device> FindDevice(const std::string& absolutePath, std::string& transformedPath) override
+	{
+		return nullptr;
+	}
+
 	virtual fwRefContainer<vfs::Device> GetNativeDevice(void* nativeDevice) override;
 
 	virtual void Mount(fwRefContainer<vfs::Device> device, const std::string& path) override;
@@ -606,7 +624,7 @@ fwRefContainer<vfs::Device> RageVFSManager::GetDevice(const std::string& path)
 {
 	std::unique_lock<std::recursive_mutex> lock(m_managerLock);
 
-	if (!g_vfsInit)
+	if (!g_vfsInitDone)
 	{
 		// logic from server device
 		for (const auto& mount : g_mountCache)
@@ -634,7 +652,10 @@ fwRefContainer<vfs::Device> RageVFSManager::GetDevice(const std::string& path)
 
 			return g_citizenDevice;
 		}
+	}
 
+	if (!g_vfsInitStarted)
+	{
 		if (_strnicmp(path.c_str(), "memory:", 7) == 0)
 		{
 			static fwRefContainer<vfs::Device> memoryDevice = vfs::MakeMemoryDevice();
@@ -689,7 +710,7 @@ void RageVFSManager::Mount(fwRefContainer<vfs::Device> device, const std::string
 		rage::fiDevice::MountGlobal(path.c_str(), adapter, true);
 	};
 
-	if (g_vfsInit)
+	if (g_vfsInitStarted)
 	{
 		run();
 	}
@@ -726,7 +747,7 @@ static InitFunction initFunction([]()
 {
 	rage::fiDevice::OnInitialMount.Connect([]()
 	{
-		g_vfsInit = true;
+		g_vfsInitStarted = true;
 	}, INT32_MIN);
 
 	rage::fiDevice::OnInitialMount.Connect([]()
@@ -742,6 +763,7 @@ static InitFunction initFunction([]()
 		}
 
 		g_mountCache.clear();
+		g_vfsInitDone = true;
 	}, 1);
 
 	Instance<vfs::Manager>::Set(new RageVFSManager());

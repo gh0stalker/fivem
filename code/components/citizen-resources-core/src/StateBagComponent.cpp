@@ -6,11 +6,13 @@
 #include <shared_mutex>
 #include <unordered_set>
 
-#include <EASTL/fixed_set.h>
+//#include <EASTL/fixed_set.h>
 #include <EASTL/fixed_vector.h>
 
 #include <SharedFunction.h>
 #include <state/RlMessageBuffer.h>
+
+#include "ByteWriter.h"
 
 namespace fx
 {
@@ -27,11 +29,13 @@ public:
 
 	virtual void Reset() override;
 
-	virtual void HandlePacket(int source, std::string_view data) override;
+	virtual void HandlePacket(int source, std::string_view data, std::string* outBagNameName = nullptr) override;
+
+	virtual void HandlePacketV2(int source, net::packet::StateBagV2& message, std::string_view* outBagNameName = nullptr) override;
 
 	virtual std::shared_ptr<StateBag> GetStateBag(std::string_view id) override;
 
-	virtual std::shared_ptr<StateBag> RegisterStateBag(std::string_view id) override;
+	virtual std::shared_ptr<StateBag> RegisterStateBag(std::string_view id, bool useParentTargets = false) override;
 
 	virtual void SetGameInterface(StateBagGameInterface* gi) override;
 
@@ -39,12 +43,24 @@ public:
 
 	virtual void UnregisterTarget(int id) override;
 
-	virtual void AddSafePreCreatePrefix(std::string_view idPrefix) override;
+	virtual void AddSafePreCreatePrefix(std::string_view idPrefix, bool useParentTargets) override;
+
+	virtual StateBagRole GetRole() const override
+	{
+		return m_role;
+	}
+
+	virtual void SetRole(StateBagRole role) override
+	{
+		m_role = role;
+	}
 
 	void UnregisterStateBag(std::string_view id);
 
 	// #TODO: this should eventually actually queue a send to allow for throttling
-	void QueueSend(int target, std::string_view packet);
+	void QueueSend(int target, net::packet::StateBagPacket& packet);
+
+	void QueueSend(int target, net::packet::StateBagV2Packet& packet);
 
 	inline std::tuple<std::shared_lock<std::shared_mutex>, std::reference_wrapper<const std::unordered_set<int>>> GetTargets()
 	{
@@ -54,9 +70,14 @@ public:
 		};
 	}
 
-	bool IsSafePreCreateName(std::string_view id);
+	/// <summary>
+	/// Checks if bag name is allowed to be automatically created
+	/// </summary>
+	/// <param name="id">full name of the state bag</param>
+	/// <returns>first is if it exists, second determines if the state bag needs to use parent's targets</returns>
+	std::pair<bool, bool> IsSafePreCreateName(std::string_view id);
 
-	std::shared_ptr<StateBag> PreCreateStateBag(std::string_view id);
+	std::shared_ptr<StateBag> PreCreateStateBag(std::string_view id, bool useParentTargets);
 
 	inline StateBagGameInterface* GetGameInterface() const
 	{
@@ -80,7 +101,7 @@ private:
 	// pre-created state bag stuff
 
 	// list of state bag prefixes
-	std::set<std::string> m_preCreatePrefixes;
+	std::vector<std::pair<std::string, bool>> m_preCreatePrefixes;
 	std::shared_mutex m_preCreatePrefixMutex;
 
 	// *owning* pointers for pre-created bags
@@ -91,11 +112,13 @@ private:
 class StateBagImpl : public StateBag
 {
 public:
-	StateBagImpl(StateBagComponentImpl* parent, std::string_view id);
+	StateBagImpl(StateBagComponentImpl* parent, std::string_view id, bool useParentTargets = false);
 
 	virtual ~StateBagImpl() override;
 
 	virtual std::optional<std::string> GetKey(std::string_view key) override;
+	virtual bool HasKey(std::string_view key) override;
+	virtual std::vector<std::string> GetKeys() override;
 	virtual void SetKey(int source, std::string_view key, std::string_view data, bool replicated = true) override;
 	virtual void SetRoutingTargets(const std::set<int>& peers) override;
 
@@ -105,9 +128,13 @@ public:
 	std::optional<int> GetOwningPeer();
 	virtual void SetOwningPeer(std::optional<int> peer) override;
 
-	void SendKey(int target, std::string_view key);
+	// #TODO: potentially remove this once the throttling system is in place
+	virtual void EnableImmediateReplication(bool enabled) override;
+	virtual void SendQueuedUpdates() override;
 
-	void SendKeyAll(std::string_view key);
+	void SendKeyValue(int target, std::string_view key, std::string_view value);
+
+	void SendKeyValueToAllTargets(std::string_view key, std::string_view value);
 
 	void SendAll(int target);
 
@@ -118,6 +145,7 @@ private:
 
 private:
 	StateBagComponentImpl* m_parent;
+	bool m_useParentTargets;
 
 	std::string m_id;
 
@@ -128,10 +156,14 @@ private:
 
 	std::shared_mutex m_dataMutex;
 	std::map<std::string, std::string, std::less<>> m_data;
+
+	std::atomic<bool> m_replicationEnabled; //< #TODO: potentially remove this once the throttling system is in place
+	std::mutex m_replicateDataMutex;
+	std::unordered_map<std::string, std::string> m_replicateData;
 };
 
-StateBagImpl::StateBagImpl(StateBagComponentImpl* parent, std::string_view id)
-	: m_parent(parent), m_id(id)
+StateBagImpl::StateBagImpl(StateBagComponentImpl* parent, std::string_view id, bool useParentTargets)
+	: m_parent(parent), m_id(id), m_replicationEnabled(true), m_useParentTargets(useParentTargets)
 {
 	
 }
@@ -151,6 +183,26 @@ std::optional<std::string> StateBagImpl::GetKey(std::string_view key)
 	}
 
 	return {};
+}
+
+std::vector<std::string> StateBagImpl::GetKeys()
+{
+	std::vector<std::string> keys;
+	std::shared_lock _(m_dataMutex);
+
+	for (auto data : m_data)
+	{
+		keys.push_back(data.first);
+	}
+	
+	return keys;
+}
+
+
+bool StateBagImpl::HasKey(std::string_view key)
+{
+	std::shared_lock _(m_dataMutex);
+	return m_data.count(key) != 0;
 }
 
 void StateBagImpl::SetKey(int source, std::string_view key, std::string_view data, bool replicated /* = true */)
@@ -189,8 +241,7 @@ void StateBagImpl::SetKey(int source, std::string_view key, std::string_view dat
 			std::string keyStr{ key };
 			std::string dataStr{ data };
 
-			gameInterface->QueueTask(make_shared_function([
-				parent,
+			gameInterface->QueueTask(make_shared_function([parent,
 				source,
 				replicated,
 				id,
@@ -218,29 +269,53 @@ void StateBagImpl::SetKey(int source, std::string_view key, std::string_view dat
 	continuation(key, data);
 }
 
+// https://github.com/msgpack/msgpack/blob/master/spec.md#formats
+constexpr char MsgPackNil = static_cast<char>(0xc0);
 void StateBagImpl::SetKeyInternal(int source, std::string_view key, std::string_view data, bool replicated)
 {
-	std::string lastValue;
-
 	{
 		std::unique_lock _(m_dataMutex);
+		const bool isNilData = data[0] == MsgPackNil;
 
-		if (replicated)
+		if (auto it = m_data.find(key); it != m_data.end())
 		{
-			if (auto it = m_data.find(key); it != m_data.end())
+			// if we're set to null *and we are existing* we should just delete ourselves
+			if (isNilData)
 			{
-				lastValue = std::move(it->second);
+				m_data.erase(std::string { key });
+			}
+			else if (data != it->second)
+			{
+				it->second = data;
+			}
+			else
+			{
+				replicated = false; // nothing changed
 			}
 		}
+		else
+		{
+			// if we're nil we don't want to emplace, or replicate, as we would just be sent back a packet to delete ourselves
+			if (isNilData)
+			{
+				return;
+			}
 
-		m_data[std::string{ key }] = std::string{ data };
+			m_data.emplace(key, data);
+		}
 	}
 
 	if (replicated)
 	{
-		if (data != lastValue)
+		if (m_replicationEnabled)
 		{
-			SendKeyAll(key);
+			SendKeyValueToAllTargets(key, data);
+		}
+		else
+		{
+			// store it for now
+			std::unique_lock lk(m_replicateDataMutex);
+			m_replicateData.emplace(key, data);
 		}
 	}
 }
@@ -255,22 +330,38 @@ void StateBagImpl::SetOwningPeer(std::optional<int> peer)
 	m_owningPeer = peer;
 }
 
+void StateBagImpl::EnableImmediateReplication(bool enabled)
+{
+	m_replicationEnabled = enabled;
+}
+
+void StateBagImpl::SendQueuedUpdates()
+{
+	decltype(m_replicateData) replicationData;
+
+	{
+		std::unique_lock lk(m_replicateDataMutex);
+		m_replicateData.swap(replicationData);
+	}
+
+	for (auto& [key, value] : replicationData)
+	{
+		SendKeyValueToAllTargets(key, value);
+	}
+}
+
 void StateBagImpl::SendAll(int target)
 {
-	eastl::fixed_set<std::string_view, 50> keys;
+	// string_view's target memory can get removed in the mean time, so let's keep locking it instead
+	//eastl::fixed_set<std::string_view, 50> keys;
 
 	{
 		std::shared_lock _(m_dataMutex);
 
 		for (auto& [ key, value ] : m_data)
 		{
-			keys.insert(key);
+			SendKeyValue(target, key, value);
 		}
-	}
-
-	for (auto key : keys)
-	{
-		SendKey(target, key);
 	}
 }
 
@@ -287,16 +378,16 @@ void StateBagImpl::SendAllInitial(int target)
 	SendAll(target);
 }
 
-void StateBagImpl::SendKeyAll(std::string_view key)
+void StateBagImpl::SendKeyValueToAllTargets(std::string_view key, std::string_view value)
 {
-	if (m_routingTargets.empty())
+	if (m_useParentTargets)
 	{
 		auto [lock, refTargets] = m_parent->GetTargets();
 		auto targets = refTargets.get();
 
 		for (int target : targets)
 		{
-			SendKey(target, key);
+			SendKeyValue(target, key, value);
 		}
 	}
 	else
@@ -305,41 +396,53 @@ void StateBagImpl::SendKeyAll(std::string_view key)
 
 		for (int target : m_routingTargets)
 		{
-			SendKey(target, key);
+			SendKeyValue(target, key, value);
 		}
 	}
 }
 
-void StateBagImpl::SendKey(int target, std::string_view key)
+void StateBagImpl::SendKeyValue(int target, std::string_view key, std::string_view value)
 {
-	static thread_local rl::MessageBuffer dataBuffer(131072);
-	dataBuffer.SetCurrentBit(0);
-
-	auto writeStr = [](const auto& str)
+	// new server will accept this message
+	if (m_parent->GetRole() == StateBagRole::ClientV2)
 	{
-		dataBuffer.Write<uint16_t>(16, str.size() + 1);
-		dataBuffer.WriteBits(str.data(), str.size() * 8);
-		dataBuffer.Write<uint8_t>(8, 0);
-	};
-
-	{
-		std::shared_lock _(m_dataMutex);
-
-		auto keyDataIt = m_data.find(key);
-
-		if (keyDataIt == m_data.end())
+		if (!key.empty() && !value.empty())
 		{
-			return;
+			net::packet::StateBagV2Packet stateBagPacket;
+			stateBagPacket.data.stateBagName = std::string_view(m_id);
+			stateBagPacket.data.key = key;
+			stateBagPacket.data.data = value;
+			m_parent->QueueSend(target, stateBagPacket);
 		}
-
-		auto keyData = keyDataIt->second;
-
-		writeStr(m_id);
-		writeStr(key);
-		dataBuffer.WriteBits(keyData.data(), keyData.size() * 8);
 	}
+	else
+	{
+		// client connecting to a older server need to send this one
+		// server need to send this one, because he has no way to know version of the client
+		static thread_local rl::MessageBuffer dataBuffer(131072);
 
-	m_parent->QueueSend(target, std::string_view{ reinterpret_cast<const char*>(dataBuffer.GetBuffer().data()), dataBuffer.GetCurrentBit() / 8 });
+		if (!key.empty() && !value.empty())
+		{
+			dataBuffer.SetCurrentBit(0);
+
+			auto writeStr = [](const auto& str)
+			{
+				dataBuffer.Write<uint16_t>(16, str.size() + 1);
+				dataBuffer.WriteBits(str.data(), str.size() * 8);
+				dataBuffer.Write<uint8_t>(8, 0);
+			};
+
+			{
+				writeStr(m_id);
+				writeStr(key);
+				dataBuffer.WriteBits(value.data(), value.size() * 8);
+			}
+
+			net::packet::StateBagPacket stateBagPacket;
+			stateBagPacket.data.data = std::string_view{ reinterpret_cast<const char*>(dataBuffer.GetBuffer().data()), dataBuffer.GetCurrentBit() / 8 };
+			m_parent->QueueSend(target, stateBagPacket);
+		}
+	}
 }
 
 void StateBagImpl::SetRoutingTargets(const std::set<int>& peers)
@@ -391,41 +494,48 @@ void StateBagComponentImpl::SetGameInterface(StateBagGameInterface* gi)
 	m_gameInterface = gi;
 }
 
-std::shared_ptr<StateBag> StateBagComponentImpl::RegisterStateBag(std::string_view id)
+std::shared_ptr<StateBag> StateBagComponentImpl::RegisterStateBag(std::string_view id, bool useParentTargets)
 {
 	std::shared_ptr<StateBagImpl> bag;
 	std::string strId{ id };
 
+	// If we're already being erased we should just disown our current weak_ptr
+	bool wasBeingErased;
+	
+	{
+		std::unique_lock _(m_erasureMutex);
+		wasBeingErased = m_erasureList.erase(strId);
+	}
+
 	{
 		std::unique_lock lock(m_mapMutex);
 
-		if (auto exIt = m_stateBags.find(std::string{ id }); exIt != m_stateBags.end())
+		if (!wasBeingErased)
 		{
-			auto bagRef = exIt->second.lock();
-
-			if (bagRef)
+			if (auto exIt = m_stateBags.find(strId); exIt != m_stateBags.end())
 			{
-				lock.unlock();
+				auto bagRef = exIt->second.lock();
 
-				// disown pre-created state bag reference, if this one came from there
+				if (bagRef)
 				{
-					std::unique_lock preLock(m_preCreatedStateBagsMutex);
-					m_preCreatedStateBags.erase(bagRef);
-				}
+					lock.unlock();
 
-				return bagRef;
+					// disown pre-created state bag reference, if this one came from there
+					{
+						std::unique_lock preLock(m_preCreatedStateBagsMutex);
+						m_preCreatedStateBags.erase(bagRef);
+					}
+
+					return bagRef;
+				}
 			}
 		}
 
 		// *only* start making a new one here as otherwise we'll delete the existing bag
-		bag = std::make_shared<StateBagImpl>(this, id);
+		bag = std::make_shared<StateBagImpl>(this, id, useParentTargets);
 		m_stateBags[strId] = bag;
 	}
 
-	{
-		std::unique_lock _(m_erasureMutex);
-		m_erasureList.erase(strId);
-	}
 
 	return bag;
 }
@@ -439,6 +549,9 @@ void StateBagComponentImpl::UnregisterStateBag(std::string_view id)
 std::shared_ptr<StateBag> StateBagComponentImpl::GetStateBag(std::string_view id)
 {
 	std::shared_lock lock(m_mapMutex);
+	// unfortunately this string allocation is required, because we are not using cpp20 yet
+	// see: https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2018/p0919r2.html
+	// TODO: remove std::string allocation when cpp20 is used
 	auto bag = m_stateBags.find(std::string{ id });
 
 	return (bag != m_stateBags.end()) ? bag->second.lock() : nullptr;
@@ -491,30 +604,30 @@ void StateBagComponentImpl::UnregisterTarget(int id)
 	}
 }
 
-void StateBagComponentImpl::AddSafePreCreatePrefix(std::string_view idPrefix)
+void StateBagComponentImpl::AddSafePreCreatePrefix(std::string_view idPrefix, bool useParentTargets)
 {
 	std::unique_lock lock(m_preCreatePrefixMutex);
-	m_preCreatePrefixes.insert(std::string{ idPrefix });
+	m_preCreatePrefixes.emplace_back(idPrefix, useParentTargets);
 }
 
-bool StateBagComponentImpl::IsSafePreCreateName(std::string_view id)
+std::pair<bool, bool> StateBagComponentImpl::IsSafePreCreateName(std::string_view id)
 {
 	std::shared_lock lock(m_preCreatePrefixMutex);
 
 	for (const auto& prefix : m_preCreatePrefixes)
 	{
-		if (id.find(prefix) == 0)
+		if (id.rfind(prefix.first, 0) == 0) // equivalent of a starts with
 		{
-			return true;
+			return { true, prefix.second };
 		}
 	}
 
-	return false;
+	return { false, false };
 }
 
-std::shared_ptr<StateBag> StateBagComponentImpl::PreCreateStateBag(std::string_view id)
+std::shared_ptr<StateBag> StateBagComponentImpl::PreCreateStateBag(std::string_view id, bool useParentTargets)
 {
-	auto bag = RegisterStateBag(id);
+	auto bag = RegisterStateBag(id, useParentTargets);
 
 	{
 		std::unique_lock lock(m_preCreatedStateBagsMutex);
@@ -560,7 +673,7 @@ void StateBagComponentImpl::AttachToObject(fx::ResourceManager* object)
 	INT32_MIN);
 }
 
-void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
+void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw, std::string* outBagNameName)
 {
 	// read state
 	rl::MessageBuffer buffer{ reinterpret_cast<const uint8_t*>(dataRaw.data()), dataRaw.size() };
@@ -568,6 +681,7 @@ void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
 	auto readStr = [&buffer]()
 	{
 		uint16_t length = 0;
+
 		buffer.Read<uint16_t>(16, &length);
 
 		// validate input
@@ -599,6 +713,13 @@ void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
 		return;
 	}
 
+	// if m_curBit is greater then m_maxBit we will overflow the dataLength, which would lead to an allocation of an
+	// extremely large buffer, which would fail and crash the server.
+	if (buffer.IsAtEnd())
+	{
+		return;
+	}
+
 	// read data
 	size_t dataLength = (buffer.GetLength() * 8) - buffer.GetCurrentBit();
 
@@ -607,7 +728,7 @@ void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
 		return;
 	}
 
-	std::vector<uint8_t> data(dataLength / 8);
+	std::vector<uint8_t> data((dataLength + 7) / 8);
 	buffer.ReadBits(data.data(), dataLength);
 
 	// handle data
@@ -619,9 +740,10 @@ void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
 
 	if (!bag)
 	{
-		if (IsSafePreCreateName(bagName))
+		auto safeToCreate = IsSafePreCreateName(bagName);
+		if (safeToCreate.first)
 		{
-			bag = PreCreateStateBag(bagName);
+			bag = PreCreateStateBag(bagName, safeToCreate.second);
 		}
 	}
 
@@ -631,24 +753,65 @@ void StateBagComponentImpl::HandlePacket(int source, std::string_view dataRaw)
 
 		// TODO: rate checks, policy checks
 		auto peer = bagRef->GetOwningPeer();
-
-		if (peer)
+		if (!peer.has_value() || source == *peer)
 		{
-			if (*peer != source)
-			{
-				return;
-			}
-		}
-
-		bagRef->SetKey(
-			source,
-			std::string_view{ keyBuffer.data(), keyBuffer.size() },
-			std::string_view{ reinterpret_cast<char*>(data.data()), data.size() },
-			m_role == StateBagRole::Server);
+			bagRef->SetKey(
+				source,
+				std::string_view{ keyBuffer.data(), keyBuffer.size() },
+				std::string_view{ reinterpret_cast<char*>(data.data()), data.size() },
+				m_role == StateBagRole::Server);
+		}		
+	}
+	else if(outBagNameName != nullptr)
+	{
+		*outBagNameName = bagName;
 	}
 }
 
-void StateBagComponentImpl::QueueSend(int target, std::string_view packet)
+void StateBagComponentImpl::HandlePacketV2(int source, net::packet::StateBagV2& message, std::string_view* outBagNameName)
+{
+	if (message.stateBagName.GetValue().empty() || message.key.GetValue().empty() || message.data.GetValue().empty())
+	{
+		return;
+	}
+
+	auto bag = GetStateBag(message.stateBagName);
+
+	if (!bag)
+	{
+		if (const auto safeToCreate = IsSafePreCreateName(message.stateBagName); safeToCreate.first)
+		{
+			bag = PreCreateStateBag(message.stateBagName, safeToCreate.second);
+		}
+	}
+
+	if (bag)
+	{
+		const auto bagRef = std::static_pointer_cast<StateBagImpl>(bag);
+
+		// TODO: rate checks, policy checks
+		const auto peer = bagRef->GetOwningPeer();
+		if (!peer.has_value() || source == *peer)
+		{
+			bagRef->SetKey(
+				source,
+				message.key,
+				message.data,
+				m_role == StateBagRole::Server);
+		}		
+	}
+	else if (outBagNameName != nullptr)
+	{
+		*outBagNameName = message.stateBagName;
+	}
+}
+
+void StateBagComponentImpl::QueueSend(int target, net::packet::StateBagPacket& packet)
+{
+	m_gameInterface->SendPacket(target, packet);
+}
+
+void StateBagComponentImpl::QueueSend(int target, net::packet::StateBagV2Packet& packet)
 {
 	m_gameInterface->SendPacket(target, packet);
 }

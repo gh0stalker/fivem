@@ -353,7 +353,9 @@ export class ProjectBuilder implements ApiContribution {
         `set steam_webApiKey "${buildInfo.steamWebApiKey}"`,
         `sv_tebexSecret "${buildInfo.tebexSecret}"`,
         ``,
-        ...this.projectAccess.getInstance().getAssetsConvarCommands(),
+        [...this.projectAccess.getInstance().getAssetsConvarDescriptors()].map((variable) => (
+          `${variable.setter} ${JSON.stringify(variable.name)} ${JSON.stringify(variable.value)}`
+        )),
         ``
       ];
 
@@ -371,7 +373,7 @@ export class ProjectBuilder implements ApiContribution {
           `endpoint_add_tcp "0.0.0.0:30120"`,
           `endpoint_add_udp "0.0.0.0:30120"`,
           ``,
-          `# Get your license key at https://keymaster.fivem.net/`,
+          `# Get your license key at https://portal.cfx.re/`,
           `sv_licenseKey REPLACE_WITH_YOUR_LICENSE_KEY`,
           ``,
           `sv_hostname "${project.getName()}"`,

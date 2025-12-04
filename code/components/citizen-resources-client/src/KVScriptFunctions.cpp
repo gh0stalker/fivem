@@ -100,30 +100,32 @@ static std::string FormatKey(const char* key, const std::string& resource = {})
 	return "res:" + resName + ":" + key;
 }
 
+template<bool sync = true>
 static void PutResourceKvp(fx::ScriptContext& context, const char* data, size_t size)
 {
 	auto db = EnsureDatabase();
 	auto key = FormatKey(context.CheckArgument<const char*>(0));
 
 	leveldb::WriteOptions options;
-	options.sync = true;
+	options.sync = sync;
 
 	db->Put(options, key, leveldb::Slice{ data, size });
 }
 
-template<typename T>
+template<typename T, bool sync = true>
 static void SetResourceKvp(fx::ScriptContext& context)
 {
 	msgpack::sbuffer buffer;
 	msgpack::packer<msgpack::sbuffer> packer(buffer);
 	packer.pack(std::is_pointer_v<T> ? context.CheckArgument<T>(1) : context.GetArgument<T>(1));
 
-	PutResourceKvp(context, buffer.data(), buffer.size());
+	PutResourceKvp<sync>(context, buffer.data(), buffer.size());
 }
 
+template<bool sync = true>
 static void SetResourceKvpRaw(fx::ScriptContext& context)
 {
-	PutResourceKvp(context, context.GetArgument<const char*>(1), context.GetArgument<size_t>(2));
+	PutResourceKvp<sync>(context, context.CheckArgument<const char*>(1), context.GetArgument<size_t>(2));
 }
 
 struct AnyType {};
@@ -224,6 +226,7 @@ struct FindHandle
 {
 	std::shared_ptr<leveldb::Iterator> dbIter;
 	std::string key;
+	size_t prefixLength = 0;
 };
 
 static FindHandle g_handles[64];
@@ -241,7 +244,7 @@ static FindHandle* GetFindHandle()
 	return nullptr;
 }
 
-static void StartFindKvp_Impl(const std::string& key, fx::ScriptContext& context)
+static void StartFindKvp_Impl(const std::string& key, size_t prefixLength, fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
 
@@ -257,6 +260,7 @@ static void StartFindKvp_Impl(const std::string& key, fx::ScriptContext& context
 	handle->dbIter->Seek(key);
 
 	handle->key = key;
+	handle->prefixLength = prefixLength;
 
 	context.SetResult(handle - g_handles);
 }
@@ -264,13 +268,14 @@ static void StartFindKvp_Impl(const std::string& key, fx::ScriptContext& context
 static void StartFindKvp(fx::ScriptContext& context)
 {
 	auto key = FormatKey(context.CheckArgument<const char*>(0));
-	return StartFindKvp_Impl(key, context);
+	return StartFindKvp_Impl(key, FormatKey("").length(), context);
 }
 
 static void StartFindExternalKvp(fx::ScriptContext& context)
 {
-	auto key = FormatKey(context.CheckArgument<const char*>(1), context.CheckArgument<const char*>(0));
-	return StartFindKvp_Impl(key, context);
+	auto resourceName = context.CheckArgument<const char*>(0);
+	auto key = FormatKey(context.CheckArgument<const char*>(1), resourceName);
+	return StartFindKvp_Impl(key, FormatKey("", resourceName).length(), context);
 }
 
 static void FindKvp(fx::ScriptContext& context)
@@ -295,7 +300,7 @@ static void FindKvp(fx::ScriptContext& context)
 	static std::string keyName;
 	std::string k(handle->dbIter->key().data(), handle->dbIter->key().size());
 
-	keyName = k.substr(FormatKey("").size());
+	keyName = k.substr(handle->prefixLength);
 
 	context.SetResult<const char*>(keyName.c_str());
 
@@ -316,12 +321,15 @@ static void EndFindKvp(fx::ScriptContext& context)
 	handle->dbIter.reset();
 }
 
+template<bool sync = true>
 static void DeleteResourceKvp(fx::ScriptContext& context)
 {
 	auto db = EnsureDatabase();
 	auto key = FormatKey(context.CheckArgument<const char*>(0));
+	leveldb::WriteOptions options;
+	options.sync = sync;
 
-	db->Delete(leveldb::WriteOptions{}, key);
+	db->Delete(options, key);
 }
 
 #include <VFSStreamDevice.h>
@@ -446,7 +454,7 @@ public:
 		return {};
 	}
 
-	virtual std::shared_ptr<KvpStream> CreateStream(const std::string& fileName) override
+	virtual std::shared_ptr<KvpStream> CreateStream(const std::string& fileName, bool createIfExists) override
 	{
 		return {};
 	}
@@ -566,21 +574,27 @@ static InitFunction initFunction([]()
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_INT", GetResourceKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_STRING", GetResourceKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_KVP_FLOAT", GetResourceKvp<float>);
-	fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_RAW_KVP", GetResourceKvp<RawType>);
+	//fx::ScriptEngine::RegisterNativeHandler("GET_RESOURCE_RAW_KVP", GetResourceKvp<RawType>);
 
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP", SetResourceKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_INT", SetResourceKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_FLOAT", SetResourceKvp<float>);
-	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw);
+	//fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_RAW_KVP", SetResourceKvpRaw);
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_INT", GetExternalKvp<int>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_STRING", GetExternalKvp<const char*>);
 	fx::ScriptEngine::RegisterNativeHandler("GET_EXTERNAL_KVP_FLOAT", GetExternalKvp<float>);
 
-	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP", DeleteResourceKvp);
+	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP", DeleteResourceKvp<true>);
 
 	fx::ScriptEngine::RegisterNativeHandler("START_FIND_KVP", StartFindKvp);
 	fx::ScriptEngine::RegisterNativeHandler("START_FIND_EXTERNAL_KVP", StartFindExternalKvp);
 	fx::ScriptEngine::RegisterNativeHandler("FIND_KVP", FindKvp);
 	fx::ScriptEngine::RegisterNativeHandler("END_FIND_KVP", EndFindKvp);
+
+	// asynchronous
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_NO_SYNC", SetResourceKvp<const char*, false>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_INT_NO_SYNC", SetResourceKvp<int, false>);
+	fx::ScriptEngine::RegisterNativeHandler("SET_RESOURCE_KVP_FLOAT_NO_SYNC", SetResourceKvp<float, false>);
+	fx::ScriptEngine::RegisterNativeHandler("DELETE_RESOURCE_KVP_NO_SYNC", DeleteResourceKvp<false>);
 });

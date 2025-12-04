@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <VFSDevice.h>
 #include <zlib.h>
 
@@ -63,7 +64,9 @@ namespace vfs
 
 		Header7 m_header;
 
-		HandleData m_handles[32];
+		std::vector<HandleData> m_handles;
+
+		std::mutex m_handlesMutex;
 
 		std::vector<Entry> m_entries;
 
@@ -81,9 +84,11 @@ namespace vfs
 	public:
 		RagePackfile7();
 
+		static void SetValidationCallback(const std::function<bool(const std::vector<uint8_t>& sig, const std::vector<uint8_t>& data)>& func);
+
 		virtual ~RagePackfile7() override;
 
-		virtual THandle Open(const std::string& fileName, bool readOnly) override;
+		virtual THandle Open(const std::string& fileName, bool readOnly, bool append = false) override;
 
 		virtual THandle OpenBulk(const std::string& fileName, uint64_t* ptr) override;
 
@@ -110,6 +115,13 @@ namespace vfs
 		virtual void SetPathPrefix(const std::string& pathPrefix) override;
 
 		virtual bool ExtensionCtl(int controlIdx, void* controlData, size_t controlSize) override;
+
+		virtual std::string GetAbsolutePath() const override
+		{
+			return m_pathPrefix;
+		}
+
+		bool Flush(THandle handle) override;
 
 	public:
 		bool OpenArchive(const std::string& archivePath, bool needsEncryption = false);

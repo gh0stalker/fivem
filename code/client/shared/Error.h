@@ -1,6 +1,6 @@
 #pragma once
 
-#if !defined(COMPILING_LAUNCH) && !defined(COMPILING_CONSOLE) && !defined(COMPILING_SHARED_LIBC)
+#if !defined(COMPILING_DIAG) && !defined(COMPILING_CONSOLE) && !defined(COMPILING_SHARED_LIBC)
 #include <fnv.h>
 
 #ifdef _WIN32
@@ -45,7 +45,9 @@ inline uint32_t const_uint32()
 #endif
 
 #define GlobalError(f, ...) do { if (GlobalErrorReal(_CFX_FILE, __LINE__, const_uint32<fnv1a_t<4>::Hash(f)>(), f, ##__VA_ARGS__) < 0) { *(volatile int*)ERROR_CRASH_MAGIC = 0; } } while(false)
+#ifndef FatalError
 #define FatalError(f, ...) do { if (FatalErrorReal(_CFX_FILE, __LINE__, const_uint32<fnv1a_t<4>::Hash(f)>(), f, ##__VA_ARGS__) < 0) { *(volatile int*)ERROR_CRASH_MAGIC = 0; } } while(false)
+#endif
 #define FatalErrorNoExcept(f, ...) do { if (FatalErrorNoExceptReal(_CFX_FILE, 99999, const_uint32<fnv1a_t<4>::Hash(f)>(), f, ##__VA_ARGS__) < 0) { } } while(false)
 #else
 void GlobalErrorV(const char* string, fmt::printf_args formatList);
@@ -63,6 +65,8 @@ inline void FatalError(const char* string, const TArgs&... args)
 	return FatalErrorV(string, fmt::make_printf_args(args...));
 }
 #endif
+
+void AddCrashometry(const std::string& key, const std::string& value);
 
 void AddCrashometryV(const std::string& key, const std::string& format, fmt::printf_args value);
 

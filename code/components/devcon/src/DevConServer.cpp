@@ -258,7 +258,13 @@ static InitFunction initFunction([]()
 	static const int tcpServerPort = IsCL2() ? 29300 : 29200;
 #endif
 	static fwRefContainer<net::TcpServerManager> tcpStack = new net::TcpServerManager();
-	static fwRefContainer<net::TcpServer> tcpServer = tcpStack->CreateServer(net::PeerAddress::FromString(fmt::sprintf("0.0.0.0:%d", tcpServerPort), tcpServerPort, net::PeerAddress::LookupType::NoResolution).get());
+	static fwRefContainer<net::TcpServer> tcpServer = tcpStack->CreateServer(
+		net::PeerAddress::FromString(
+			fmt::sprintf("%s:%d",
+				wcsstr(GetCommandLineW(), L"-devcon") != nullptr ? "0.0.0.0" : "127.0.0.1",
+				tcpServerPort
+			), tcpServerPort, net::PeerAddress::LookupType::NoResolution
+		).get());
 
 	if (!tcpServer.GetRef())
 	{
@@ -425,14 +431,4 @@ static InitFunction initFunction([]()
 		});
 	});
 });
-
-void* operator new[](size_t size, const char* pName, int flags, unsigned debugFlags, const char* file, int line)
-{
-	return ::operator new[](size);
-}
-
-void* operator new[](size_t size, size_t alignment, size_t alignmentOffset, const char* pName, int flags, unsigned debugFlags, const char* file, int line)
-{
-	return ::operator new[](size);
-}
 #endif

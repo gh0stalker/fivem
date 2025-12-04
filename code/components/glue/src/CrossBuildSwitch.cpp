@@ -1,29 +1,33 @@
 #include <StdInc.h>
 #include <CefOverlay.h>
 #include <NetLibrary.h>
+#include <Utils.h>
 #include <json.hpp>
 
 #include <CrossBuildRuntime.h>
+#include <PureModeState.h>
+#include <PoolSizesState.h>
 
 #include <CommCtrl.h>
 
 #include "../../client/launcher/InstallerExtraction.h"
 
 int gameCacheTargetBuild;
+bool gameCacheReplaceExecutable;
 
 extern NetLibrary* netLibrary;
 extern std::map<std::string, std::string> UpdateGameCache();
 
-extern void RestartGameToOtherBuild(int build);
+extern void RestartGameToOtherBuild(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable);
 
 static std::function<void(const std::string&)> g_submitFn;
 static bool g_cancelable;
 static bool g_canceled;
 static bool g_hadError;
 
-void PerformBuildSwitch(int build);
+void PerformStateSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable);
 
-void InitializeBuildSwitch(int build)
+void InitializeBuildSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
 {
 	if (nui::HasMainUI())
 	{
@@ -31,23 +35,36 @@ void InitializeBuildSwitch(int build)
 		g_cancelable = true;
 		g_hadError = false;
 
+		std::string currentPoolSizesIncreaseSetting = "";
+		if (!fx::PoolSizeManager::GetIncreaseRequest().empty())
+		{
+			currentPoolSizesIncreaseSetting = nlohmann::json(fx::PoolSizeManager::GetIncreaseRequest()).dump();
+		}
+
 		auto j = nlohmann::json::object({
 			{ "build", build },
+			{ "pureLevel", pureLevel },
+			{ "poolSizesIncrease", ToNarrow(poolSizesIncreaseSetting) },
+			{ "replaceExecutable", replaceExecutable },
+			{ "currentBuild", xbr::GetRequestedGameBuild() },
+			{ "currentPureLevel", fx::client::GetPureLevel() },
+			{ "currentPoolSizesIncrease", std::move(currentPoolSizesIncreaseSetting) },
+			{ "currentReplaceExecutable", xbr::GetReplaceExecutable() }
 		});
 
 		nui::PostFrameMessage("mpMenu", fmt::sprintf(R"({ "type": "connectBuildSwitchRequest", "data": %s })", j.dump()));
 
-		g_submitFn = [build](const std::string& action)
+		g_submitFn = [build, pureLevel, poolSizesIncreaseSetting = std::move(poolSizesIncreaseSetting), replaceExecutable](const std::string& action)
 		{
 			if (action == "ok")
 			{
-				PerformBuildSwitch(build);
+				PerformStateSwitch(build, pureLevel, std::move(poolSizesIncreaseSetting), replaceExecutable);
 			}
 		};
 	}
 }
 
-void PerformBuildSwitch(int build)
+void PerformStateSwitch(int build, int pureLevel, std::wstring poolSizesIncreaseSetting, bool replaceExecutable)
 {
 	if (gameCacheTargetBuild != 0)
 	{
@@ -55,16 +72,17 @@ void PerformBuildSwitch(int build)
 	}
 
 	gameCacheTargetBuild = build;
+	gameCacheReplaceExecutable = replaceExecutable;
 
-	std::thread([]()
+	std::thread([pureLevel, poolSizesIncreaseSetting = std::move(poolSizesIncreaseSetting), replaceExecutable]()
 	{
 		// let's try to update the game cache
 		if (!UpdateGameCache().empty())
 		{
-			RestartGameToOtherBuild(gameCacheTargetBuild);
+			RestartGameToOtherBuild(gameCacheTargetBuild, pureLevel, std::move(poolSizesIncreaseSetting), replaceExecutable);
 		}
 		// display a generic error if we failed
-		else if (!g_hadError)
+		else if (!g_hadError && !g_canceled)
 		{
 			netLibrary->OnConnectionError("Changing game build failed: An unknown error occurred");
 		}
@@ -105,6 +123,8 @@ void TaskDialogEmulated(TASKDIALOGCONFIG* config, int* button, void*, void*)
 
 		g_buttonEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 		WaitForSingleObject(g_buttonEvent, INFINITE);
+		CloseHandle(g_buttonEvent);
+		g_buttonEvent = nullptr;
 
 		*button = g_buttonResponse ? IDYES : IDNO;
 	}
@@ -169,6 +189,12 @@ static double g_percentage;
 
 static void UpdateProgressUX()
 {
+	// don't submit more progress when we're canceled
+	if (g_canceled)
+	{
+		return;
+	}
+
 	auto text = fmt::sprintf("%s (%.0f%s)\n%s", g_topText, round(g_percentage), "%", g_bottomText);
 
 	netLibrary->OnConnectionProgress(text, 0, 100, true);
@@ -194,4 +220,9 @@ void UI_DisplayError(const wchar_t* error)
 
 	g_hadError = true;
 	netLibrary->OnConnectionError(fmt::sprintf("Changing game build failed: %s", ToNarrow(error)).c_str());
+}
+
+void UI_SetSnailState(bool)
+{
+
 }

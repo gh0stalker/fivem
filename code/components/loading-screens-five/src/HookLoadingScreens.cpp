@@ -5,11 +5,10 @@
 
 #include <stack>
 
-#include <LaunchMode.h>
-
 #include <nutsnbolts.h>
 #include <CefOverlay.h>
 #include <DrawCommands.h>
+#include "CoreConsole.h"
 
 #include <mmsystem.h>
 
@@ -147,7 +146,7 @@ int InstrumentFunction(void* fn, std::vector<void*>& outFunctions)
 		{
 			break;
 		}
-
+#ifdef GTA_FIVE // because rdr have WrapLevelLoad hook ):
 		// if this is a 32-bit JMP, break as well
 		if (ud_insn_mnemonic(&ud) == UD_Ijmp)
 		{
@@ -160,7 +159,7 @@ int InstrumentFunction(void* fn, std::vector<void*>& outFunctions)
 				break;
 			}
 		}
-
+#endif
 		if (ud_insn_mnemonic(&ud) == UD_Icall)
 		{
 			// get the first operand
@@ -198,7 +197,11 @@ struct DataFileEntry
 	bool flag2; // 153
 	bool flag3; // 154
 	bool disabled; // 155
+#ifdef GTA_FIVE
 	char pad2[12];
+#elif IS_RDR3
+	char pad2[20];
+#endif
 };
 
 class CDataFileMgr;
@@ -209,7 +212,11 @@ class CDataFileMgr
 {
 private:
 	atArray<DataFileEntry> m_entries;
+#ifdef GTA_FIVE
 	intptr_t pad[48 / 8];
+#elif IS_RDR3
+	intptr_t pad[56 / 8];
+#endif
 
 	DataFileEntry m_emptyEntry;
 
@@ -289,11 +296,20 @@ int CountRelevantDataFileEntries()
 	return g_instrumentedFuncs;
 }
 
-static void(*dataFileMgr__loadDefDat)(void*, const char*, bool);
+
+
+void (*g_updateContentArray)(void*);
 
 int dlcIdx = -1;
+int extraContentWrapperIdx = std::numeric_limits<int>::max();
+void** g_extraContentManagerLocation;
 std::map<uint32_t, std::string> g_dlcNameMap;
 
+char g_extraContentManagerContentOffset;
+uint32_t g_mountableContentSize;
+uint32_t g_mountableContentFlagsOffset;
+#ifdef GTA_FIVE
+static void (*dataFileMgr__loadDefDat)(void*, const char*, bool);
 static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 {
 	rage::InitFunctionData ifd;
@@ -310,7 +326,7 @@ static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 
 	if (dlcIdx >= 0)
 	{
-		rage::OnInitFunctionInvoking(rage::INIT_SESSION, 14 + dlcIdx, ifd);
+		rage::OnInitFunctionInvoking(rage::INIT_SESSION, extraContentWrapperIdx + dlcIdx, ifd);
 
 		dlcIdx++;
 	}
@@ -322,13 +338,54 @@ static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled)
 		rage::OnInitFunctionInvoked(rage::INIT_SESSION, ifd);
 	}
 }
+#elif IS_RDR3
+static void (*dataFileMgr__loadDefDat)(void*, const char*, bool, void*);
+static void LoadDefDats(void* dataFileMgr, const char* name, bool enabled, void* unk)
+{
+	rage::InitFunctionData ifd;
+	ifd.funcHash = HashRageString(name);
+	ifd.initOrder = 3;
+	ifd.shutdownOrder = 42;
+	ifd.initFunction = [](int) {
+	};
 
+	std::string nameStripped = name;
+	nameStripped = nameStripped.substr(0, nameStripped.find("CRC"));
+	g_dlcNameMap.emplace(ifd.funcHash, nameStripped);
+
+	if (dlcIdx >= 0)
+	{
+		rage::OnInitFunctionInvoking(rage::INIT_SESSION, extraContentWrapperIdx + dlcIdx, ifd);
+
+		dlcIdx++;
+	}
+
+	dataFileMgr__loadDefDat(dataFileMgr, name, enabled, unk);
+
+	if (dlcIdx >= 0)
+	{
+		rage::OnInitFunctionInvoked(rage::INIT_SESSION, ifd);
+	}
+}
+#endif
+#ifdef GTA_FIVE
 static int* loadingScreenState;
-
+#endif
 extern bool g_doDrawBelowLoadingScreens;
 
 static HookFunction hookFunction([] ()
 {
+#ifdef GTA_FIVE
+	{
+		g_extraContentManagerLocation = hook::get_address<void**>(hook::get_pattern("79 91 C8 BC E8 ? ? ? ? 48 8D", -0x16));
+
+		g_extraContentManagerContentOffset = *(char*)hook::get_pattern<char>("48 83 C1 ? 89 82", 3);
+		g_mountableContentSize = *(uint32_t*)hook::get_pattern<char>("48 69 C0 ? ? ? ? 48 03 43 ? F6 80", 3);
+		g_mountableContentFlagsOffset = *(uint32_t*)hook::get_pattern<char>("8A 81 ? ? ? ? 41 BC ? ? ? ? 48 8B F9", 2);
+
+		g_updateContentArray = (void(*)(void*))hook::get_call(hook::get_pattern("E8 ? ? ? ? 44 8A C3 B2"));
+	}
+
 	hook::jump(hook::get_pattern("44 8B D8 4D 63 C8 4C 3B C8 7D 33 8B", -0x16), &CDataFileMgr::FindNextEntry);
 	hook::jump(hook::get_pattern("4C 8B C9 45 85 C0 79 05 45 33 C0 EB 07 44", -0x0B), &CDataFileMgr::FindPreviousEntry);
 
@@ -338,11 +395,39 @@ static HookFunction hookFunction([] ()
 	InstrumentFunction<LoadScreenFuncs>(functions[4], functions);
 
 	// don't play game loading music
-	if (!CfxIsSinglePlayer())
-	{
-		hook::return_function(hook::get_pattern("41 B8 97 96 11 96", -0x9A));
-	}
+	hook::return_function(hook::get_pattern("41 B8 97 96 11 96", -0x9A));
 
+	auto hookPoint = hook::pattern("E8 ? ? ? ? 48 8B 1D ? ? ? ? 41 8B F7").count(1).get(0).get<void>(0);
+	hook::set_call(&dataFileMgr__loadDefDat, hookPoint);
+	hook::call(hookPoint, LoadDefDats); // Call the new function to load the handling files
+
+#elif IS_RDR3
+	{
+		g_extraContentManagerLocation = hook::get_address<void**>(hook::get_pattern("48 8B 0D ? ? ? ? 44 8A C6 89 45 ? E8 ? ? ? ? 48 8B 0D", 0x3));
+		g_extraContentManagerContentOffset = *(char*)hook::get_pattern<char>("48 83 C1 ? 03 D5", 3);
+		g_mountableContentSize = *(uint32_t*)hook::get_pattern<char>("48 69 C8 ? ? ? ? 48 03 4F ? F6 81 ? ? ? ? ? 74 ? 8B 81", 3);
+		g_mountableContentFlagsOffset = *(uint32_t*)hook::get_pattern<char>("8A 81 ? ? ? ? 41 BC ? ? ? ? 48 8B F9", 2);
+
+		g_updateContentArray = (void (*)(void*))hook::get_call(hook::get_pattern("E8 ? ? ? ? 44 8A C3 B2 ? 48 8B CF E8 ? ? ? ? 48 8B 5C 24"));
+
+	}
+	// caled one time lol type 23 which its CTimecycle
+	hook::jump(hook::get_pattern("44 8B 82 ? ? ? ? 44 0F B7 51"), &CDataFileMgr::FindNextEntry);
+
+	std::vector<void*> functions;
+	InstrumentFunction<LoadScreenFuncs>(hook::get_call(hook::get_pattern("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? 48 8D 0D ? ? ? ? E8 ? ? ? ? 8B 1D")), functions);
+
+	InstrumentFunction<LoadScreenFuncs>(functions[1], functions);
+	InstrumentFunction<LoadScreenFuncs>(functions[2], functions);
+
+	// don't play game loading music
+	hook::return_function(hook::get_pattern("41 BC ? ? ? ? 45 8B F0", -0x21));
+
+	auto hookPoint = hook::pattern("E8 ? ? ? ? 48 8B 1D ? ? ? ? 41 8B F7").count(1).get(0).get<void>(0);
+	hook::set_call(&dataFileMgr__loadDefDat, hookPoint);
+	hook::call(hookPoint, LoadDefDats); // Call the new function to load the handling files
+#endif
+#ifdef GTA_FIVE
 	// loading screen state 10 draws postFX every frame, which will make for a lot of unneeded GPU load below NUI
 	loadingScreenState = hook::get_address<int*>(hook::get_pattern("83 3D ? ? ? ? 05 75 ? 8B"), 2, 7);
 
@@ -410,12 +495,9 @@ static HookFunction hookFunction([] ()
 	// don't use it tends to break the profiler output
 	//InstrumentFunction<ProfilerFuncs>(hook::get_pattern("BF 01 00 00 00 84 C0 75 23 38 1D ? ? ? ? 75", -0x51), proFunctions);
 #endif
-
-	auto hookPoint = hook::pattern("E8 ? ? ? ? 48 8B 1D ? ? ? ? 41 8B F7").count(1).get(0).get<void>(0);
-	hook::set_call(&dataFileMgr__loadDefDat, hookPoint);
-	hook::call(hookPoint, LoadDefDats); //Call the new function to load the handling files
+#endif
 });
-
+#ifdef GTA_FIVE
 static hook::cdecl_stub<void(float)> _drawLoadingSpinner([]()
 {
 	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 83 3D ? ? ? ? 00 74 0C E8 ? ? ? ? EB 05"));
@@ -447,7 +529,7 @@ static HookFunction hookFunctionSpinner([]()
 
 	// spinner setup deps
 	{
-		auto location = hook::get_pattern("B1 01 E8 ? ? ? ? 48 8D 0D ? ? ? ? 48 8B", 2);
+		auto location = hook::get_pattern("B1 01 E8 ? ? ? ? 48 8D 0D ? ? ? ? 48 8B ? E8", 2);
 		hook::set_call(&setupBusySpinner, location);
 	}
 
@@ -464,12 +546,21 @@ static HookFunction hookFunctionSpinner([]()
 
 static InitFunction initFunction([] ()
 {
+	static bool showBusySpinner = true;
+	static ConVar showBusySpinnerConVar("sv_showBusySpinnerOnLoadingScreen", ConVar_Replicated, true, &showBusySpinner);
+
 	OnLookAliveFrame.Connect([]()
 	{
-		if (nui::HasFrame("loadingScreen"))
+		if (nui::HasFrame("loadingScreen") && showBusySpinner)
 		{
 			if (*g_scaleformMgr)
 			{
+				if (GetCurrentThreadId() != g_mainThreadId)
+				{
+					trace("Error: BusySpinner update called from non-main thread!\n");
+					return;
+				}
+
 				setupBusySpinner(1);
 				*spinnerDep = true;
 				updateBusySpinner();
@@ -481,7 +572,7 @@ static InitFunction initFunction([] ()
 		
 	OnPostFrontendRender.Connect([]()
 	{
-		if (nui::HasFrame("loadingScreen"))
+		if (nui::HasFrame("loadingScreen") && showBusySpinner)
 		{
 			*g_isPendingGFx = true;
 
@@ -496,3 +587,4 @@ static InitFunction initFunction([] ()
 		}
 	}, 5000);
 });
+#endif

@@ -32,14 +32,26 @@ static int (*g_origHandleObjectLoad)(streaming::Manager*, int, int, int*, int, i
 static std::unordered_map<std::string, std::tuple<rage::fiDevice*, uint64_t, uint64_t>> g_handleMap;
 static std::unordered_map<std::string, int> g_failures;
 
-hook::cdecl_stub<rage::fiCollection*()> getRawStreamer([]()
+struct SemaAwaiter
 {
-	return hook::get_call(hook::get_pattern("48 8B D3 4C 8B 00 48 8B C8 41 FF 90 ? 01 00 00", -5));
-});
+	bool operator()(void* sema) const
+	{
+		return WaitForSingleObject(sema, 0) == WAIT_OBJECT_0;
+	}
+};
 
-static bool ProcessHandler(HANDLE sema, char* a1)
+struct ByteAwaiter
 {
-	bool isSignaled = WaitForSingleObject(sema, 0) == WAIT_OBJECT_0;
+	bool operator()(void* sema) const
+	{
+		return *((uint8_t*)sema + 0x1848);
+	}
+};
+
+template<typename Awaiter>
+static bool ProcessHandler(void* sema, char* a1)
+{
+	bool isSignaled = Awaiter()(sema);
 
 	if (!isSignaled)
 	{
@@ -68,7 +80,7 @@ static bool ProcessHandler(HANDLE sema, char* a1)
 	return isSignaled;
 }
 
-static void Hook_StreamingSema()
+static void Hook_StreamingSema2699()
 {
 	{
 		static struct : jitasm::Frontend
@@ -77,7 +89,53 @@ static void Hook_StreamingSema()
 			{
 				mov(rdx, rbx);
 
-				mov(rax, (uint64_t)&ProcessHandler);
+				mov(rax, (uint64_t)&ProcessHandler<ByteAwaiter>);
+				jmp(rax);
+			}
+		} weirdStub;
+
+		// rage::strStreamingLoader::ProcessStreamFiles
+		auto location = hook::get_pattern("8A 81 48 18 00 00 84 C0 0F 84 E5");
+		hook::nop(location, 6);
+		hook::call(location, weirdStub.GetCode());
+	}
+
+	{
+		static struct : jitasm::Frontend
+		{
+			virtual void InternalMain() override
+			{
+				mov(rdx, rsi);
+
+				mov(rax, (uint64_t)&ProcessHandler<ByteAwaiter>);
+				jmp(rax);
+			}
+		} weirdStub;
+
+		// rage::strStreamingLoader::Flush
+		auto location = hook::get_pattern("8A 81 48 18 00 00 84 C0 0F 84 10 01");
+		hook::nop(location, 6);
+		hook::call(location, weirdStub.GetCode());
+	}
+}
+
+static void Hook_StreamingSema()
+{
+	// 2699+ uses a byte instead of a sema, so needs its own patch
+	if (xbr::IsGameBuildOrGreater<2699>())
+	{
+		Hook_StreamingSema2699();
+		return;	
+	}
+
+	{
+		static struct : jitasm::Frontend
+		{
+			virtual void InternalMain() override
+			{
+				mov(rdx, rbx);
+
+				mov(rax, (uint64_t)&ProcessHandler<SemaAwaiter>);
 				jmp(rax);
 			}
 		} weirdStub;
@@ -93,7 +151,7 @@ static void Hook_StreamingSema()
 			{
 				mov(rdx, rsi);
 
-				mov(rax, (uint64_t)&ProcessHandler);
+				mov(rax, (uint64_t)&ProcessHandler<SemaAwaiter>);
 				jmp(rax);
 			}
 		} weirdStub;
@@ -164,7 +222,7 @@ static void ProcessRemoval()
 	}
 }
 
-static bool IsHandleCache(uint32_t handle, std::string* outFileName)
+bool IsHandleCache(uint32_t handle, std::string* outFileName)
 {
 	if (outFileName)
 	{
@@ -173,9 +231,9 @@ static bool IsHandleCache(uint32_t handle, std::string* outFileName)
 
 	rage::fiCollection* collection = nullptr;
 
-	if ((handle >> 16) == 0)
+	if (streaming::IsRawHandle(handle))
 	{
-		collection = getRawStreamer();
+		collection = streaming::GetRawStreamerByIndex(streaming::GetCollectionIndex(handle));
 	}
 
 	bool isCache = false;
@@ -185,7 +243,7 @@ static bool IsHandleCache(uint32_t handle, std::string* outFileName)
 		char fileNameBuffer[1024];
 		strcpy(fileNameBuffer, "CfxRequest");
 
-		collection->GetEntryNameToBuffer(handle & 0xFFFF, fileNameBuffer, sizeof(fileNameBuffer));
+		collection->GetEntryNameToBuffer(streaming::GetEntryIndex(handle), fileNameBuffer, sizeof(fileNameBuffer));
 
 		if (strncmp(fileNameBuffer, "cache:/", 7) == 0)
 		{
@@ -377,23 +435,9 @@ static uint32_t NoLSN(void* streamer, uint16_t idx)
 	return idx;
 }
 
-extern int* g_archetypeStreamingIndex;
-
-static auto GetArchetypeModule()
-{
-	auto mgr = streaming::Manager::GetInstance();
-	return mgr->moduleMgr.modules[*g_archetypeStreamingIndex];
-}
-
 static auto GetModelIndex(rage::fwArchetype* archetype)
 {
-	return *(uint16_t*)((char*)archetype + 106);
-}
-
-static auto GetStrIndexFromArchetype(rage::fwArchetype* archetype)
-{
-	auto modelIndex = GetModelIndex(archetype);
-	return GetArchetypeModule()->baseIdx + modelIndex;
+	return rage::fwArchetypeManager::LookupModelId(archetype).modelIndex;
 }
 
 static std::mutex strRefCountsMutex;
@@ -407,11 +451,29 @@ static bool CEntity_SetModelIdWrap(rage::fwEntity* entity, rage::fwModelId* id)
 
 	if (auto archetype = entity->GetArchetype())
 	{
+		// Ensure any archetypes used by scripted entities aren't prematurely unloaded.
+		// Archetypes can be protected in various ways, i.e:
+		// * Being permanent (so are never unloaded)
+		// * Being used to fully initialize the entity (creating drawable/frag/etc)
+		// * Calling REQUEST_MODEL (which protects the archetype until a matching call to SetModelAsNoLongerNeeded)
+		// * Assigning a script handle to the entity (which protects the archetype until the entity is destroyed)
+		//
+		// This is all fine for local entites, but a problem for networked ones, since these protections will not necessarily apply for other clients.
+		// In certain conditions, it is possible for the archetype of a networked entity to be unloaded after setting its model.
+		// This causes a bunch of weird crashes due to accessing an invalid archetype pointer.
+		// 
+		// TODO: Maybe consider other GetType() / GetOwnedBy() values?
+		// Technically this might not only apply to scripted entities, but I think that's generally where the main issue comes from.
+		if (entity->GetOwnedBy() == 4 /*ENTITY_OWNEDBY_SCRIPT*/)
+		{
+			entity->ProtectStreamedArchetype();
+		}
+
 		auto mgr = streaming::Manager::GetInstance();
 
 		// TODO: recurse?
 		uint32_t outDeps[150];
-		auto module = GetArchetypeModule();
+		auto module = rage::fwArchetypeManager::GetStreamingModule();
 		auto numDeps = module->GetDependencies(GetModelIndex(archetype), outDeps, std::size(outDeps));
 
 		for (size_t depIdx = 0; depIdx < numDeps; depIdx++)
@@ -446,43 +508,26 @@ static bool CEntity_SetModelIdWrap(rage::fwEntity* entity, rage::fwModelId* id)
 	return rv;
 }
 
-static hook::thiscall_stub<void(void*, const rage::fwModelId&)> _fwEntity_SetModelId([]()
-{
-	return hook::get_pattern("E8 ? ? ? ? 45 33 D2 3B 05", -12);
-});
-
 static void (*g_orig_fwEntity_Dtor)(void* entity);
 
 static void fwEntity_DtorWrap(rage::fwEntity* entity)
 {
 	if (auto archetype = entity->GetArchetype())
 	{
-		auto midx = GetModelIndex(archetype);
+		auto mgr = streaming::Manager::GetInstance();
 
-		// check if the archetype is actually valid for this model index
-		// (some bad asset setups lead to a corrupted archetype list)
-		//
-		// to do this, we use a little hack to not have to manually read the archetype list:
-		// the base rage::fwEntity::SetModelId doesn't do anything other than setting (rcx + 32)
-		// to the resolved archetype, or nullptr if none
-		rage::fwModelId modelId;
-		modelId.id = midx;
+		auto model = GetModelIndex(archetype);
 
-		void* fakeEntity[40 / 8] = { 0 };
-		_fwEntity_SetModelId(fakeEntity, modelId);
-
-		// not the same archetype - bail out
-		if (fakeEntity[4] != archetype)
+		// Check if this archetype is still valid (this should only fail during shutdown).
+		if (model == 0xFFFF)
 		{
 			return g_orig_fwEntity_Dtor(entity);
 		}
 
-		auto mgr = streaming::Manager::GetInstance();
-
 		// TODO: recurse?
 		uint32_t outDeps[150];
-		auto module = GetArchetypeModule();
-		auto numDeps = module->GetDependencies(midx, outDeps, std::size(outDeps));
+		auto module = rage::fwArchetypeManager::GetStreamingModule();
+		auto numDeps = module->GetDependencies(model, outDeps, std::size(outDeps));
 
 		for (size_t depIdx = 0; depIdx < numDeps; depIdx++)
 		{
@@ -542,7 +587,7 @@ static HookFunction hookFunction([] ()
 
 	// redirect pgStreamer::Read for custom streaming reads
 	{
-		auto location = hook::get_pattern("45 8B CC 48 89 7C 24 28 48 89 44 24 20 E8", 13);
+		auto location = hook::get_pattern("48 8D 05 ? ? ? ? 45 8B ? 48 89 7C 24 28 48 89 44 24 20 E8", 20);
 		hook::set_call(&g_origPgStreamerRead, location);
 		hook::call(location, pgStreamerRead);
 	}
@@ -551,7 +596,7 @@ static HookFunction hookFunction([] ()
 
 	// rage::strStreamingLoader::CancelRequest hook (deprioritize canceled requests)
 	{
-		auto location = hook::get_pattern("B9 00 40 00 00 33 ED 48", -0x29);
+		auto location = hook::get_pattern("B9 00 40 00 00 33 ED 48", (xbr::IsGameBuildOrGreater<2699>()) ? -0x21: -0x29);
 		MH_CreateHook(location, CancelRequestWrap, (void**)&g_origCancelRequest);
 		MH_EnableHook(location);
 	}

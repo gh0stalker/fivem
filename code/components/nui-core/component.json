@@ -3,8 +3,10 @@
 	"version": "0.1.0",
 	"dependencies": [
 		"fx[2]",
+		"net:base",
 		"vfs:core",
-		"vendor:minhook"
+		"vendor:minhook",
+		"legitimacy"
 	],
 	"provides": []
 }

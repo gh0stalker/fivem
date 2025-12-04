@@ -284,7 +284,8 @@ namespace CitizenFX.Core
 
 		public static void AddDelay(int delay, AsyncCallback callback, string name = null)
 		{
-			ms_delays.Add(Tuple.Create(DateTime.UtcNow.AddMilliseconds(delay), callback, name));
+			lock (ms_delays)
+				ms_delays.Add(Tuple.Create(DateTime.UtcNow.AddMilliseconds(delay), callback, name));
 		}
 
 		public static void TickGlobal()
@@ -312,30 +313,33 @@ namespace CitizenFX.Core
 				using (var scope = new ProfilerScope(() => "c# deferredDelay"))
 				{
 					var now = DateTime.UtcNow;
-					var count = ms_delays.Count;
-
-					for (int delayIdx = 0; delayIdx < count; delayIdx++)
+					lock (ms_delays)
 					{
-						var delay = ms_delays[delayIdx];
+						var count = ms_delays.Count;
 
-						if (now >= delay.Item1)
+						for (int delayIdx = 0; delayIdx < count; delayIdx++)
 						{
-							using (var inScope = new ProfilerScope(() => delay.Item3))
-							{
-								try
-								{
-									BaseScript.CurrentName = delay.Item3;
-									delay.Item2(new DummyAsyncResult());
-								}
-								finally
-								{
-									BaseScript.CurrentName = null;
-								}
-							}
+							var delay = ms_delays[delayIdx];
 
-							ms_delays.RemoveAt(delayIdx);
-							delayIdx--;
-							count--;
+							if (now >= delay.Item1)
+							{
+								using (var inScope = new ProfilerScope(() => delay.Item3))
+								{
+									try
+									{
+										BaseScript.CurrentName = delay.Item3;
+										delay.Item2(new DummyAsyncResult());
+									}
+									finally
+									{
+										BaseScript.CurrentName = null;
+									}
+								}
+
+								ms_delays.RemoveAt(delayIdx);
+								delayIdx--;
+								count--;
+							}
 						}
 					}
 				}
@@ -473,7 +477,7 @@ namespace CitizenFX.Core
 		private int m_retvalBufferSize;
 
 		[SecuritySafeCritical]
-		public void CallRef(int refIndex, byte[] argsSerialized, out IntPtr retvalSerialized, out int retvalSize)
+		public void CallRef(int refIndex, byte[] argsSerialized, out IntPtr retval)
 		{
 			// not using using statements here as old Mono on Linux build doesn't know of these
 #if IS_FXSERVER
@@ -492,33 +496,16 @@ namespace CitizenFX.Core
 
 					if (retvalData != null)
 					{
-						if (m_retvalBuffer == IntPtr.Zero)
-						{
-							m_retvalBuffer = Marshal.AllocHGlobal(32768);
-							m_retvalBufferSize = 32768;
-						}
-
-						if (m_retvalBufferSize < retvalData.Length)
-						{
-							m_retvalBuffer = Marshal.ReAllocHGlobal(m_retvalBuffer, new IntPtr(retvalData.Length));
-							m_retvalBufferSize = retvalData.Length;
-						}
-
-						Marshal.Copy(retvalData, 0, m_retvalBuffer, retvalData.Length);
-
-						retvalSerialized = m_retvalBuffer;
-						retvalSize = retvalData.Length;
+						retval = GameInterface.MakeMemoryBuffer(retvalData);
 					}
 					else
 					{
-						retvalSerialized = IntPtr.Zero;
-						retvalSize = 0;
+						retval = IntPtr.Zero;
 					}
 				}
 				catch (Exception e)
 				{
-					retvalSerialized = IntPtr.Zero;
-					retvalSize = 0;
+					retval = IntPtr.Zero;
 
 					PrintError($"reference call", e.InnerException ?? e);
 				}
@@ -574,7 +561,36 @@ namespace CitizenFX.Core
 			ScriptHost.SubmitBoundaryEnd(null, 0);
 
 			var stackTrace = new StackTrace(what, true);
-			var frames = stackTrace.GetFrames()
+
+#if IS_FXSERVER
+			var stackFrames = stackTrace.GetFrames();
+#else
+			IEnumerable<StackFrame> stackFrames;
+
+			// HACK: workaround to iterate inner traces ourselves.
+			// TODO: remove this once we've updated libraries
+			var fieldCapturedTraces = typeof(StackTrace).GetField("captured_traces", BindingFlags.NonPublic | BindingFlags.Instance);
+			if (fieldCapturedTraces != null)
+			{
+				var captured_traces = (StackTrace[])fieldCapturedTraces.GetValue(stackTrace);
+
+				// client's mscorlib is missing this piece of code, copied from https://github.com/mono/mono/blob/ef848cfa83ea16b8afbd5b933968b1838df19505/mcs/class/corlib/System.Diagnostics/StackTrace.cs#L181
+				var accum = new List<StackFrame>();
+				foreach (var t in captured_traces ?? Array.Empty<StackTrace>())
+				{
+					for (int i = 0; i < t.FrameCount; i++)
+						accum.Add(t.GetFrame(i));
+				}
+
+				accum.AddRange(stackTrace.GetFrames());
+
+				stackFrames = accum;
+			}
+			else
+				stackFrames = stackTrace.GetFrames();
+#endif
+
+			var frames = stackFrames
 				.Select(a => new
 				{
 					Frame = a,
@@ -621,6 +637,7 @@ namespace CitizenFX.Core
 			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryStartMethod;
 			private FastMethod<Action<IntPtr, IntPtr, int>> submitBoundaryEndMethod;
 			private FastMethod<Func<IntPtr, IntPtr, int>> getLastErrorTextMethod;
+			private FastMethod<Func<IntPtr, IntPtr, IntPtr, int, IntPtr, int>> invokeFunctionReference;
 
 			[SecuritySafeCritical]
 			public DirectScriptHost(IntPtr hostPtr)
@@ -635,6 +652,7 @@ namespace CitizenFX.Core
 				submitBoundaryStartMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryStartMethod), hostPtr, 5);
 				submitBoundaryEndMethod = new FastMethod<Action<IntPtr, IntPtr, int>>(nameof(submitBoundaryEndMethod), hostPtr, 6);
 				getLastErrorTextMethod = new FastMethod<Func<IntPtr, IntPtr, int>>(nameof(getLastErrorTextMethod), hostPtr, 7);
+				invokeFunctionReference = new FastMethod<Func<IntPtr, IntPtr, IntPtr, int, IntPtr, int>>(nameof(invokeFunctionReference), hostPtr, 8);
 			}
 
 			[SecuritySafeCritical]
@@ -790,6 +808,19 @@ namespace CitizenFX.Core
 				}
 
 				return retVal;
+			}
+
+			public unsafe int InvokeFunctionReference(string refId, byte[] argsSerialized, int argsSize, IntPtr ret)
+			{
+				var refIdBytes = Encoding.UTF8.GetBytes(refId);
+
+				fixed (byte* refIdBytesFixed = refIdBytes)
+				{
+					fixed (byte* argsSerializedStart = argsSerialized)
+					{
+						return invokeFunctionReference.method(hostPtr, new IntPtr(refIdBytesFixed), new IntPtr(argsSerializedStart), argsSize, ret);
+					}
+				}
 			}
 		}
 

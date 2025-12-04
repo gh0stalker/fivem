@@ -14,6 +14,7 @@ static constexpr const size_t kGamePlayerCap =
 
 #include <Client.h>
 #include <GameServer.h>
+#include <CrossBuildRuntime.h>
 
 #include <ServerInstanceBase.h>
 #include <ServerTime.h>
@@ -47,11 +48,17 @@ static constexpr const size_t kGamePlayerCap =
 
 #include <StateBagComponent.h>
 
+#include <net/NetObjEntityType.h>
+
+#ifdef STATE_FIVE
+// For GTA5, if the feature flag for new build system is set, we use the latest stable build executable even if lower version is enforced.
+// The different sv_enforceGameBuild behaviors is achieved on the client side by loading different DLC sets with IsDlcIncludedInBuild.
+
 inline bool Is2060()
 {
 	static bool value = ([]()
 	{
-		return fx::GetEnforcedGameBuildNumber() >= 2060;
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2060) || fx::GetEnforcedGameBuildNumber() >= 2060;
 	})();
 
 	return value;
@@ -61,7 +68,7 @@ inline bool Is2189()
 {
 	static bool value = ([]()
 	{
-		return fx::GetEnforcedGameBuildNumber() >= 2189;
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2189) || fx::GetEnforcedGameBuildNumber() >= 2189;
 	})();
 
 	return value;
@@ -71,7 +78,7 @@ inline bool Is2372()
 {
 	static bool value = ([]()
 	{
-		return fx::GetEnforcedGameBuildNumber() >= 2372;
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2372) || fx::GetEnforcedGameBuildNumber() >= 2372;
 	})();
 
 	return value;
@@ -81,11 +88,112 @@ inline bool Is2545()
 {
 	static bool value = ([]()
 	{
-		return fx::GetEnforcedGameBuildNumber() >= 2545;
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2545) || fx::GetEnforcedGameBuildNumber() >= 2545;
 	})();
 
 	return value;
 }
+
+inline bool Is2612()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2612) || fx::GetEnforcedGameBuildNumber() >= 2612;
+	})();
+
+	return value;
+}
+
+inline bool Is2699()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2699) || fx::GetEnforcedGameBuildNumber() >= 2699;
+	})();
+
+	return value;
+}
+
+inline bool Is2802()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2802) || fx::GetEnforcedGameBuildNumber() >= 2802;
+	})();
+
+	return value;
+}
+
+inline bool Is2944()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 2944) || fx::GetEnforcedGameBuildNumber() >= 2944;
+	})();
+
+	return value;
+}
+
+inline bool Is3095()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 3095) || fx::GetEnforcedGameBuildNumber() >= 3095;
+	})();
+
+	return value;
+}
+
+inline bool Is3258()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 3258) || fx::GetEnforcedGameBuildNumber() >= 3258;
+	})();
+
+	return value;
+}
+
+inline bool Is3323()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 3323) || fx::GetEnforcedGameBuildNumber() >= 3323;
+	})();
+
+	return value;
+}
+
+inline bool Is3407()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= 3407) || fx::GetEnforcedGameBuildNumber() >= 3407;
+	})();
+
+	return value;
+}
+
+inline bool IsSummerUpdate25()
+{
+	static bool value = ([]()
+	{
+		return (!fx::GetReplaceExecutable() && xbr::GetDefaultGTA5Build() >= xbr::Build::Summer_2025) || fx::GetEnforcedGameBuildNumber() >= xbr::Build::Summer_2025;
+	})();
+
+	return value;
+}
+#elif defined(STATE_RDR3)
+inline bool Is1491()
+{
+	static bool value = ([]()
+	{
+		return fx::GetEnforcedGameBuildNumber() >= 1491;
+	})();
+
+	return value;
+}
+#endif
 
 template<typename T>
 inline constexpr T roundToWord(T val)
@@ -106,7 +214,7 @@ extern int m_ackTimeoutThreshold;
 
 namespace fx::sync
 {
-struct SyncParseState;
+struct SyncParseStateDynamic;
 struct SyncUnparseState;
 
 struct NodeBase;
@@ -146,14 +254,6 @@ struct CDoorScriptGameStateDataNodeData
 {
 	uint32_t doorSystemState;
 	bool holdOpen;
-};
-
-struct CHeliControlDataNodeData
-{
-	bool engineOff;
-
-	bool hasLandingGear;
-	uint32_t landingGearState;
 };
 
 struct CPlayerCameraNodeData
@@ -203,6 +303,10 @@ struct CPedGameStateNodeData
 
 	int curWeapon;
 
+	bool isHandcuffed;
+	bool actionModeEnabled;
+	bool isFlashlightOn;
+
 	inline CPedGameStateNodeData()
 		: lastVehicle(-1), lastVehicleSeat(-1), lastVehiclePedWasIn(-1)
 	{
@@ -247,48 +351,109 @@ struct CObjectGameStateNodeData
 
 struct CVehicleAppearanceNodeData
 {
-	int primaryColour;
-	int secondaryColour;
-	int pearlColour;
-	int wheelColour;
-	int interiorColour;
-	int dashboardColour;
+    int primaryColour;
+    int secondaryColour;
+    int pearlColour;
+    int wheelColour;
+    int interiorColour;
+    int dashboardColour;
 
-	bool isPrimaryColourRGB;
-	bool isSecondaryColourRGB;
+    bool isPrimaryColourRGB;
+    bool isSecondaryColourRGB;
 
-	int primaryRedColour;
-	int primaryGreenColour;
-	int primaryBlueColour;
+    int primaryRedColour;
+    int primaryGreenColour;
+    int primaryBlueColour;
 
-	int secondaryRedColour;
-	int secondaryGreenColour;
-	int secondaryBlueColour;
+    int secondaryRedColour;
+    int secondaryGreenColour;
+    int secondaryBlueColour;
 
-	int dirtLevel;
-	int extras;
-	int liveryIndex;
-	int roofLiveryIndex;
+	int envEffScale;
+	bool hasExtras;
 
-	int wheelChoice;
-	int wheelType;
+    int dirtLevel;
+    int extras;
+	bool hasCustomLivery;
+	bool hasCustomLiveryIndex;
+    int liveryIndex;
+    int roofLiveryIndex;
 
-	bool hasCustomTires;
+	bool hasCustomRoofLivery;
 
-	int windowTintIndex;
+	bool hasMod;
+	int kitMods[32];
 
-	int tyreSmokeRedColour;
-	int tyreSmokeGreenColour;
-	int tyreSmokeBlueColour;
+	bool hasToggleMods;
+	int toggleMods;
 
-	char plate[9];
+    int wheelChoice;
+    int wheelType;
 
-	int numberPlateTextIndex;
+	bool hasDifferentRearWheel;
+	int rearWheelChoice;
 
-	inline CVehicleAppearanceNodeData()
-	{
-		memset(plate, 0, sizeof(plate));
-	}
+	int kitIndex;
+    bool hasCustomTires;
+	bool hasWheelVariation1;
+
+	bool hasWindowTint;
+    int windowTintIndex;
+
+	bool hasTyreSmokeColours;
+
+    int tyreSmokeRedColour;
+    int tyreSmokeGreenColour;
+    int tyreSmokeBlueColour;
+
+	bool hasPlate;
+    char plate[9];
+
+    int numberPlateTextIndex;
+
+    int hornTypeHash;
+
+
+    // Badge related fields
+    bool hasEmblems;
+	bool isEmblem;
+	int emblemType;
+    int emblemId;
+	bool isSizeModified;
+    int emblemSize;
+    int txdName;
+    int textureName;
+
+	bool hasNeonLights;
+	bool hasVehicleBadge;
+
+    bool hasBadge[4];
+    int badgeBoneIndex[4];
+    int badgeAlpha[4];
+    float badgeOffsetX[4];
+    float badgeOffsetY[4];
+    float badgeOffsetZ[4];
+    float badgeDirX[4];
+    float badgeDirY[4];
+    float badgeDirZ[4];
+    float badgeSideX[4];
+    float badgeSideY[4];
+    float badgeSideZ[4];
+    float badgeSize[4];
+	
+    int neonRedColour;
+    int neonGreenColour;
+    int neonBlueColour;
+    bool neonLeftOn;
+    bool neonRightOn;
+    bool neonFrontOn;
+    bool neonBackOn;
+    bool isNeonSuppressed;
+
+    inline CVehicleAppearanceNodeData()
+    {
+        memset(plate, 0, sizeof(plate));
+    }
 };
 
 struct CVehicleHealthNodeData
@@ -298,6 +463,8 @@ struct CVehicleHealthNodeData
 	bool tyresFine;
 	int tyreStatus[1 << 4];
 	int bodyHealth;
+	int health;
+	int totalRepairs;
 };
 
 struct CVehicleGameStateNodeData
@@ -314,8 +481,8 @@ struct CVehicleGameStateNodeData
 	bool sirenOn;
 	int lockStatus;
 	int doorsOpen;
-	int doorPositions[1 << 7];
-	bool noLongerNeeded;
+	int doorPositions[7];
+	bool isStationary;
 	bool lightsOn;
 	bool highbeamsOn;
 	bool hasBeenOwnedByPlayer;
@@ -333,6 +500,7 @@ struct CVehicleGameStateNodeData
 struct CEntityOrientationNodeData
 {
 	compressed_quaternion<11> quat;
+	float rotX, rotY, rotZ;
 };
 
 struct CDummyObjectCreationNodeData
@@ -434,8 +602,37 @@ struct CDynamicEntityGameStateNodeData
 struct CTrainGameStateDataNodeData
 {
 	int engineCarriage;
+	int linkedToBackwardId;
+	int linkedToForwardId;
 
+	float distanceFromEngine;
+
+	int trainConfigIndex;
 	int carriageIndex;
+
+	int trackId;
+	float cruiseSpeed;
+
+	int trainState;
+
+	bool isEngine;
+	bool isCaboose;
+
+	bool isMissionTrain;
+
+	bool direction;
+
+	bool hasPassengerCarriages;
+
+	bool renderDerailed;
+
+	// 2372 {
+	bool allowRemovalByPopulation;
+	bool highPrecisionBlending;
+	bool stopAtStations;
+	// }
+
+	bool forceDoorsOpen;
 };
 
 struct CPlayerGameStateNodeData
@@ -471,12 +668,93 @@ struct CPlayerGameStateNodeData
 struct CHeliHealthNodeData
 {
 	int mainRotorHealth;
-	int tailRotorHealth;
+	int rearRotorHealth;
+
+	bool boomBroken;
+	bool canBoomBreak;
+	bool hasCustomHealth;
+
+	int bodyHealth;
+	int gasTankHealth;
+	int engineHealth;
+
+	float mainRotorDamage;
+	float rearRotorDamage;
+	float tailRotorDamage;
+
+	bool disableExplosionFromBodyDamage;
+};
+
+struct CHeliControlDataNodeData
+{
+	float yawControl;
+	float pitchControl;
+	float rollControl;
+	float throttleControl;
+
+	bool engineOff;
+
+	bool hasLandingGear;
+	uint32_t landingGearState;
+
+	bool isThrusterModel;
+	float thrusterSideRCSThrottle;
+	float thrusterThrottle;
+
+	bool hasVehicleTask;
+	bool lockedToXY;
 };
 
 struct CVehicleSteeringNodeData
 {
 	float steeringAngle;
+};
+
+struct CEntityScriptGameStateNodeData
+{
+	bool usesCollision;
+	bool isFixed;
+};
+
+struct CVehicleDamageStatusNodeData
+{
+	bool damagedByBullets;
+	bool anyWindowBroken;
+	bool windowsState[8];
+};
+
+struct CBoatGameStateNodeData
+{
+	bool lockedToXY;
+	float sinkEndTime;
+	int wreckedAction;
+	bool isWrecked;
+};
+
+struct CPedMovementGroupNodeData
+{
+	bool isStealthy;
+	bool isStrafing;
+	bool isRagdolling;
+};
+
+struct CPedAINodeData
+{
+	int relationShip;
+	int decisionMaker;
+};
+
+struct CPedVehicleNodeData
+{
+	bool inVehicle;
+	int curVehicle;
+	int lastVehiclePedWasIn;
+
+	bool onHorse;
+	int curHorse;
+	int lastHorsePedWasOn;
+
+	int curSeat;
 };
 
 enum ePopType
@@ -499,7 +777,9 @@ struct SyncTreeBase
 public:
 	virtual ~SyncTreeBase() = default;
 
-	virtual void Parse(SyncParseState& state) = 0;
+	virtual void ParseSync(SyncParseStateDynamic& state) = 0;
+
+	virtual void ParseCreate(SyncParseStateDynamic& state) = 0;
 
 	virtual bool Unparse(SyncUnparseState& state) = 0;
 
@@ -514,8 +794,6 @@ public:
 	virtual CDoorScriptInfoDataNodeData* GetDoorScriptInfo() = 0;
 
 	virtual CDoorScriptGameStateDataNodeData* GetDoorScriptGameState() = 0;
-
-	virtual CHeliControlDataNodeData* GetHeliControl() = 0;
 
 	virtual CPlayerCameraNodeData* GetPlayerCamera() = 0;
 
@@ -561,7 +839,19 @@ public:
 
 	virtual CHeliHealthNodeData* GetHeliHealth() = 0;
 
+	virtual CHeliControlDataNodeData* GetHeliControl() = 0;
+
 	virtual CVehicleSteeringNodeData* GetVehicleSteeringData() = 0;
+
+	virtual CEntityScriptGameStateNodeData* GetEntityScriptGameState() = 0;
+
+	virtual CVehicleDamageStatusNodeData* GetVehicleDamageStatus() = 0;
+
+	virtual CBoatGameStateNodeData* GetBoatGameState() = 0;
+
+	virtual CPedMovementGroupNodeData* GetPedMovementGroup() = 0;
+
+	virtual CPedAINodeData* GetPedAI() = 0;
 
 	virtual void CalculatePosition() = 0;
 
@@ -572,59 +862,16 @@ public:
 	virtual bool GetScriptHash(uint32_t* scriptHash) = 0;
 
 	virtual bool IsEntityVisible(bool* visible) = 0;
+
+	virtual CPedVehicleNodeData* GetPedVehicleData() = 0;
 };
 
-enum class NetObjEntityType
+enum EntityOrphanMode : uint8_t
 {
-#ifdef STATE_FIVE
-	Automobile = 0,
-	Bike = 1,
-	Boat = 2,
-	Door = 3,
-	Heli = 4,
-	Object = 5,
-	Ped = 6,
-	Pickup = 7,
-	PickupPlacement = 8,
-	Plane = 9,
-	Submarine = 10,
-	Player = 11,
-	Trailer = 12,
-	Train = 13,
-#elif defined(STATE_RDR3)
-	Animal = 0,
-	Automobile = 1,
-	Bike = 2,
-	Boat = 3,
-	Door = 4,
-	Heli = 5,
-	Object = 6,
-	Ped = 7,
-	Pickup = 8,
-	PickupPlacement = 9,
-	Plane = 10,
-	Submarine = 11,
-	Player = 12,
-	Trailer = 13,
-	Train = 14,
-	DraftVeh = 15,
-	StatsTracker = 16,
-	PropSet = 17,
-	AnimScene = 18,
-	GroupScenario = 19,
-	Herd = 20,
-	Horse = 21,
-	WorldState = 22,
-	WorldProjectile = 23,
-	Incident = 24,
-	Guardzone = 25,
-	PedGroup = 26,
-	CombatDirector = 27,
-	PedSharedTargeting = 28,
-	Persistent = 29,
-#endif
+	DeleteWhenNotRelevant = 0,
+	DeleteOnOwnerDisconnect = 1,
+	KeepEntity = 2,
 };
-
 struct SyncEntityState
 {
 	using TData = std::variant<int, float, bool, std::string>;
@@ -639,6 +886,7 @@ struct SyncEntityState
 	uint32_t creationToken;
 	uint32_t routingBucket = 0;
 	float overrideCullingRadius = 0.0f;
+	bool ignoreRequestControlFilter = false;
 
 	std::shared_mutex guidMutex;
 	eastl::bitset<roundToWord(MAX_CLIENTS)> relevantTo;
@@ -653,6 +901,7 @@ struct SyncEntityState
 	// #IFARQ this means lastFramesSent
 	std::array<uint64_t, MAX_CLIENTS> lastFramesPreSent;
 
+	std::chrono::milliseconds createdAt{ 0 };
 	std::chrono::milliseconds lastReceivedAt;
 	std::chrono::milliseconds lastMigratedAt;
 
@@ -667,6 +916,10 @@ struct SyncEntityState
 	bool passedFilter = false;
 	bool wantsReassign = false;
 	bool firstOwnerDropped = false;
+	EntityOrphanMode orphanMode = EntityOrphanMode::DeleteWhenNotRelevant;
+#ifdef STATE_FIVE
+	bool allowRemoteSyncedScenes = false;
+#endif
 
 	std::list<std::function<void(const fx::ClientSharedPtr& ptr)>> onCreationRPC;
 
@@ -725,6 +978,14 @@ public:
 			syncTree->GetScriptHash(&scriptHash);
 		}
 		return scriptHash;
+	}
+
+	/// <summary>
+	/// Checks of the entity is set to be kept by the server via orphan mode or by being owned by a server script.
+	/// </summary>
+	inline bool ShouldServerKeepEntity()
+	{
+		return IsOwnedByServerScript() || orphanMode == EntityOrphanMode::KeepEntity;
 	}
 
 	inline bool IsOwnedByScript()
@@ -794,13 +1055,35 @@ using SyncEntityWeakPtr = weak_reference<SyncEntityPtr>;
 struct SyncParseState
 {
 	rl::MessageBuffer buffer;
-	int syncType;
-	int objType;
 	uint32_t timestamp;
 
 	SyncEntityPtr entity;
 
 	uint64_t frameIndex;
+
+	inline SyncParseState(rl::MessageBuffer&& buffer, uint32_t timestamp, const SyncEntityPtr& entity, uint64_t frameIndex)
+		: buffer(std::move(buffer)), timestamp(timestamp), entity(entity), frameIndex(frameIndex)
+	{
+	}
+
+private:
+	// use SyncParseStateDynamic instead
+	inline SyncParseState(rl::MessageBuffer&& buffer, int syncType, int objType, uint32_t timestamp, const SyncEntityPtr& entity, uint64_t frameIndex)
+	{
+		
+	}
+};
+
+struct SyncParseStateDynamic : SyncParseState
+{
+	int syncType;
+	int objType;
+
+	inline SyncParseStateDynamic(rl::MessageBuffer&& buffer, int syncType, int objType, uint32_t timestamp, const SyncEntityPtr& entity, uint64_t frameIndex)
+		: SyncParseState(std::move(buffer), timestamp, entity, frameIndex), syncType(syncType), objType(objType)
+	{
+	
+	}
 };
 
 struct SyncUnparseState
@@ -1000,13 +1283,14 @@ struct SyncedEntityData
 	sync::SyncEntityPtr entity;
 	bool forceUpdate;
 	bool hasCreated;
+	bool hasRoutedStateBag = false;
 	bool hasNAckedCreate = false;
 };
 
 constexpr auto maxSavedClientFrames = 650; // enough for ~8-9 seconds, after 5 we'll start using worst-case frames
 constexpr auto maxSavedClientFramesWorstCase = (60000 / 15); // enough for ~60 seconds
 
-struct GameStateClientData : public sync::ClientSyncDataBase
+struct GameStateClientData
 {
 	rl::MessageBuffer ackBuffer{ 16384 };
 	std::unordered_set<int> objectIds;
@@ -1077,19 +1361,83 @@ public:
 
 	void UpdateEntities();
 
-	void ParseGameStatePacket(const fx::ClientSharedPtr& client, const std::vector<uint8_t>& packetData);
+	void ParseGameStatePacket(const fx::ClientSharedPtr& client, const net::packet::ClientRoute& packetData);
 
 	virtual void AttachToObject(fx::ServerInstanceBase* instance) override;
 
 	void HandleClientDrop(const fx::ClientSharedPtr& client, uint16_t netId, uint32_t slotId);
 
-	void HandleArrayUpdate(const fx::ClientSharedPtr& client, net::Buffer& buffer);
+	void HandleArrayUpdate(const fx::ClientSharedPtr& client, net::packet::ClientArrayUpdate& buffer) override;
 
-	void SendObjectIds(const fx::ClientSharedPtr& client, int numIds);
+	void HandleGameStateNAck(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client, net::packet::ClientGameStateNAck& buffer) override;
 
-	void ReassignEntity(uint32_t entityHandle, const fx::ClientSharedPtr& targetClient);
+	void HandleGameStateAck(fx::ServerInstanceBase* instance, const fx::ClientSharedPtr& client, net::packet::ClientGameStateAck& buffer) override;
+	
+	void GetFreeObjectIds(const fx::ClientSharedPtr& client, uint8_t numIds, std::vector<uint16_t>& freeIds);
 
-	void DeleteEntity(const fx::sync::SyncEntityPtr& entity);
+#ifdef STATE_FIVE
+	void IterateTrainLink(const sync::SyncEntityPtr& train, std::function<bool(sync::SyncEntityPtr&)> fn, bool callOnInitialEntity = true);
+#endif
+
+	void ReassignEntity(uint32_t entityHandle, const fx::ClientSharedPtr& targetClient, std::unique_lock<std::shared_mutex>&& lock = {});
+
+	bool SetEntityStateBag(uint8_t playerId, uint16_t objectId, std::function<std::shared_ptr<StateBag>()> createStateBag) override;
+
+	uint32_t GetClientRoutingBucket(const fx::ClientSharedPtr& client) override;
+
+	std::function<bool()> GetGameEventHandlerWithEvent(const fx::ClientSharedPtr& client, const std::vector<uint16_t>& targetPlayers, net::packet::ClientNetGameEventV2& netGameEvent) override;
+
+	bool IsClientRelevantEntity(const fx::ClientSharedPtr& client, uint32_t objectId) override;
+
+private:
+	void ReassignEntityInner(uint32_t entityHandle, const fx::ClientSharedPtr& targetClient, std::unique_lock<std::shared_mutex>&& lock = {});
+
+public:
+
+	template<bool IgnoreTrainChecks = false>
+	void DeleteEntity(const fx::sync::SyncEntityPtr& entity)
+	{
+		if (entity->type == sync::NetObjEntityType::Player || !entity->syncTree)
+		{
+			return;
+		}
+
+		// can only be used on FiveM, RDR doesn't have its sync nodes filled out
+#ifdef STATE_FIVE
+		// this will be ignored by DELETE_TRAIN so calling on any part of the train will delete the entire thing
+		if constexpr (!IgnoreTrainChecks)
+		{
+
+			if (entity->type == sync::NetObjEntityType::Train;
+				auto trainState = entity->syncTree->GetTrainState())
+			{
+				// don't allow the deletion of carriages until we can modify sync node data and overwrite the linked forward/linked backwards state
+				if (trainState->engineCarriage && trainState->engineCarriage != entity->handle)
+				{
+					return;
+				}
+			}
+		}
+#endif
+
+		gscomms_execute_callback_on_sync_thread([=]()
+		{
+#ifdef STATE_FIVE
+			if (entity->type == sync::NetObjEntityType::Train)
+			{
+				// recursively delete every part of the train
+				IterateTrainLink(entity, [=](fx::sync::SyncEntityPtr& train)
+				{
+					RemoveClone({}, train->handle);
+
+					return true;
+				});
+				return;
+			}
+#endif
+			RemoveClone({}, entity->handle);
+		});
+	}
 
 	void ClearClientFromWorldGrid(const fx::ClientSharedPtr& targetClient);
 
@@ -1103,6 +1451,11 @@ public:
 	inline void SetEntityLockdownMode(EntityLockdownMode mode)
 	{
 		m_entityLockdownMode = mode;
+	}
+
+	bool GetStateBagStrictMode() const override
+	{
+		return m_stateBagStrictMode;
 	}
 
 	EntityLockdownMode GetEntityLockdownMode(const fx::ClientSharedPtr& client);
@@ -1121,16 +1474,21 @@ public:
 
 	void ForAllEntities(const std::function<void(sync::Entity*)>& cb);
 
+	inline auto GetServerInstance() const
+	{
+		return m_instance;
+	}
+
 private:
-	void ProcessCloneCreate(const fx::ClientSharedPtr& client, rl::MessageBuffer& inPacket, AckPacketWrapper& ackPacket);
+	void ProcessCloneCreate(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket, AckPacketWrapper& ackPacket);
 
-	void ProcessCloneRemove(const fx::ClientSharedPtr& client, rl::MessageBuffer& inPacket, AckPacketWrapper& ackPacket);
+	void ProcessCloneRemove(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket, AckPacketWrapper& ackPacket);
 
-	void ProcessCloneSync(const fx::ClientSharedPtr& client, rl::MessageBuffer& inPacket, AckPacketWrapper& ackPacket);
+	void ProcessCloneSync(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket, AckPacketWrapper& ackPacket);
 
-	void ProcessCloneTakeover(const fx::ClientSharedPtr& client, rl::MessageBuffer& inPacket);
+	void ProcessCloneTakeover(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket);
 
-	bool ProcessClonePacket(const fx::ClientSharedPtr& client, rl::MessageBuffer& inPacket, int parsingType, uint16_t* outObjectId, uint16_t* outUniqifier);
+	bool ProcessClonePacket(const fx::ClientSharedPtr& client, rl::MessageBufferView& inPacket, int parsingType, uint16_t* outObjectId, uint16_t* outUniqifier);
 
 	void OnCloneRemove(const fx::sync::SyncEntityPtr& entity, const std::function<void()>& doRemove);
 
@@ -1138,11 +1496,21 @@ private:
 
 	void FinalizeClone(const fx::ClientSharedPtr& client, const fx::sync::SyncEntityPtr& entity, uint16_t objectId, uint16_t uniqifier = 0, std::string_view finalizeReason = "");
 
-	void ParseClonePacket(const fx::ClientSharedPtr& client, net::Buffer& buffer);
+	void ParseClonePacket(const fx::ClientSharedPtr& client, net::ByteReader& buffer);
 
-	void ParseAckPacket(const fx::ClientSharedPtr& client, net::Buffer& buffer);
+	void ParseAckPacket(const fx::ClientSharedPtr& client, net::ByteReader& buffer);
 
 	bool ValidateEntity(EntityLockdownMode entityLockdownMode, const fx::sync::SyncEntityPtr& entity);
+
+public:
+	std::unordered_set<uint32_t> blockedEvents;
+	std::shared_mutex blockedEventsMutex;
+	bool IsNetGameEventBlocked(uint32_t eventNameHash);
+	std::function<bool()> GetGameEventHandler(const fx::ClientSharedPtr& client, const std::vector<uint16_t>& targetPlayers, net::Buffer&& buffer);
+
+private:
+	std::function<bool()> GetRequestControlEventHandler(const fx::ClientSharedPtr& client, net::Buffer&& buffer);
+	std::function<bool()> GetRequestControlEventHandlerWithEvent(const fx::ClientSharedPtr& client, net::packet::ClientNetGameEventV2& netGameEvent);
 
 public:
 	fx::sync::SyncEntityPtr GetEntity(uint8_t playerId, uint16_t objectId);
@@ -1153,7 +1521,9 @@ public:
 private:
 	fx::ServerInstanceBase* m_instance;
 
+#ifdef USE_ASYNC_SCL_POSTING
 	std::unique_ptr<ThreadPool> m_tg;
+#endif
 
 	// as bitset is not thread-safe
 	std::shared_mutex m_objectIdsMutex;
@@ -1214,7 +1584,7 @@ public:
 	{
 		virtual ~ArrayHandlerBase() = default;
 
-		virtual bool ReadUpdate(const fx::ClientSharedPtr& client, net::Buffer& buffer) = 0;
+		virtual bool ReadUpdate(const fx::ClientSharedPtr& client, net::packet::ClientArrayUpdate& buffer) = 0;
 
 		virtual void WriteUpdates(const fx::ClientSharedPtr& client) = 0;
 
@@ -1250,7 +1620,9 @@ private:
 public:
 	bool MoveEntityToCandidate(const fx::sync::SyncEntityPtr& entity, const fx::ClientSharedPtr& client);
 
-	void SendPacket(int peer, std::string_view data) override;
+	void SendPacket(int peer, net::packet::StateBagPacket& packet) override;
+
+	void SendPacket(int peer, net::packet::StateBagV2Packet& packet) override;
 
 	bool IsAsynchronous() override;
 
@@ -1267,6 +1639,7 @@ private:
 	std::shared_ptr<fx::StateBag> m_globalBag;
 
 	std::shared_ptr<ConVar<EntityLockdownMode>> m_lockdownModeVar;
+	std::shared_ptr<ConVar<bool>> m_stateBagStrictModeVar;
 
 	//private:
 public:
@@ -1278,6 +1651,8 @@ public:
 
 	EntityLockdownMode m_entityLockdownMode;
 	SyncStyle m_syncStyle = SyncStyle::NAK;
+
+	bool m_stateBagStrictMode {false};
 };
 
 // for use in sync trees

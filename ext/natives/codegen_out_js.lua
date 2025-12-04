@@ -121,7 +121,7 @@ print("\treturn (flt === 0.0) ? flt : (flt + 0.0000001);")
 print("}\n")
 
 print("function _mfr(fn) {")
-print("\treturn Citizen.makeRefFunction(fn);")
+print("\treturn Citizen.getRefFunction(fn);")
 print("}\n")
 
 print("const _ENV = null;\n")
@@ -219,7 +219,7 @@ local function printReturnType(type)
 			return '_ri'
 		end
 	elseif type.nativeType == 'Any*' then
-		return '_ri'
+		return '_rl' -- Assume pointers are 64 bits
 	elseif type.nativeType == 'object' then
 		return '_ro'
 	end

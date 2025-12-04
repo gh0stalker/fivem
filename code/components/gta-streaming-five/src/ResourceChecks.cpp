@@ -3,6 +3,7 @@
 #include <jitasm.h>
 #include "Hooking.h"
 
+#include "CoreConsole.h"
 #include "Streaming.h"
 
 #include <Error.h>
@@ -21,16 +22,31 @@
 static int(*g_origInsertModule)(void*, void*);
 
 static thread_local std::string g_currentStreamingName;
+static thread_local uint32_t g_currentStreamingIndex;
+
+static hook::cdecl_stub<void(void*)> phBoundGeometry_RecomputeOctantMap([]
+{
+	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 48 FF C3 48 3B DF 7C ? E8"));
+});
+
+static hook::cdecl_stub<void(void*)> phBoundGeometry_DeleteOctantMap([]
+{
+	return hook::get_call(hook::get_pattern("E8 ? ? ? ? 48 8B 8B ? ? ? ? 48 85 C9 74 ? E8 ? ? ? ? 48 8D 05"));
+});
 
 std::string GetCurrentStreamingName()
 {
 	return g_currentStreamingName;
 }
 
+uint32_t GetCurrentStreamingIndex()
+{
+	return g_currentStreamingIndex;
+}
+
 class strStreamingModule
 {
-public:
-	virtual ~strStreamingModule() {}
+	void* vtbl;
 
 public:
 	uint32_t baseIdx;
@@ -39,16 +55,22 @@ public:
 	atArray<char> name;
 };
 
-static void CallBeforeStreamingLoad(strStreamingModule* strModule, uint32_t index, void* data)
-{
-	uint32_t moduleBase = strModule->baseIdx;
+static thread_local void* g_currentStreamingModuleCallback;
 
-	g_currentStreamingName = streaming::GetStreamingNameForIndex(moduleBase + index);
+static void SetCurrentStreamingModuleCallback(void* func)
+{
+	g_currentStreamingModuleCallback = func;
 }
 
-static void CallAfterStreamingLoad(strStreamingModule* strModule, uint32_t index, void* data)
+static void WrapStreamingLoad(strStreamingModule* strModule, uint32_t index, void* data, void* a4)
 {
+	uint32_t moduleBase = strModule->baseIdx;
+	g_currentStreamingName = streaming::GetStreamingNameForIndex(moduleBase + index);
+	g_currentStreamingIndex = moduleBase + index;
+
+	((decltype(&WrapStreamingLoad))g_currentStreamingModuleCallback)(strModule, index, data, a4);
 	g_currentStreamingName = "";
+	g_currentStreamingIndex = 0;
 }
 
 static int InsertStreamingModuleWrap(void* moduleMgr, void* strModule)
@@ -74,28 +96,23 @@ static int InsertStreamingModuleWrap(void* moduleMgr, void* strModule)
 
 			sub(rsp, 0x28);
 
+			// save arguments
 			mov(rbx, rcx); // streaming module
 			mov(rsi, rdx); // index in module
 			mov(rbp, r8);  // data pointer
 			mov(rdi, r9);  // unknown
 
-			mov(rax, (uintptr_t)CallBeforeStreamingLoad);
+			// save the current callback
+			mov(rcx, (uintptr_t)m_origFunc);
+
+			mov(rax, (uintptr_t)SetCurrentStreamingModuleCallback);
 			call(rax);
 
+			// return original arguments
 			mov(rcx, rbx);
 			mov(rdx, rsi);
 			mov(r8, rbp);
 			mov(r9, rdi);
-
-			mov(rax, (uintptr_t)m_origFunc);
-			call(rax);
-
-			mov(rcx, rbx);
-			mov(rdx, rsi);
-			mov(r8, rbp);
-
-			mov(rax, (uintptr_t)CallAfterStreamingLoad);
-			call(rax);
 
 			add(rsp, 0x28);
 
@@ -104,20 +121,22 @@ static int InsertStreamingModuleWrap(void* moduleMgr, void* strModule)
 			pop(rsi);
 			pop(rbx);
 
-			ret();
+			mov(rax, (uintptr_t)WrapStreamingLoad);
+			jmp(rax);
 		}
 	};
 
-	auto stub = new StreamingOnLoadStub(vt[6]);
-	hook::put(&vt[6], stub->GetCode());
+	int index = (xbr::IsGameBuildOrGreater<2802>()) ? 12 : 6;
+	auto stub = new StreamingOnLoadStub(vt[index]);
+	hook::put(&vt[index], stub->GetCode());
 
 	return g_origInsertModule(moduleMgr, strModule);
 }
 
 static void PolyErrorv(const std::string& str, fmt::printf_args args)
 {
-	trace("Physics validation failed for asset %s.\nThis asset is **INVALID**, but we've fixed it for this load. Please fix the exporter used to export it.\nDetails: %s\n",
-		g_currentStreamingName, fmt::vsprintf(str, args));
+	console::DPrintf("asset-validation", "Physics validation failed for asset %s.\nThis asset is **INVALID**, but we've fixed it for this load. Please fix the exporter used to export it.\nDetails: %s\n",
+	g_currentStreamingName, fmt::vsprintf(str, args));
 }
 
 template<typename... TArgs>
@@ -128,7 +147,7 @@ static inline void PolyError(const std::string& str, const TArgs&... args)
 
 extern std::set<std::string> g_customStreamingFileRefs;
 
-static void ValidateGeometry(void* geomPtr)
+static void ValidateGeometry(hook::FlexStruct* geomPtr)
 {
 	// only validate #ft files for the time being.
 	// #bn/#dr files tend to be exported with GIMS Evo, which inherently exports broken data
@@ -148,11 +167,36 @@ static void ValidateGeometry(void* geomPtr)
 	auto numPolys = geom->GetNumPolygons();
 	auto numVerts = geom->GetNumVertices();
 
-	// Some exporter exports broken octant maps, which at this time (2020-11-23) is a #9 top crasher.
-	// Therefore, remove octant maps for any custom assets (pending research on what exactly is broken).
-	if (g_customStreamingFileRefs.find(g_currentStreamingName) != g_customStreamingFileRefs.end())
+	// Some exporters break octant maps, causing crashes when calculating bound collisions.
+	// If we detect that the octant map is invalid, recompute it.
+	if (auto octantVertCounts = geom->GetNumOctants())
 	{
-		geom->ClearOctantMap();
+		for (int octant = 0; octant < 8; ++octant)
+		{
+			if (octantVertCounts[octant] <= 0)
+			{
+				console::DPrintf("asset-validation",
+				"Physics validation failed for asset '%s'.\n"
+				"This asset contains invalid octant data (OctantVertCounts <= 0) and has been auto-corrected during this load to prevent a crash.\n"
+				"**Please update or fix the exporter responsible for generating this asset.**\n"
+				"Until corrected, this asset may cause degraded runtime performance while being loaded in.\n",
+				g_currentStreamingName);
+				
+				auto shrunkVertexPointer = geomPtr->Get<void*>(0x78);
+
+				if (shrunkVertexPointer)
+				{
+					phBoundGeometry_RecomputeOctantMap(geomPtr);
+				}
+				else
+				{
+					// Beyond broken, just delete and give up.
+					phBoundGeometry_DeleteOctantMap(geomPtr);
+				}
+
+				break;
+			}
+		}
 	}
 
 	bool error = false;
@@ -309,7 +353,7 @@ static void ValidateGeometry(void* geomPtr)
 
 static void(*g_origBVHThing)(void*, void*);
 
-static void DoBVHThing(char* a1, void* a2)
+static void DoBVHThing(hook::FlexStruct* a1, void* a2)
 {
 	g_origBVHThing(a1, a2);
 
@@ -318,7 +362,7 @@ static void DoBVHThing(char* a1, void* a2)
 
 static void(*g_origGeometryThing)(void*, void*);
 
-static void DoGeometryThing(char* a1, void* a2)
+static void DoGeometryThing(hook::FlexStruct* a1, void* a2)
 {
 	g_origGeometryThing(a1, a2);
 

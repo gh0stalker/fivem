@@ -1,14 +1,21 @@
-using CitizenFX.Core;
-using CitizenFX.Core.Native;
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Drawing;
 using System.Linq;
-using System.Security;
-using System.Threading.Tasks;
+
+#if MONO_V2
+using CitizenFX.Core;
+using API = CitizenFX.FiveM.Native.Natives;
+using TaskBool = CitizenFX.Core.Coroutine<bool>;
+
+namespace CitizenFX.FiveM
+#else
+using CitizenFX.Core.Native;
+using System.Drawing;
+using TaskBool = System.Threading.Tasks.Task<bool>;
 
 namespace CitizenFX.Core
+#endif
 {
 	public enum VehicleModType
 	{
@@ -29,6 +36,12 @@ namespace CitizenFX.Core
 		Horns,
 		Suspension,
 		Armor,
+		Nitrous,
+		Turbo,
+		Subwoofer,
+		TyreSmoke,
+		Hydraulics2,
+		XenonLights,
 		FrontWheel = 23,
 		RearWheel,
 		PlateHolder,
@@ -58,8 +71,11 @@ namespace CitizenFX.Core
 
 	public enum VehicleToggleModType
 	{
+		Nitrous = 17,
 		Turbo = 18,
+		Subwoofer = 19,
 		TireSmoke = 20,
+		Hydraulics = 21,
 		XenonHeadlights = 22
 	}
 
@@ -232,7 +248,7 @@ namespace CitizenFX.Core
 			API.SetVehicleModKit(_owner.Handle, 0);
 		}
 
-		public async Task<bool> RequestAdditionTextFile(int timeout = 1000)
+		public async TaskBool RequestAdditionTextFile(int timeout = 1000)
 		{
 			if (!API.HasThisAdditionalTextLoaded("mod_mnu", 10))
 			{

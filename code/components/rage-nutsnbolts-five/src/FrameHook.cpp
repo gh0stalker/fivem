@@ -11,6 +11,9 @@
 #include <Hooking.h>
 
 #include <ICoreGameInit.h>
+#include <CrossBuildRuntime.h>
+
+DWORD g_mainThreadId;
 
 fwEvent<> OnLookAliveFrame;
 fwEvent<> OnEarlyGameFrame;
@@ -63,7 +66,6 @@ static uint32_t g_lastCriticalFrame;
 static std::mutex g_gameFrameMutex;
 static std::mutex g_earlyGameFrameMutex;
 static std::mutex g_criticalFrameMutex;
-static DWORD g_mainThreadId;
 static bool g_executedOnMainThread;
 
 // NOTE: depends indirectly on GameProfiling.cpp in gta:core!
@@ -198,7 +200,7 @@ static HookFunction hookFunction([] ()
 
 	location = (char*)(location + *(int32_t*)location + 4);
 
-	location += 32;
+	location += xbr::IsGameBuildOrGreater<2802>() ? 24 : 32;
 
 	void** vt = (void**)location;
 

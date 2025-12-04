@@ -30,12 +30,12 @@ void MumbleChannel::UpdateChannel(MumbleProto::ChannelState& state)
 
 	if (state.has_name())
 	{
-		m_channelName = ConvertFromUTF8(state.name());
+		m_channelName = state.name();
 	}
 
 	if (state.has_description())
 	{
-		m_channelDescription = ConvertFromUTF8(state.description());
+		m_channelDescription = state.description();
 		m_hasDescription = true;
 	}
 
@@ -62,8 +62,7 @@ void MumbleClientState::ProcessChannelState(MumbleProto::ChannelState& channelSt
 		if (channelIt == m_channels.end())
 		{
 			auto channel = MumbleChannel(m_client, channelState);
-
-			m_channels.insert(std::make_pair(id, channel));
+			m_channels.emplace(id, channel);
 
 			auto name = channel.GetName();
 

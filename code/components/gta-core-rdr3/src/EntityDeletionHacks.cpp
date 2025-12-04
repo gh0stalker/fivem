@@ -1,6 +1,7 @@
 #include "StdInc.h"
 #include "Hooking.h"
 
+#include "ScriptWarnings.h"
 #include "scrEngine.h"
 
 #include <boost/type_index.hpp>
@@ -33,22 +34,18 @@ public:
 
 class CPickup : public fwEntity
 {
-
 };
 
 class CObject : public fwEntity
 {
-
 };
 
 class CVehicle : public fwEntity
 {
-
 };
 
 class CPed : public fwEntity
 {
-
 };
 
 template<typename T>
@@ -74,7 +71,7 @@ static hook::cdecl_stub<fwEntity*(int handle)> getScriptEntity([]()
 	return hook::pattern("45 8B C1 41 C1 F8 08 45 38 0C 00 75 ? 8B 42 ? 41 0F AF C0").count(1).get(0).get<void>(-81);
 });
 
-static hook::cdecl_stub<void(fwEntity*)> deletePed([]()
+static hook::cdecl_stub<void(fwEntity*)> deletePedReal([]()
 {
 	return hook::get_pattern("84 D2 74 ? 48 8B 01 48 83 C4 28 48 FF A0", -9);
 });
@@ -99,21 +96,58 @@ static hook::cdecl_stub<void(fwEntity*, bool)> markAsNoLongerNeeded([]()
 	return hook::get_pattern("48 83 C1 10 E8 ? ? ? ? 48 8B D8 EB", -37);
 });
 
-static hook::cdecl_stub<netObject* (uint16_t id)> getNetObjById([]()
+static hook::cdecl_stub<netObject*(uint16_t id)> getNetObjById([]()
 {
 	return hook::get_call(hook::get_pattern("48 8B F8 8A 46 ? 3C 03 75", -13));
 });
+
+static fwEntity* GetNetworkObject(int objectId)
+{
+	auto object = getNetObjById(objectId);
+
+	if (!object)
+	{
+		fx::scripting::Warningf("entity", __FUNCTION__ ": no object by ID %d\n", objectId);
+		return nullptr;
+	}
+
+	auto gameObject = object->gameObject;
+
+	if (!gameObject)
+	{
+		fx::scripting::Warningf("entity", __FUNCTION__ ": no game object for ID %d\n", objectId);
+		return nullptr;
+	}
+
+	return gameObject;
+}
+
+enum NativeIdentifiers : uint64_t
+{
+	GET_PLAYER_PED = 0x275F255ED201B937,
+};
+
+static void deletePed(int* entityRef, CPed* entity)
+{
+
+	uint32_t playerPedId = NativeInvoke::Invoke<GET_PLAYER_PED, uint32_t>(0xFF);
+
+	if (*entityRef == playerPedId)
+		return;
+	deletePedReal(entity);
+}
 
 static HookFunction hookFunction([]()
 {
 	// get network ID by entity
 	rage::scrEngine::NativeHandler getNetID = [](rage::scrNativeCallContext* context)
 	{
-		auto entity = getScriptEntity(context->GetArgument<int>(0));
+		auto entityId = context->GetArgument<int>(0);
+		auto entity = getScriptEntity(entityId);
 
 		if (!entity)
 		{
-			trace("NETWORK_GET_NETWORK_ID_FROM_ENTITY: no such entity\n");
+			fx::scripting::Warningf("entity", "NETWORK_GET_NETWORK_ID_FROM_ENTITY: no such entity (script ID %d)\n", entityId);
 			return;
 		}
 
@@ -121,7 +155,7 @@ static HookFunction hookFunction([]()
 
 		if (!netObject)
 		{
-			trace("NETWORK_GET_NETWORK_ID_FROM_ENTITY: no net object for entity\n");
+			fx::scripting::Warningf("entity", "NETWORK_GET_NETWORK_ID_FROM_ENTITY: no net object for entity (script id %d)\n", entityId);
 			return;
 		}
 
@@ -131,20 +165,10 @@ static HookFunction hookFunction([]()
 	// get entity by network ID
 	rage::scrEngine::NativeHandler getNetObj = [](rage::scrNativeCallContext* context)
 	{
-		auto objectId = context->GetArgument<int>(0);
-		auto object = getNetObjById(objectId);
-
-		if (!object)
-		{
-			trace("NETWORK_GET_ENTITY_FROM_NETWORK_ID: no object by ID %d\n", objectId);
-			return;
-		}
-
-		auto gameObject = object->gameObject;
+		auto gameObject = GetNetworkObject(context->GetArgument<int>(0));
 
 		if (!gameObject)
 		{
-			trace("NETWORK_GET_ENTITY_FROM_NETWORK_ID: no game object for ID %d\n", objectId);
 			return;
 		}
 
@@ -188,14 +212,19 @@ static HookFunction hookFunction([]()
 		context->SetResult<uint32_t>(0, object != nullptr);
 	});
 
-	// NETWORK_DOES_ENTITY_EXIST_WITH_NETWORK_ID
-	rage::scrEngine::RegisterNativeHandler(0x18A47D074708FD68, [](rage::scrNativeCallContext* context)
+	auto doesEntityExistWithNetworkId = [](rage::scrNativeCallContext* context)
 	{
 		auto objectId = context->GetArgument<int>(0);
 		auto object = getNetObjById(objectId);
 
 		context->SetResult<uint32_t>(0, object && object->gameObject);
-	});
+	};
+
+	// NETWORK_DOES_ENTITY_EXIST_WITH_NETWORK_ID
+	// Kept to keep compatibility with any resource that directly invoked it previously
+	rage::scrEngine::RegisterNativeHandler(0x18A47D074708FD68, doesEntityExistWithNetworkId);
+
+	rage::scrEngine::RegisterNativeHandler("NETWORK_DOES_ENTITY_EXIST_WITH_NETWORK_ID", doesEntityExistWithNetworkId);
 
 	// CGameScriptHandlerObject::GetOwner vs. GetCurrentScriptHandler checks
 	{
@@ -255,7 +284,7 @@ static HookFunction hookFunction([]()
 
 		if (entity)
 		{
-			deletePed(entity);
+			deletePed(entityRef, entity);
 		}
 
 		*entityRef = 0;
@@ -286,15 +315,15 @@ static HookFunction hookFunction([]()
 		{
 			switch (entity->entityType)
 			{
-			case 3:
-				deleteVehicle(entity);
-				break;
-			case 4:
-				deletePed(entity);
-				break;
-			case 5:
-				deleteObject(entity);
-				break;
+				case 3:
+					deleteVehicle(entity);
+					break;
+				case 4:
+					deletePed(entityRef, static_cast<CPed*>(entity));
+					break;
+				case 5:
+					deleteObject(entity);
+					break;
 			}
 		}
 

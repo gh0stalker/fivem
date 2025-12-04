@@ -8,7 +8,10 @@
 #include "StdInc.h"
 
 #include <imgui.h>
+
+#define GImGui ImGui::GetCurrentContext()
 #include <imgui_internal.h>
+#include <Textselect.hpp>
 #include <ConsoleHost.h>
 
 #include <CoreConsole.h>
@@ -43,7 +46,6 @@ console::Context* GetConsoleContext()
 }
 
 extern ImFont* consoleFontSmall;
-extern ImFont* consoleFontTiny;
 
 // following 2 functions based on https://www.programmingalgorithms.com/algorithm/hsl-to-rgb/cpp/
 static float HueToRGB(float v1, float v2, float vH) {
@@ -99,15 +101,75 @@ static CRGBA HSLToRGB(HSL hsl) {
 
 struct FiveMConsoleBase
 {
-	boost::circular_buffer<std::string> Items{ 2500 };
-	boost::circular_buffer<std::string> ItemKeys{ 2500 };
+	const size_t BufferSize = 2500;
+	boost::circular_buffer<std::string> Items{ BufferSize };
+	boost::circular_buffer<std::string> ItemKeys{ BufferSize };
 
 	std::recursive_mutex ItemsMutex;
+
+	int ItemsAdded = 0;
+
+	virtual std::string_view GetLineAtIdx(const size_t idx)
+	{
+		if (idx >= Items.size()) return "";
+
+		return Items[idx];
+	}
+
+	virtual size_t GetNumLines()
+	{
+		return Items.size();
+	}
+
+	virtual float GetTextOffset(const size_t idx)
+	{
+		if (idx >= Items.size()) return 0.0f;
+
+		const std::string& itemKey = ItemKeys[idx];
+		if (itemKey.empty()) return 0.0f;
+
+		const float textSize = ImGui::CalcTextSize(itemKey.c_str()).x;
+		return ImGui::GetCursorPosX() + textSize + (textSize > 0 ? 16.0f : 0.0f);
+	}
+
+	FiveMConsoleBase()
+		: textSelect(
+			[this](const size_t idx) { return GetLineAtIdx(idx); },
+			[this]() { return GetNumLines(); },
+			[this](const size_t idx) { return GetTextOffset(idx); }
+		) {}
+
+	TextSelect textSelect;
+
+	virtual void RunCommandQueue()
+	{
+	}
 
 	// Portable helpers
 	static int Stricmp(const char* str1, const char* str2) { int d; while ((d = toupper(*str2) - toupper(*str1)) == 0 && *str1) { str1++; str2++; } return d; }
 	static int Strnicmp(const char* str1, const char* str2, int n) { int d = 0; while (n > 0 && (d = toupper(*str2) - toupper(*str1)) == 0 && *str1) { str1++; str2++; n--; } return d; }
 	static char* Strdup(const char* str) { size_t len = strlen(str) + 1; void* buff = malloc(len); return (char*)memcpy(buff, (const void*)str, len); }
+	static bool Stristr(const char* haystack, const char* needle)
+	{
+		if (!needle || !needle[0])
+			return true;
+
+		for (const char* h = haystack; *h; h++)
+		{
+			const char* h1 = h;
+			const char* n1 = needle;
+
+			while (*h1 && *n1 && toupper(*h1) == toupper(*n1))
+			{
+				h1++; n1++;
+			}
+
+			if (!*n1)
+				return true;
+		}
+
+		return false;
+	}
 
 	virtual void AddLog(const char* key, const char* fmt, ...)
 	{
@@ -122,6 +184,11 @@ struct FiveMConsoleBase
 			std::unique_lock<std::recursive_mutex> lock(ItemsMutex);
 			ItemKeys.push_back(key);
 			Items.push_back(buf);
+
+			if (Items.size() == BufferSize)
+			{
+				ItemsAdded++;
+			}
 
 			OnAddLog(key, buf);
 		}
@@ -151,9 +218,7 @@ struct FiveMConsoleBase
 
 		if (strlen(key.c_str()) > 0 && strlen(item.c_str()) > 0)
 		{
-			ImGui::PushFont(consoleFontSmall);
-
-			auto hue = int{ HashRageString(key.c_str()) % 360 };
+			const auto hue = static_cast<int>(HashRageString(key) % 360);
 			auto color = HSLToRGB(HSL{ hue, 0.8f, 0.4f });
 			color.alpha = alpha * 255.0f;
 
@@ -179,14 +244,12 @@ struct FiveMConsoleBase
 				color.alpha *= 0.8f;
 			}
 
-			dl->AddRectFilled(ImVec2(startPos.x, startPos.y + 1.0f), ImVec2(startPos.x + textSize.x + itemSize.x + 8.0f, startPos.y + 22.f - 1.0f), color.AsARGB(), fullBg ? 10.0f : 6.0f);
+			dl->AddRectFilled(ImVec2(startPos.x, startPos.y + 1.0f), ImVec2(startPos.x + textSize.x + itemSize.x + 8.0f, startPos.y + textSize.y - 1.0f), color.AsARGB(), fullBg ? 10.0f : 6.0f);
 			ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 4.0f);
 
 			//ImGui::PushStyleColor(ImGuiCol_Text, col);
 			ImGui::TextUnformatted(key.c_str());
 			//ImGui::PopStyleColor();
-
-			ImGui::PopFont();
 
 			ImGui::SameLine(textSize.x + 16.0f);
 		}
@@ -213,13 +276,47 @@ struct FiveMConsoleBase
 
 extern float g_menuHeight;
 
+#ifndef IS_FXSERVER
+#include <HostSharedData.h>
+#include <../launcher/TickCountData.h>
+
+#include <shellapi.h>
+
+static void OpenLogFile()
+{
+	static TickCountData initTickCount = ([]()
+	{
+		HostSharedData<TickCountData> initTickCountRef("CFX_SharedTickCount");
+		return *initTickCountRef;
+	})();
+
+	static fwPlatformString dateStamp = fmt::sprintf(L"%04d-%02d-%02dT%02d%02d%02d", initTickCount.initTime.wYear, initTickCount.initTime.wMonth,
+	initTickCount.initTime.wDay, initTickCount.initTime.wHour, initTickCount.initTime.wMinute, initTickCount.initTime.wSecond);
+
+	auto fileName = MakeRelativeCitPath(fmt::sprintf(L"logs/CitizenFX_log_%s.log", dateStamp));
+
+	ShellExecuteW(NULL, L"open", fileName.c_str(), NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void SetAutoScroll(bool enabled);
+
+static std::shared_ptr<ConVar<bool>> g_conAutoScroll;
+
+#endif
+
 struct CfxBigConsole : FiveMConsoleBase
 {
 	char InputBuf[1024];
 	bool ScrollToBottom;
+	bool AutoScrollEnabled;
 	ImVector<char*> History;
 	int HistoryPos;    // -1: new line, 0..History.Size-1 browsing history.
 	ImVector<const char*> Commands;
+	ImVec2 PreviousWindowSize;
+
+	char FilterBuf[128];
+	std::vector<int> filteredIndices;
+	std::string previousFilter;
 
 	concurrency::concurrent_queue<std::string> CommandQueue;
 
@@ -227,6 +324,7 @@ struct CfxBigConsole : FiveMConsoleBase
 	{
 		ClearLog();
 		memset(InputBuf, 0, sizeof(InputBuf));
+		memset(FilterBuf, 0, sizeof(FilterBuf));
 		HistoryPos = -1;
 		Commands.push_back("HELP");
 		Commands.push_back("HISTORY");
@@ -236,6 +334,20 @@ struct CfxBigConsole : FiveMConsoleBase
 		Commands.push_back("QUIT");
 		Commands.push_back("NETGRAPH");
 		Commands.push_back("STRDBG");
+		PreviousWindowSize = { 0, 0 };
+
+		// Update textSelect to work with filtered indices
+		textSelect = TextSelect(
+			[this](const size_t idx) { return GetFilteredLineAtIdx(idx); },
+			[this]() { return GetFilteredNumLines(); },
+			[this](const size_t idx) { return GetFilteredTextOffset(idx); }
+		);
+
+#ifndef IS_FXSERVER
+		AutoScrollEnabled = g_conAutoScroll->GetValue();
+#else
+		AutoScrollEnabled = true;
+#endif
 	}
 
 	virtual ~CfxBigConsole()
@@ -245,124 +357,257 @@ struct CfxBigConsole : FiveMConsoleBase
 			free(History[i]);
 	}
 
+	// Helper functions for filtered text selection
+	std::string_view GetFilteredLineAtIdx(const size_t idx)
+	{
+		if (idx >= filteredIndices.size()) return "";
+		const size_t originalIdx = filteredIndices[idx];
+		return GetLineAtIdx(originalIdx);
+	}
+
+	size_t GetFilteredNumLines()
+	{
+		return filteredIndices.size();
+	}
+
+	float GetFilteredTextOffset(const size_t idx)
+	{
+		if (idx >= filteredIndices.size()) return 0.0f;
+		const size_t originalIdx = filteredIndices[idx];
+		return GetTextOffset(originalIdx);
+	}
+
 	virtual void ClearLog() override
 	{
 		FiveMConsoleBase::ClearLog();
+
+		// Clear filtered indices
+		filteredIndices.clear();
 
 		ScrollToBottom = true;
 	}
 
 	virtual void OnAddLog(std::string_view key, std::string_view msg) override
 	{
-		// TODO: figure out if scrolled up somehow?
-		ScrollToBottom = true;
+		if (AutoScrollEnabled)
+		{
+			ScrollToBottom = true;
+		}
 	}
 
-	void Draw(const char* title, bool* p_open) override
+	virtual bool PreStartWindow()
 	{
 #ifndef IS_FXSERVER
 		if (GetKeyState(VK_CONTROL) & 0x8000 && GetKeyState(VK_MENU) & 0x8000)
 		{
-			return;
+			return false;
 		}
 #endif
 
-		ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + 0, ImGui::GetMainViewport()->Pos.y + g_menuHeight));
-		ImGui::SetNextWindowSize(ImVec2(ImGui::GetIO().DisplaySize.x, 
+		return true;
+	}
+
+	virtual bool StartWindow(const char* title, bool* p_open)
+	{
+		ImVec2 viewportPos = ImGui::GetMainViewport()->Pos;
+		ImVec2 viewportSize = ImGui::GetMainViewport()->Size;
+		float windowPosY = viewportPos.y + g_menuHeight;
+		ImGui::SetNextWindowPos(ImVec2(viewportPos.x, windowPosY));
+
 #ifndef IS_FXSERVER
-							     ImGui::GetFrameHeightWithSpacing() * 12.0f
+		const float forcedWidth = viewportSize.x;
+		const float initialHeight = ImGui::GetFrameHeightWithSpacing() * 12.0f;
+		ImVec2 initialSize(forcedWidth, initialHeight);
+		ImVec2 minSize(forcedWidth, initialHeight * 0.5f);
+		ImVec2 maxSize(forcedWidth, viewportSize.y - g_menuHeight);
+		ImGui::SetNextWindowSize(initialSize, ImGuiCond_FirstUseEver);
+		ImGui::SetNextWindowSizeConstraints(minSize, maxSize);
 #else
-								 ImGui::GetIO().DisplaySize.y - g_menuHeight
+		ImVec2 fullSize(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y - g_menuHeight);
+		ImGui::SetNextWindowSize(fullSize, ImGuiCond_Always);
 #endif
-		), ImGuiCond_Always);
 
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, { 4.0f, 3.0f });
 
-		ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
-			ImGuiWindowFlags_NoScrollbar |
-			ImGuiWindowFlags_NoMove |
-			ImGuiWindowFlags_NoResize |
-			ImGuiWindowFlags_NoSavedSettings | 
-			ImGuiWindowFlags_NoBringToFrontOnFocus;
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings
+#ifdef IS_FXSERVER
+		| ImGuiWindowFlags_NoResize;
+#endif
+		;
 
-		if (!ImGui::Begin(title, nullptr, flags))
+		return ImGui::Begin(title, nullptr, flags);
+	}
+
+	virtual void EndWindow()
+	{
+		ImGui::End();
+		ImGui::PopStyleVar(2);
+	}
+
+	void Draw(const char* title, bool* p_open) override
+	{
+		if (!PreStartWindow())
 		{
-			ImGui::End();
-			ImGui::PopStyleVar();
 			return;
 		}
 
-		std::unique_lock<std::recursive_mutex> lock(ItemsMutex);
+		if (!StartWindow(title, p_open))
+		{
+			EndWindow();
+			return;
+		}
 
-		/*ImGui::TextWrapped("This example implements a console with basic coloring, completion and history. A more elaborate implementation may want to store entries along with extra data such as timestamp, emitter, etc.");
-		ImGui::TextWrapped("Enter 'HELP' for help, press TAB to use text completion.");
+		std::unique_lock lock(ItemsMutex);
 
-		// TODO: display items starting from the bottom
+		ImGui::BeginChild("ScrollingRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - 8.0f), false);
 
-		if (ImGui::SmallButton("Add Dummy Text")) { AddLog("%d some text", Items.Size); AddLog("some more text"); AddLog("display very important message here!"); } ImGui::SameLine();
-		if (ImGui::SmallButton("Add Dummy Error")) AddLog("[error] something went wrong"); ImGui::SameLine();
-		if (ImGui::SmallButton("Clear")) ClearLog(); ImGui::SameLine();
-		if (ImGui::SmallButton("Scroll to bottom")) ScrollToBottom = true;
-		//static float t = 0.0f; if (ImGui::GetTime() - t > 0.02f) { t = ImGui::GetTime(); AddLog("Spam %f", t); }
-
-		ImGui::Separator();
-
-		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
-		static ImGuiTextFilter filter;
-		filter.Draw("Filter (\"incl,-excl\") (\"error\")", 180);
-		ImGui::PopStyleVar();
-		ImGui::Separator();*/
-
-		ImGui::BeginChild("ScrollingRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), false, 0);
-
-		// Display every line as a separate entry so we can change their color or add custom widgets. If you only want raw text you can use ImGui::TextUnformatted(log.begin(), log.end());
-		// NB- if you have thousands of entries this approach may be too inefficient and may require user-side clipping to only process visible items.
-		// You can seek and display only the lines that are visible using the ImGuiListClipper helper, if your elements are evenly spaced and you have cheap random access to the elements.
-		// To use the clipper we could replace the 'for (int i = 0; i < Items.Size; i++)' loop with:
-		//     ImGuiListClipper clipper(Items.Size);
-		//     while (clipper.Step())
-		//         for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
-		// However take note that you can not use this code as is if a filter is active because it breaks the 'cheap random-access' property. We would need random-access on the post-filtered list.
-		// A typical application wanting coarse clipping and filtering may want to pre-compute an array of indices that passed the filtering test, recomputing this array when user changes the filter,
-		// and appending newly elements as they are inserted. This is left as a task to the user until we can manage to improve this example code!
-		// If your items are of variable size you may want to implement code similar to what ImGuiListClipper does. Or split your data into fixed height items to allow random-seeking into your list.
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 1)); // Tighten spacing
-		ImGuiListClipper clipper(Items.size());
+		// Check if filter has changed
+		std::string currentFilter(FilterBuf);
+		bool filterChanged = (currentFilter != previousFilter);
+
+		// Update filtered indices
+		filteredIndices.clear();
+		for (size_t i = 0; i < Items.size(); i++)
+		{
+			if (FilterBuf[0] == '\0' ||
+				Stristr(Items[i].c_str(), FilterBuf) ||
+				Stristr(ItemKeys[i].c_str(), FilterBuf))
+			{
+				filteredIndices.push_back(static_cast<int>(i));
+			}
+		}
+
+		// If filter changed and auto scroll is enabled, scroll to bottom
+		if (filterChanged && AutoScrollEnabled)
+		{
+			ScrollToBottom = true;
+		}
+
+		// Update previous filter for next frame
+		previousFilter = currentFilter;
+
+		ImGuiListClipper clipper(filteredIndices.size());
 		while (clipper.Step())
 		{
 			for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
 			{
-				DrawItem(i);
+				DrawItem(filteredIndices[i]);
 			}
 		}
 
+		textSelect.update(ItemsAdded);
+		ItemsAdded = 0;
+
+		if (ImGui::BeginPopupContextWindow("CopyPopup"))
+		{
+			ImGui::BeginDisabled(!textSelect.hasSelection());
+			if (ImGui::MenuItem("Copy", "Ctrl+C"))
+			{
+				textSelect.copy();
+			}
+			ImGui::EndDisabled();
+
+			if (ImGui::MenuItem("Select all", "Ctrl+A"))
+			{
+				textSelect.selectAll();
+			}
+			ImGui::EndPopup();
+		}
+
 		if (ScrollToBottom)
-			ImGui::SetScrollHere();
+		{
+			ImGui::SetScrollHereY();
+		}
 
 		ScrollToBottom = false;
 		ImGui::PopStyleVar();
 		ImGui::EndChild();
 		ImGui::Separator();
 
-		// Command-line
-		ImGui::PushItemWidth(-1.0f);
-		if (ImGui::InputText("_", InputBuf, _countof(InputBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory, &TextEditCallbackStub, (void*)this))
+		if (ImGui::BeginTable("InputTable", 2, ImGuiTableFlags_SizingStretchProp))
 		{
-			char* input_end = InputBuf + strlen(InputBuf);
-			while (input_end > InputBuf && input_end[-1] == ' ') input_end--; *input_end = 0;
-			if (InputBuf[0])
-				ExecCommand(InputBuf);
-			strcpy(InputBuf, "");
+			// Set up columns: first column stretches, second column has fixed width
+			ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthStretch);
+			ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed);
+
+			ImGui::TableNextRow();
+			ImGui::TableNextColumn();
+
+			// Input field in the first column
+			ImGui::PushItemWidth(-FLT_MIN);
+			if (ImGui::InputText("##_Input", InputBuf, _countof(InputBuf),
+				ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackCompletion | ImGuiInputTextFlags_CallbackHistory, &TextEditCallbackStub, (void*)this))
+			{
+				char* input_end = InputBuf + strlen(InputBuf);
+				while (input_end > InputBuf && input_end[-1] == ' ')
+				{
+					input_end--;
+				}
+				*input_end = 0;
+				if (InputBuf[0])
+				{
+					ExecCommand(InputBuf);
+				}
+				strcpy(InputBuf, "");
+			}
+			ImGui::PopItemWidth();
+
+			ImGui::TableNextColumn();
+
+			if (ImGui::IsWindowAppearing() || !ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow) ||
+				(ImGui::IsWindowFocused() && !ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) ||
+				ImGui::IsKeyPressed(ImGuiKey_Tab))
+			{
+				ImGui::SetKeyboardFocusHere(-1);
+			}
+
+			ImGui::SameLine();
+			ImGui::SetNextItemWidth(ImGui::GetMainViewport()->Size.x * 0.15f);
+			ImGui::InputTextWithHint("##LogFilter", "Filter", FilterBuf, sizeof(FilterBuf));
+
+			bool preAutoScrollValue = AutoScrollEnabled;
+
+			// Controls in the second column
+			ImGui::SameLine();
+			ImGui::Checkbox("Auto scroll", &AutoScrollEnabled);
+
+			if (preAutoScrollValue != AutoScrollEnabled)
+			{
+#ifndef IS_FXSERVER
+				SetAutoScroll(AutoScrollEnabled);
+#else
+				if (AutoScrollEnabled)
+				{
+					// Force scroll to bottom on enabling autoscroll
+					ScrollToBottom = true;
+				}
+#endif
+			}
+
+#ifndef IS_FXSERVER
+			ImGui::SameLine();
+			if (ImGui::Button("Open log"))
+			{
+				OpenLogFile();
+			}
+
+			ImGui::CaptureKeyboardFromApp(true);
+#endif
+
+			ImGui::EndTable();
 		}
-		ImGui::PopItemWidth();
 
-		// Demonstrate keeping auto focus on the input box
-		if (ImGui::IsItemHovered() || (ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)))
-			ImGui::SetKeyboardFocusHere(-1); // Auto focus previous widget
+		// Check if the screen is being resized
+		const ImVec2 currentSize = ImGui::GetWindowSize();
+		if (AutoScrollEnabled && currentSize.y != PreviousWindowSize.y)
+		{
+			ScrollToBottom = true;
+			PreviousWindowSize = currentSize;
+		}
 
-		ImGui::End();
-
-		ImGui::PopStyleVar();
+		EndWindow();
 	}
 
 	void ExecCommand(const char* command_line)
@@ -397,13 +642,13 @@ struct CfxBigConsole : FiveMConsoleBase
 		}
 	}
 
-	static int TextEditCallbackStub(ImGuiTextEditCallbackData* data) // In C++11 you are better off using lambdas for this sort of forwarding callbacks
+	static int TextEditCallbackStub(ImGuiInputTextCallbackData* data) // In C++11 you are better off using lambdas for this sort of forwarding callbacks
 	{
 		CfxBigConsole* console = (CfxBigConsole*)data->UserData;
 		return console->TextEditCallback(data);
 	}
 
-	int TextEditCallback(ImGuiTextEditCallbackData* data)
+	int TextEditCallback(ImGuiInputTextCallbackData* data)
 	{
 		//AddLog("cursor: %d, selection: %d-%d", data->CursorPos, data->SelectionStart, data->SelectionEnd);
 		switch (data->EventFlag)
@@ -462,6 +707,9 @@ struct CfxBigConsole : FiveMConsoleBase
 			{
 				// No match
 				AddLog("", "No match for \"%.*s\"!\n", (int)(word_end - word_start), word_start);
+
+				// Scroll to bottom anyway if "Tab" pressed
+				ScrollToBottom = true;
 			}
 			else if (candidates.size() == 1)
 			{
@@ -508,6 +756,9 @@ struct CfxBigConsole : FiveMConsoleBase
 				AddLog("", "Possible matches:\n");
 				for (const auto& candidate : candidates)
 					AddLog("", "- %s\n", candidate.c_str());
+
+				// Scroll to bottom anyway if "Tab" pressed
+				ScrollToBottom = true;
 			}
 
 			break;
@@ -541,7 +792,7 @@ struct CfxBigConsole : FiveMConsoleBase
 		return 0;
 	}
 
-	void RunCommandQueue()
+	virtual void RunCommandQueue() override
 	{
 		std::string command_line;
 
@@ -567,12 +818,35 @@ struct CfxBigConsole : FiveMConsoleBase
 			return false;
 		}
 
-		if (channel == "cmd")
+		if (channel == "cmd" || channel == "IO" || channel == "loading-screens-rdr3")
 		{
 			return true;
 		}
 
 		return channel.find("script:") == 0;
+	}
+};
+
+// WinConsole is a midway point between minicon and the f8 console
+struct CfxWinConsole : CfxBigConsole
+{
+	virtual bool PreStartWindow() override
+	{
+		return true;
+	}
+
+	virtual bool StartWindow(const char* title, bool* p_open) override
+	{
+		ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
+
+		ImGui::SetNextWindowSize(ImVec2(800, 480), ImGuiCond_FirstUseEver);
+
+		return ImGui::Begin(title, p_open, flags);
+	}
+
+	virtual void EndWindow() override
+	{
+		ImGui::End();
 	}
 };
 
@@ -587,7 +861,7 @@ auto msec()
 
 struct MiniConsole : CfxBigConsole
 {
-	ImVector<std::chrono::milliseconds> ItemTimes;
+	boost::circular_buffer<std::chrono::milliseconds> ItemTimes{ 2500 };
 
 	ConVar<std::string>* m_miniconChannels;
 	std::string m_miniconLastValue;
@@ -595,7 +869,7 @@ struct MiniConsole : CfxBigConsole
 
 	MiniConsole()
 	{
-		m_miniconChannels = new ConVar<std::string>("con_miniconChannels", ConVar_Archive, "minicon:*");
+		m_miniconChannels = new ConVar<std::string>("con_miniconChannels", ConVar_Archive | ConVar_UserPref, "minicon:*");
 		m_miniconLastValue = m_miniconChannels->GetValue();
 
 		try
@@ -621,7 +895,7 @@ struct MiniConsole : CfxBigConsole
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 4)); // Tighten spacing
 
-		if (ImGui::Begin("MiniCon", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar))
+		if (ImGui::Begin("MiniCon", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoBringToFrontOnFocus | ImGuiWindowFlags_NoInputs))
 		{
 			auto t = msec();
 
@@ -666,7 +940,7 @@ struct MiniConsole : CfxBigConsole
 				}
 			}
 
-			ImGui::SetScrollHere();
+			ImGui::SetScrollHereY();
 		}
 
 		ImGui::PopStyleVar();
@@ -732,7 +1006,7 @@ struct MiniConsole : CfxBigConsole
 	}
 };
 
-static std::unique_ptr<FiveMConsoleBase> g_consoles[2];
+static std::unique_ptr<FiveMConsoleBase> g_consoles[3];
 static std::recursive_mutex g_consolesMutex;
 
 static void EnsureConsoles()
@@ -743,12 +1017,13 @@ static void EnsureConsoles()
 	{
 		g_consoles[0] = std::make_unique<CfxBigConsole>();
 		g_consoles[1] = std::make_unique<MiniConsole>();
+		g_consoles[2] = std::make_unique<CfxWinConsole>();
 	}
 }
 
 bool IsNonProduction()
 {
-#if !defined(GTA_FIVE) || defined(_DEBUG)
+#if (!defined(GTA_FIVE) && !defined(IS_RDR3)) || defined(_DEBUG)
 	return true;
 #else
 	static ConVar<int> moo("moo", ConVar_None, 0);
@@ -771,7 +1046,7 @@ void DrawConsole()
 	EnsureConsoles();
 
 	static bool pOpen = true;
-	g_consoles[0]->Draw("", &pOpen);
+	g_consoles[0]->Draw("##_BigConsole", &pOpen);
 }
 
 void DrawMiniConsole()
@@ -779,8 +1054,40 @@ void DrawMiniConsole()
 	EnsureConsoles();
 
 	static bool pOpen = true;
-	g_consoles[1]->Draw("", &pOpen);
+	g_consoles[1]->Draw("##_MiniConsole", &pOpen);
 }
+
+void DrawWinConsole(bool* pOpen)
+{
+	EnsureConsoles();
+
+	g_consoles[2]->Draw("WinConsole", pOpen);
+}
+
+#ifndef IS_FXSERVER
+static void SetAutoScroll(const bool enabled)
+{
+	std::unique_lock _(g_consolesMutex);
+
+	if (auto* bigConsole = dynamic_cast<CfxBigConsole*>(g_consoles[0].get())) {
+		bigConsole->AutoScrollEnabled = enabled;
+		if (enabled)
+		{
+			bigConsole->ScrollToBottom = true;
+		}
+	}
+
+	if (auto* winConsole = dynamic_cast<CfxBigConsole*>(g_consoles[2].get())) {
+		winConsole->AutoScrollEnabled = enabled;
+		if (enabled)
+		{
+			winConsole->ScrollToBottom = true;
+		}
+	}
+
+	g_conAutoScroll->GetHelper()->SetRawValue(enabled);
+}
+#endif
 
 #include <sstream>
 
@@ -862,9 +1169,9 @@ void SendPrintMessage(const std::string& channel, const std::string& message)
 
 DLL_EXPORT void RunConsoleGameFrame()
 {
-	if (g_consoles[0])
+	for (auto& console : g_consoles)
 	{
-		((CfxBigConsole*)g_consoles[0].get())->RunCommandQueue();
+		console->RunCommandQueue();
 	}
 }
 
@@ -885,9 +1192,26 @@ static InitFunction initFunction([]()
 });
 #endif
 
+#include "ProductionWhitelist.h"
+
 static InitFunction initFunctionCon([]()
 {
-	for (auto& command : { "connect", "quit", "cl_drawFPS", "bind", "rbind", "unbind", "disconnect", "storymode", "loadlevel", "cl_drawPerf", "profile_reticuleSize", "profile_musicVolumeInMp", "profile_musicVolume", "profile_sfxVolume" })
+#ifndef IS_FXSERVER
+	g_conAutoScroll = std::make_shared<ConVar<bool>>("con_autoScroll", ConVar_Archive | ConVar_UserPref, true);
+#endif
+
+	console::GetDefaultContext()->GetCommandManager()->AccessDeniedEvent.Connect([](std::string_view commandName)
+	{
+		if (!IsNonProduction())
+		{
+			console::Printf("cmd", "Command %s is disabled in production mode. See ^2https://aka.cfx.re/prod-console^7 for further information.\n", commandName);
+			return false;
+		}
+
+		return true;
+	});
+
+	for (auto& command : g_prodCommandsWhitelist)
 	{
 		seGetCurrentContext()->AddAccessControlEntry(se::Principal{ "system.extConsole" }, se::Object{ fmt::sprintf("command.%s", command) }, se::AccessType::Allow);
 	}

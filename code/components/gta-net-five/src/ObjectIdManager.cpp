@@ -12,6 +12,9 @@
 
 #include <MinHook.h>
 
+#include "ObjectIds.h"
+#include "ObjectIdsPacketHandler.h"
+
 static std::list<int> g_objectIds;
 static std::set<int> g_usedObjectIds;
 static std::set<int> g_stolenObjectIds;
@@ -60,7 +63,7 @@ static bool ReturnObjectId(void* objectIds, uint16_t objectId)
 
 		// only return it to ourselves if it was ours to begin with
 		// (and only use this for network protocol version 0x201903031957 or above - otherwise server bookkeeping will go out of sync)
-		if (Instance<ICoreGameInit>::Get()->NetProtoVersion < 0x201903031957 || g_stolenObjectIds.find(objectId) == g_stolenObjectIds.end())
+		if (g_stolenObjectIds.find(objectId) == g_stolenObjectIds.end())
 		{
 			if (!TheClones->IsRemovingObjectId(objectId))
 			{
@@ -169,34 +172,7 @@ void ObjectIds_BindNetLibrary(NetLibrary* netLibrary)
 {
 	g_netLibrary = netLibrary;
 
-	netLibrary->AddReliableHandler("msgObjectIds", [](const char* data, size_t len)
-	{
-		net::Buffer buffer(reinterpret_cast<const uint8_t*>(data), len);
-
-		auto numIds = buffer.Read<uint16_t>();
-
-		int last = 0;
-
-		for (int i = 0; i < numIds; i++)
-		{
-			auto skip = buffer.Read<uint16_t>();
-			auto take = buffer.Read<uint16_t>();
-
-			last += skip + 1;
-
-			for (int j = 0; j <= take; j++)
-			{
-				int objectId = last++;
-
-				TheClones->Log("got object id %d\n", objectId);
-
-				g_objectIds.push_back(objectId);
-				g_stolenObjectIds.erase(objectId);
-			}
-		}
-
-		g_requestedIds = false;
-	});
+	netLibrary->AddPacketHandler<fx::ObjectIdsPacketHandler>(false);
 }
 
 static HookFunction hookFunction([]()
@@ -224,10 +200,8 @@ static HookFunction hookFunction([]()
 		{
 			if (!g_requestedIds)
 			{
-				net::Buffer outBuffer;
-				outBuffer.Write<uint16_t>(32);
-
-				g_netLibrary->SendReliableCommand("msgRequestObjectIds", (const char*)outBuffer.GetData().data(), outBuffer.GetCurOffset());
+				net::packet::ClientRequestObjectIdsPacket packet;
+				g_netLibrary->SendNetPacket(packet);
 
 				g_requestedIds = true;
 			}
@@ -247,9 +221,9 @@ static HookFunction hookFunction([]()
 
 
 #ifdef GTA_FIVE
-	MH_CreateHook(hook::get_pattern("FF 89 C4 3E 00 00 33 D2", -12), AssignObjectId, (void**)&g_origAssignObjectId);
-	MH_CreateHook(hook::get_pattern("44 8B 91 C4 3E 00 00", -0x14), ReturnObjectId, (void**)&g_origReturnObjectId);
-	MH_CreateHook(hook::get_pattern("48 83 EC 20 8B B1 C4 3E 00 00", -0xB), HasSpaceForObjectId, (void**)&g_origHasSpaceForObjectId);
+	MH_CreateHook(hook::get_pattern("FF 81 ? ? ? ? 8B 81 ? ? ? ? FF 89 ? ? ? ? 33 D2"), AssignObjectId, (void**)&g_origAssignObjectId);
+	MH_CreateHook(hook::get_pattern("48 89 5C 24 ? 48 89 7C 24 ? 81 B9"), ReturnObjectId, (void**)&g_origReturnObjectId);
+	MH_CreateHook(hook::get_pattern("48 89 5C 24 ? 48 89 74 24 ? 57 48 83 EC ? 8B B1 ? ? ? ? 8B DA"), HasSpaceForObjectId, (void**)&g_origHasSpaceForObjectId);
 #elif IS_RDR3
 	MH_CreateHook(hook::get_pattern("0F B7 08 66 FF C9 66 3B CA 76", -0x1C), AssignObjectId, (void**)&g_origAssignObjectId);
 	MH_CreateHook(hook::get_pattern("45 8B D9 85 DB 7E ? 8B B9", -0x1A), ReturnObjectId, (void**)&g_origReturnObjectId);

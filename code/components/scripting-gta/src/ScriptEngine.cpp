@@ -6,6 +6,9 @@
  */
 
 #include "StdInc.h"
+
+#include <stdexcept>
+
 #include <ScriptEngine.h>
 
 #include <jitasm.h>
@@ -16,6 +19,7 @@
 #include <scrEngine.h>
 
 #include <NativeHandlerLogging.h>
+#include <ExceptionToModuleHelper.h>
 
 #include <CL2LaunchMode.h>
 
@@ -63,7 +67,7 @@ static inline void CallHandler(const THandler& rageHandler, uint64_t nativeIdent
 	}
 	__except (exceptionAddress = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress, ShouldHandleUnwind(GetExceptionInformation(), (GetExceptionInformation())->ExceptionRecord->ExceptionCode, nativeIdentifier))
 	{
-		throw std::exception(va("Error executing native 0x%016llx at address %p.", nativeIdentifier, exceptionAddress));
+		throw std::runtime_error(va("Error executing native 0x%016llx at address %s.", nativeIdentifier, FormatModuleAddress(exceptionAddress)));
 	}
 //#endif
 }
@@ -73,7 +77,7 @@ static void* g_exceptionAddress;
 
 static void SetLastErrorException(uint64_t nativeIdentifier)
 {
-	g_lastError = fmt::sprintf("Error executing native %016llx at address %p.", nativeIdentifier, g_exceptionAddress);
+	g_lastError = fmt::sprintf("Error executing native %016llx at address %s.", nativeIdentifier, FormatModuleAddress(g_exceptionAddress));
 }
 
 static bool CallNativeWrapperCppEh(rage::scrEngine::NativeHandler handler, uint64_t nativeIdentifier, rage::scrNativeCallContext* context, char** errorMessage)
@@ -92,8 +96,32 @@ static bool CallNativeWrapperCppEh(rage::scrEngine::NativeHandler handler, uint6
 	}
 }
 
+static void NullInvocation(uint64_t nativeIdentifier, char** errorMessage)
+{
+	if (nativeIdentifier == 0)
+	{
+		auto resourceName = NativeInvoke::Invoke<HashString("GET_CURRENT_RESOURCE_NAME"), const char*>();
+
+		if (!resourceName)
+		{
+			resourceName = "<unknown>";
+		}
+
+		FatalError("Invalid native call\nA script (%s) has invoked an invalid native call (null pointer/null native). This is unsupported behavior, and usually seen as part of a resource attempting to exploit a vulnerability in the Cfx.re platform.", resourceName);
+	}
+
+	g_lastError = fmt::sprintf("Invalid native call %016llx", nativeIdentifier);
+	*errorMessage = const_cast<char*>(g_lastError.c_str());
+}
+
 extern "C" bool DLL_EXPORT WrapNativeInvoke(rage::scrEngine::NativeHandler handler, uint64_t nativeIdentifier, rage::scrNativeCallContext* context, char** errorMessage)
 {
+	if (!handler)
+	{
+		NullInvocation(nativeIdentifier, errorMessage);
+		return false;
+	}
+
 	__try
 	{
 		return CallNativeWrapperCppEh(handler, nativeIdentifier, context, errorMessage);
@@ -111,7 +139,7 @@ static std::unordered_map<uint64_t, fx::TNativeHandler> g_registeredHandlers;
 
 namespace fx
 {
-	boost::optional<TNativeHandler> ScriptEngine::GetNativeHandler(uint64_t nativeIdentifier)
+	TNativeHandler ScriptEngine::GetNativeHandler(uint64_t nativeIdentifier)
 	{
 		auto it = g_registeredHandlers.find(nativeIdentifier);
 
@@ -122,17 +150,17 @@ namespace fx
 
 		if (launch::IsSDK())
 		{
-			return {};
+			return nullptr;
 		}
 
 		auto rageHandler = rage::scrEngine::GetNativeHandler(nativeIdentifier);
 
 		if (rageHandler == nullptr)
 		{
-			return boost::optional<TNativeHandler>();
+			return nullptr;
 		}
 
-		return boost::optional<TNativeHandler>([=] (ScriptContext& context)
+		return [=] (ScriptContext& context)
 		{
 /*#if USE_OPTICK
 			static std::unordered_map<uint64_t, Optick::EventDescription*> staticDescriptions;
@@ -148,13 +176,19 @@ namespace fx
 #endif*/
 
 			// push arguments from the original context
-			NativeContextRaw rageContext(context.GetArgumentBuffer(), context.GetArgumentCount());
+			NativeContextRaw rageContext(context.GetArgumentBuffer(), context.GetResultBuffer(), context.GetArgumentCount());
 
 			CallHandler(rageHandler, nativeIdentifier, rageContext);
 
 			// append vector3 result components
 			rageContext.SetVectorResults();
-		});
+		};
+	}
+
+	TNativeHandler* ScriptEngine::GetNativeHandlerPtr(uint64_t nativeIdentifier)
+	{
+		auto it = g_registeredHandlers.find(nativeIdentifier);
+		return it != g_registeredHandlers.end() ? &it->second : nullptr;
 	}
 
 	static bool __declspec(safebuffers) CallNativeHandlerUniversal(uint64_t nativeIdentifier, ScriptContext& context);
@@ -163,7 +197,7 @@ namespace fx
 
 	static bool __declspec(safebuffers) CallNativeHandlerSdk(uint64_t nativeIdentifier, ScriptContext& context)
 	{
-		auto h = ScriptEngine::GetNativeHandler(nativeIdentifier);
+		auto h = ScriptEngine::GetNativeHandlerPtr(nativeIdentifier);
 
 		if (h)
 		{
@@ -182,7 +216,7 @@ namespace fx
 		if (rageHandler)
 		{
 			// push arguments from the original context
-			NativeContextRaw rageContext(context.GetArgumentBuffer(), context.GetArgumentCount());
+			NativeContextRaw rageContext(context.GetArgumentBuffer(), context.GetResultBuffer(), context.GetArgumentCount());
 
 			CallHandler(rageHandler, nativeIdentifier, rageContext);
 
@@ -258,7 +292,7 @@ namespace fx
 				TNativeHandler* handler = reinterpret_cast<TNativeHandler*>(handlerData);
 
 				// turn into a native context
-				ScriptContextRaw cfxContext(context->GetArgumentBuffer(), context->GetArgumentCount());
+				ScriptContextRaw cfxContext(context->GetArgumentBuffer(), context->GetResultBuffer(), context->GetArgumentCount());
 
 				// call the native
 				(*handler)(cfxContext);

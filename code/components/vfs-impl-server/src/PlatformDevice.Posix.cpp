@@ -12,9 +12,15 @@
 
 namespace vfs
 {
-Device::THandle LocalDevice::Open(const std::string& fileName, bool readOnly)
+Device::THandle LocalDevice::Open(const std::string& fileName, bool readOnly, bool append)
 {
-	int fd = open(fileName.c_str(), (readOnly) ? O_RDONLY : O_RDWR);
+	int flags = (readOnly) ? O_RDONLY : O_RDWR;
+	if (append && !readOnly)
+	{
+		flags |= O_APPEND;
+	}
+
+	int fd = open(fileName.c_str(), flags);
 
 	if (fd < 0)
 	{
@@ -30,9 +36,20 @@ Device::THandle LocalDevice::OpenBulk(const std::string& fileName, uint64_t* ptr
 	return Open(fileName, true);
 }
 
-Device::THandle LocalDevice::Create(const std::string& filename)
+Device::THandle LocalDevice::Create(const std::string& filename, bool createIfExists, bool append)
 {
-	int fd = creat(filename.c_str(), 0755);
+	int flags = O_CREAT|O_WRONLY;
+	if (createIfExists)
+	{
+		flags |= O_TRUNC;
+	}
+
+	if (append)
+	{
+		flags |= O_APPEND;
+	}
+
+	int fd = open(filename.c_str(), flags, 0755);
 
 	if (fd < 0)
 	{
@@ -208,6 +225,23 @@ void LocalDevice::FindClose(THandle handle)
 	delete data;
 }
 
+uint32_t LocalDevice::GetAttributes(const std::string& filename)
+{
+	struct stat stbuf;
+	if (stat(filename.c_str(), &stbuf) < 0)
+	{
+		return -1;
+	}
+
+	uint32_t attributes = 0;
+	if (S_ISDIR(stbuf.st_mode))
+	{
+		attributes |= FILE_ATTRIBUTE_DIRECTORY;
+	}
+
+	return attributes;
+}
+
 bool LocalDevice::ExtensionCtl(int controlIdx, void* controlData, size_t controlSize)
 {
 	if (controlIdx == VFS_GET_FILE_ID && controlSize == sizeof(GetFileIdExtension))
@@ -249,6 +283,16 @@ bool LocalDevice::ExtensionCtl(int controlIdx, void* controlData, size_t control
 	}
 
 	return false;
+}
+
+bool LocalDevice::Flush(THandle handle)
+{
+	return fsync(static_cast<int>(handle)) == 0;
+}
+
+bool LocalDevice::Truncate(THandle handle, uint64_t length)
+{
+	return ftruncate(static_cast<int>(handle), length) == 0;
 }
 }
 

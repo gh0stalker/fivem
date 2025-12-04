@@ -1,5 +1,6 @@
 #include "StdInc.h"
 #include <sfFontStuff.h>
+#include <sfDefinitions.h>
 
 #include <atPool.h>
 
@@ -15,7 +16,10 @@
 
 #include <queue>
 
+#include "Hooking.Stubs.h"
+
 static std::vector<std::string> g_fontIds = {
+#ifdef GTA_FIVE
 	"$Font2",
 	"$Font5",
 	"$RockstarTAG",
@@ -26,11 +30,16 @@ static std::vector<std::string> g_fontIds = {
 	"$gtaCash",
 	// padding for bad scripts
 	"$Font2",
+	"$Taxi_font", // added in a newer release after a $Font2 for padding
 	"$Font2",
 	"$Font2",
 	"$Font2",
-	"$Font2",
+#endif
 };
+
+#if IS_RDR3
+constexpr int GAME_FONT_COUNT = 31; // common:/data/ui/fontmap.xml
+#endif
 
 static std::set<std::string> g_fontLoadQueue;
 static std::set<std::string> g_loadedFonts;
@@ -64,6 +73,7 @@ namespace sf
 	}
 }
 
+#ifdef GTA_FIVE
 static void(*gfxStringAssign)(void*, const char*);
 
 static void GetFontById(void* gfxString, int id)
@@ -75,6 +85,25 @@ static void GetFontById(void* gfxString, int id)
 
 	gfxStringAssign(gfxString, g_fontIds[id].c_str());
 }
+#else
+static char* (*g_GetFontNameById)(int id);
+static char* GetFontById(int id)
+{
+	if (id < 0 || id >= (GAME_FONT_COUNT + g_fontIds.size()))
+	{
+		trace("Font ID out of range: %d\n", id);
+		id = 0;
+	}
+	
+	if(id >= GAME_FONT_COUNT)
+	{
+		return const_cast<char*>(g_fontIds[id - GAME_FONT_COUNT].c_str());
+	}
+	
+	char* fontName = g_GetFontNameById(id);
+	return fontName;
+}
+#endif
 
 static void(*assignFontLib)(void*, void*, int);
 
@@ -142,22 +171,6 @@ static void UpdateFontLoading()
 
 static bool(*g_origFindExportedResource)(void* movieRoot, void* localDef, void* bindData, void* symbol);
 
-struct GFxMovieDef
-{
-
-};
-
-struct GRectF
-{
-	float left, top, right, bottom;
-};
-
-struct GFxMovieRoot
-{
-	char pad[200];
-	GRectF VisibleFrameRect;
-};
-
 static GFxMovieDef* g_md;
 static GFxMovieRoot* g_movie;
 
@@ -215,6 +228,14 @@ static void HandleEarlyLoading(TFn&& cb)
 				g_md = (GFxMovieDef*)* movieDefRef;
 				g_movie = (GFxMovieRoot*)movieRef;
 
+				// GH-2157: HandleSprite can be called from both MainThread and
+				// RenderThread simultaneously: ensure the heap is flagged to be
+				// thread-safe.
+				GMemoryHeap* heap = g_movie->pHeap;
+				if (!heap->useLocks)
+				{
+					heap->useLocks = true;
+				}
 				cb();
 			}
 		}
@@ -236,6 +257,8 @@ static bool FindExportedResource(void* movieRoot, void* localDef, void* bindData
 	return rv;
 }
 
+#if GTA_FIVE
+
 static bool(*g_origGetExportedResource)(void* movieDef, void* bindData, void* symbol, void* ignoreDef);
 
 static bool GetExportedResource(void* movieDef, void* bindData, void* symbol, void* ignoreDef)
@@ -253,84 +276,10 @@ static bool GetExportedResource(void* movieDef, void* bindData, void* symbol, vo
 	return rv;
 }
 
-static void AddRef(void* ptr)
-{
-	InterlockedIncrement((unsigned long*)((char*)ptr + 8));
-}
-
-static void ReleaseRef(void* ptr)
-{
-	struct VBase
-	{
-	public:
-		virtual ~VBase() = 0;
-	};
-
-	if (!InterlockedDecrement((unsigned long*)((char*)ptr + 8)))
-	{
-		delete (VBase*)ptr;
-	}
-}
-
 static hook::cdecl_stub<void*(GFxMovieRoot*, int)> _gfxMovieRoot_getLevelMovie([]()
 {
 	return hook::get_pattern("48 8B 49 40 44 8B C0 4D 03 C0 42 39 14 C1 74 0D", -0xB);
 });
-
-static void* Alloc_Align(void* self, size_t size, size_t align)
-{
-	return _aligned_malloc(size, align);
-}
-
-static void* Alloc(void* self, size_t size)
-{
-	return _aligned_malloc(size, 16);
-}
-
-static void* Realloc(void* self, void* ptr, size_t size)
-{
-	return _aligned_realloc(ptr, size, 16);
-}
-
-static void Free(void* self, void* ptr)
-{
-	_aligned_free(ptr);
-}
-
-static void* AllocAuto_Align(void* self, void* h, size_t size, size_t align)
-{
-	return _aligned_malloc(size, align);
-}
-
-static void* AllocAuto(void* self, void* h, size_t size)
-{
-	return _aligned_malloc(size, 16);
-}
-
-class GFxMemoryHeap
-{
-public:
-	virtual void m_00() = 0;
-	virtual void m_08() = 0;
-	virtual void m_10() = 0;
-	virtual void m_18() = 0;
-	virtual void m_20() = 0;
-	virtual void m_28() = 0;
-	virtual void m_30() = 0;
-	virtual void m_38() = 0;
-	virtual void m_40() = 0;
-	virtual void m_48() = 0;
-	virtual void* Alloc(uint32_t size) = 0;
-	virtual void m_58() = 0;
-	virtual void Free(void* memory) = 0;
-};
-
-extern GFxMemoryHeap** g_gfxMemoryHeap;
-
-static void* GetHeap(void* self)
-{
-	return self;
-}
 
 static LONG SafetyFilter(PEXCEPTION_POINTERS pointers)
 {
@@ -346,159 +295,22 @@ static LONG SafetyFilter(PEXCEPTION_POINTERS pointers)
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 
-struct Matrix2D
+// GH-2157: Other methods used path into GASEnvironment/GlobalEnvironment bits
+// that are not thread-safe.
+static std::mutex g_handleSprite;
+static void HandleSprite(GFxResource* resource, GFxStyledText::HTMLImageTagInfo* imgTagInfo, uint64_t document, void* md, void* character)
 {
-	float matrix[2][3];
-
-	inline Matrix2D()
-	{
-		memset(matrix, 0, sizeof(matrix));
-		matrix[0][0] = 1.0f;
-		matrix[1][1] = 1.0f;
-	}
-
-	inline void AppendScaling(float sx, float sy)
-	{
-		matrix[0][0] *= sx;
-		matrix[0][1] *= sx;
-		matrix[0][2] *= sx;
-		matrix[1][0] *= sy;
-		matrix[1][1] *= sy;
-		matrix[1][2] *= sy;
-	}
-
-	inline void AppendTranslation(float dx, float dy)
-	{
-		matrix[0][2] += dx;
-		matrix[1][2] += dy;
-	}
-
-	inline void Prepend(const Matrix2D& m)
-	{
-		Matrix2D t = *this;
-		matrix[0][0] = t.matrix[0][0] * m.matrix[0][0] + t.matrix[0][1] * m.matrix[1][0];
-		matrix[1][0] = t.matrix[1][0] * m.matrix[0][0] + t.matrix[1][1] * m.matrix[1][0];
-		matrix[0][1] = t.matrix[0][0] * m.matrix[0][1] + t.matrix[0][1] * m.matrix[1][1];
-		matrix[1][1] = t.matrix[1][0] * m.matrix[0][1] + t.matrix[1][1] * m.matrix[1][1];
-		matrix[0][2] = t.matrix[0][0] * m.matrix[0][2] + t.matrix[0][1] * m.matrix[1][2] + t.matrix[0][2];
-		matrix[1][2] = t.matrix[1][0] * m.matrix[0][2] + t.matrix[1][1] * m.matrix[1][2] + t.matrix[1][2];
-	}
-};
-
-struct CXform
-{
-	float matrix[4][2];
-
-	CXform()
-	{
-		matrix[0][0] = 1.0f;
-		matrix[1][0] = 1.0f;
-		matrix[2][0] = 1.0f;
-		matrix[3][0] = 1.0f;
-		matrix[0][1] = 0.0f;
-		matrix[1][1] = 0.0f;
-		matrix[2][1] = 0.0f;
-		matrix[3][1] = 0.0f;
-	}
-};
-
-struct GFxTextImageDesc
-{
-	void* vtbl;
-	int refcount;
-	void* imageShape;
-	void* spriteShape;
-	int baseLineX;
-	int baseLineY;
-	uint32_t screenWidth;
-	uint32_t screenHeight;
-	Matrix2D matrix;
-};
-
-struct HTMLImageTagInfo
-{
-	GFxTextImageDesc* textImageDesc;
-	char pad[32];
-	uint32_t Width, Height;
-};
-
-struct GFxResource
-{
-	virtual void m_0() = 0;
-	virtual void m_1() = 0;
-	virtual int GetType() = 0;
-
-	inline bool IsSprite()
-	{
-		return ((GetType() >> 8) & 0xff) == 0x84;
-	}
-};
-
-struct GFxSprite
-{
-	virtual void m0() = 0;
-	virtual void m1() = 0;
-	virtual void m2() = 0;
-	virtual void m3() = 0;
-	virtual void m4() = 0;
-	virtual void m5() = 0;
-	virtual void m6() = 0;
-	virtual void m7() = 0;
-	virtual void m8() = 0;
-	virtual void m9() = 0;
-	virtual void m10() = 0;
-	virtual void m11() = 0;
-	virtual void m12() = 0;
-	virtual void m13() = 0;
-	virtual void m14() = 0;
-	virtual void m15() = 0;
-	virtual GRectF GetRectBounds(const Matrix2D& matrix) = 0;
-	virtual void m17() = 0;
-	virtual void m18() = 0;
-	virtual void m19() = 0;
-	virtual void m20() = 0;
-	virtual void m21() = 0;
-	virtual void m22() = 0;
-	virtual void m23() = 0;
-	virtual void m24() = 0;
-	virtual void m25() = 0;
-	virtual void m26() = 0;
-	virtual void m27() = 0;
-	virtual void m28() = 0;
-	virtual void Display(void* context) = 0;
-	virtual void Restart() = 0;
-};
-
-struct GFxSpriteDef : public GFxResource
-{
-	virtual void m_s0() = 0;
-	virtual void m_s1() = 0;
-	virtual void m_s2() = 0;
-	virtual void m_s3() = 0;
-	virtual void m_s4() = 0;
-	virtual void m_s5() = 0;
-	virtual void* CreateCharacterInstance(void* parent, uint32_t* id,
-		void* pbindingImpl) = 0;
-};
-
-struct DisplayContext
-{
-	CXform* parentCxform;
-	Matrix2D* parentMatrix;
-};
-
-static void HandleSprite(GFxResource* resource, HTMLImageTagInfo* imgTagInfo, uint64_t document, void* md, void* character)
-{
+	std::unique_lock _(g_handleSprite);
 	auto sprite = (GFxSpriteDef*)resource;
 
 	static uint32_t id = 0x1234;
 	auto ci = (GFxSprite*)sprite->CreateCharacterInstance(character ? character : _gfxMovieRoot_getLevelMovie(g_movie, 0), &id, g_md ? g_md : md);
 
-	AddRef(ci);
+	ci->AddRef();
 
 	if (imgTagInfo->textImageDesc->spriteShape)
 	{
-		ReleaseRef(imgTagInfo->textImageDesc->spriteShape);
+		imgTagInfo->textImageDesc->spriteShape->Release();
 	}
 
 	imgTagInfo->textImageDesc->spriteShape = ci;
@@ -508,7 +320,7 @@ static void HandleSprite(GFxResource* resource, HTMLImageTagInfo* imgTagInfo, ui
 
 	ci->Restart();
 
-	auto rect = ci->GetRectBounds(Matrix2D{});
+	auto rect = ci->GetRectBounds(GMatrix2D{});
 	float origWidth = abs(rect.right - rect.left);
 	float origHeight = abs(rect.bottom - rect.top);
 
@@ -525,40 +337,56 @@ static void HandleSprite(GFxResource* resource, HTMLImageTagInfo* imgTagInfo, ui
 	// SetCompleteReformatReq
 	*(uint8_t*)(document + 456i64) |= 2u;
 
-	ReleaseRef(ci);
+	ci->Release();
 }
+#endif
 
 static HookFunction hookFunction([]()
 {
 	// get font by id, hook
 	{
+#ifdef GTA_FIVE
 		auto location = hook::get_pattern<char>("85 D2 74 68 FF CA 74 5B FF CA 74 4E");
 		hook::jump(location, GetFontById);
 		hook::set_call(&gfxStringAssign, location + 115);
+#else
+		auto location = hook::get_call(hook::get_pattern<char>("E8 ? ? ? ? 33 C9 48 89 45 ? 48 85 FF"));
+		g_GetFontNameById = hook::trampoline(location, GetFontById);
+#endif
 	}
 
 	// init font things
 	{
-		auto location = hook::get_pattern<char>("BA 13 00 00 00 48 8B 48 20 48 8B 01 FF 50 10 44");
-		hook::set_call(&assignFontLib, location + 32);
-		hook::call(location + 32, AssignFontLibWrap);
+#ifdef GTA_FIVE
+		auto location = hook::get_pattern<char>("BA 13 00 00 00 48 8B 48 20 48 8B 01 FF 50 10 44", 32);
+#else
+		auto location = hook::get_pattern<char>("E8 ? ? ? ? 48 63 53 ? 48 8B 05");
+#endif
+		hook::set_call(&assignFontLib, location);
+		hook::call(location, AssignFontLibWrap);
 	}
 
 	{
+#ifdef GTA_FIVE
 		auto location = hook::get_pattern<char>("74 1A 80 3D ? ? ? ? 00 74 11 E8 ? ? ? ? 48 8B");
+#else
+		auto location = hook::get_pattern<char>("E8 ? ? ? ? 48 63 53 ? 48 8B 05");
+#endif
 		g_scaleformMgr = hook::get_address<void**>(location + 19);
 	}
-
-	OnLookAliveFrame.Connect([]()
-	{
-		InitEarlyLoading();
-	});
-
+	
 	OnMainGameFrame.Connect([]()
 	{
 		UpdateFontLoading();
 	});
 
+#ifdef GTA_FIVE
+
+	OnLookAliveFrame.Connect([]()
+	{
+		InitEarlyLoading();
+	});
+	
 	// find resource parent movie defs
 	MH_Initialize();
 	MH_CreateHook(hook::get_pattern("B0 01 EB 47 48 8B 5F 70 48 83 C7 68", -0x39), FindExportedResource, (void**)&g_origFindExportedResource);
@@ -585,7 +413,7 @@ static HookFunction hookFunction([]()
 			ret();
 		}
 
-		static void HandleNewImageTag(HTMLImageTagInfo* imgTagInfo, GFxResource* resource, void* self, void* md)
+		static void HandleNewImageTag(GFxStyledText::HTMLImageTagInfo* imgTagInfo, GFxResource* resource, void* self, void* md)
 		{
 			if (resource->IsSprite())
 			{
@@ -638,7 +466,7 @@ static HookFunction hookFunction([]()
 			ret();
 		}
 
-		static int HandleNewImageTag(HTMLImageTagInfo* imgTagInfo, GFxResource* resource, uint64_t document)
+		static int HandleNewImageTag(GFxStyledText::HTMLImageTagInfo* imgTagInfo, GFxResource* resource, uint64_t document)
 		{
 			__try
 			{
@@ -689,7 +517,7 @@ static HookFunction hookFunction([]()
 			ret();
 		}
 
-		static void DrawSprite(GFxTextImageDesc* image, DisplayContext* drawContext, const Matrix2D* matrix)
+		static void DrawSprite(GFxTextImageDesc* image, GFxDisplayContext* drawContext, const GMatrix2D* matrix)
 		{
 			// add a SEH frame here so we won't try unwinding over the jitasm stub
 			__try
@@ -702,7 +530,7 @@ static HookFunction hookFunction([]()
 			}
 		}
 
-		static void DrawSpriteInternal(GFxTextImageDesc* image, DisplayContext* drawContext, const Matrix2D* matrix)
+		static void DrawSpriteInternal(GFxTextImageDesc* image, GFxDisplayContext* drawContext, const GMatrix2D* matrix)
 		{
 			// expand the visible rectangle of the placeholder movie
 			// otherwise, only ~600x400 on-screen gets sprites drawn due to culling tests
@@ -722,7 +550,7 @@ static HookFunction hookFunction([]()
 			m2.Prepend(image->matrix);
 
 			// set the matrix/color transform in the context
-			CXform identityCxform;
+			GRenderer::CXform identityCxform;
 
 			auto oldParentCxform = drawContext->parentCxform;
 			auto oldParentMatrix = drawContext->parentMatrix;
@@ -745,20 +573,6 @@ static HookFunction hookFunction([]()
 	// fix bug when img tag is last in a text formatting tag (https://github.com/citizenfx/fivem/issues/1112)
 	static void (*origPopBack)(void* vec, size_t len);
 
-	struct TextFormat
-	{
-		char pad[66];
-		uint16_t presentMask;
-		char pad2[12];
-	};
-
-	struct ElemDesc
-	{
-		char pad[32];
-		TextFormat fmt;
-		char paraFmt[24];
-	};
-
 	static struct : jitasm::Frontend
 	{
 		void InternalMain() override
@@ -768,7 +582,7 @@ static HookFunction hookFunction([]()
 			jmp(rax);
 		}
 
-		static void ParseHtmlReset(ElemDesc** vec, size_t len, TextFormat* format)
+		static void ParseHtmlReset(GFxElemDesc** vec, size_t len, GFxTextFormat* format)
 		{
 			if (len > 0)
 			{
@@ -789,26 +603,11 @@ static HookFunction hookFunction([]()
 		hook::call(location, parseHtmlStub.GetCode());
 		hook::call(location + 0x62, parseHtmlStub.GetCode());
 	}
-
-	// formerly debuggability for GFx heap, but as it seems now this is required to not get memory corruption
-	// (memory locking, maybe? GFx allows disabling thread safety of its heap)
-	// TODO: figure this out
-	auto memoryHeapPt = hook::get_address<void**>(hook::get_call(hook::get_pattern<char>("41 F6 06 04 75 03 83 CD 20", 12)) + 0x19);
-	hook::put(&memoryHeapPt[9], Alloc_Align);
-	hook::put(&memoryHeapPt[10], Alloc);
-	hook::put(&memoryHeapPt[11], Realloc);
-	hook::put(&memoryHeapPt[12], Free);
-	hook::put(&memoryHeapPt[13], AllocAuto_Align);
-	hook::put(&memoryHeapPt[14], AllocAuto);
-	hook::put(&memoryHeapPt[15], GetHeap);
+#endif
 
 	// undo fonts if reloading
 	OnKillNetworkDone.Connect([]()
 	{
 		g_loadedFonts.clear();
 	});
-
-	// always enable locking for GFx heap
-	// doesn't fix it, oddly - probably singlethreaded non-atomic reference counts?
-	//hook::put<uint8_t>(hook::get_pattern("24 01 41 88 87 C0 00 00 00 41 8B"), 0xB0);
 });

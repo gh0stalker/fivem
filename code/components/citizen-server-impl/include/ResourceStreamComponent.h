@@ -19,6 +19,7 @@ namespace fx
 			uint32_t rscVersion;
 			uint32_t size;
 			bool isResource;
+			bool e;
 
 			std::string GetCacheString();
 		};
@@ -48,12 +49,14 @@ namespace fx
 
 		virtual void SetCustomValidateFunction(std::function<void(Entry&, fwRefContainer<vfs::Stream>)> func);
 
+		void CheckSizes(int* numWarnings);
+
 	private:
 		bool ShouldUpdateSet();
 
 		bool UpdateSet();
 
-		void ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize);
+		void ValidateSize(std::string_view name, uint32_t physSize, uint32_t virtSize, int* numWarnings);
 
 	private:
 		fx::Resource* m_resource;

@@ -20,6 +20,8 @@
 #include <GameAudioState.h>
 #endif
 
+#include <Error.h>
+
 namespace WRL = Microsoft::WRL;
 
 using nui::GITexture;
@@ -38,6 +40,8 @@ private:
 	bool m_targetMouseFocus = true;
 
 	bool m_lastTargetMouseFocus = true;
+
+	bool m_flushMouse = true;
 
 public:
 	virtual void GetGameResolution(int* width, int* height) override;
@@ -61,17 +65,19 @@ public:
 
 	virtual void UnsetTexture() override;
 
-	virtual void SetGameMouseFocus(bool val) override
+	virtual void SetGameMouseFocus(bool val, bool flushMouse = true) override
 	{
 		m_targetMouseFocus = val;
+		m_flushMouse = flushMouse;
 	}
 
 	void UpdateMouseFocus()
 	{
 		if (m_targetMouseFocus != m_lastTargetMouseFocus)
 		{
-			InputHook::SetGameMouseFocus(m_targetMouseFocus);
+			InputHook::SetGameMouseFocus(m_targetMouseFocus, m_flushMouse);
 			m_lastTargetMouseFocus = m_targetMouseFocus;
+			m_flushMouse = true;
 		}
 	}
 
@@ -124,7 +130,6 @@ public:
 
 static tbb::concurrent_queue<std::function<void()>> g_onRenderQueue;
 static tbb::concurrent_queue<std::function<void()>> g_earlyOnRenderQueue;
-static std::mutex g_frontendDeletionMutex;
 
 class GtaNuiTextureBase : public nui::GITexture
 {
@@ -136,8 +141,6 @@ class GtaNuiTexture final : public GtaNuiTextureBase
 {
 private:
 	rage::grcTexture* m_texture;
-
-	std::shared_ptr<GtaNuiTexture*> m_canary;
 
 	bool m_overriddenTexture;
 
@@ -153,23 +156,16 @@ public:
 	explicit GtaNuiTexture(std::function<rage::grcTexture*(GtaNuiTexture*)> fn)
 		: m_texture(nullptr), m_overriddenTexture(false), m_overriddenSRV(false)
 	{
-		m_canary = std::make_shared<GtaNuiTexture*>(this);
-
-		// make a weak reference to the class pointer, so if it gets `delete`d, we can just ignore this creation attempt
-		std::weak_ptr<GtaNuiTexture*> weakCanary = m_canary;
-
-		g_onRenderQueue.push([weakCanary, fn]()
+		g_onRenderQueue.push([self = fwRefContainer(this), fn]()
 		{
-			std::unique_lock<std::mutex> lock(g_frontendDeletionMutex);
-			auto ref = weakCanary.lock();
-
-			if (ref)
+			if (self.GetRefCount() > 1) // Don't bother creating the texture if we are the only reference left
 			{
-				(*ref)->m_texture = fn(*ref);
-			}
-			else
-			{
+				std::unique_lock _(self->TextureLock);
 
+				self->m_texture = fn(self.GetRef());
+
+				self->OnMaterialize(self->m_texture);
+				self->OnMaterialize.Reset();
 			}
 		});
 	}
@@ -243,9 +239,27 @@ public:
 		return m_texture;
 #endif
 	}
+
 	virtual void* GetHostTexture() override
 	{
 		return m_texture;
+	}
+
+	virtual void WithHostTexture(std::function<void(void*)>&& callback) override
+	{
+		std::unique_lock _(TextureLock);
+
+		if (auto texture = GetHostTexture())
+		{
+			callback(texture);
+		}
+		else
+		{
+			OnMaterialize.Connect([callback = std::move(callback)](void* texture)
+			{
+				callback(texture);
+			});
+		}
 	}
 
 	virtual bool Map(int numSubLevels, int subLevel, nui::GILockedTexture* lockedTexture, nui::GILockFlags flags) override
@@ -301,6 +315,10 @@ public:
 		m_texture->m_pITexture->UnlockRect(0);
 #endif
 	}
+
+private:
+	fwEvent<void*> OnMaterialize;
+	std::mutex TextureLock;
 };
 
 #ifdef IS_RDR3
@@ -309,28 +327,15 @@ class GtaNuiDynamicTexture final : public GtaNuiTextureBase
 private:
 	rage::sga::ext::DynamicTexture2* m_texture;
 
-	std::shared_ptr<GtaNuiDynamicTexture*> m_canary;
-
 public:
 	explicit GtaNuiDynamicTexture(std::function<rage::sga::ext::DynamicTexture2*(GtaNuiDynamicTexture*)> fn)
 		: m_texture(nullptr)
 	{
-		m_canary = std::make_shared<GtaNuiDynamicTexture*>(this);
-
-		// make a weak reference to the class pointer, so if it gets `delete`d, we can just ignore this creation attempt
-		std::weak_ptr<GtaNuiDynamicTexture*> weakCanary = m_canary;
-
-		g_onRenderQueue.push([weakCanary, fn]()
+		g_onRenderQueue.push([self = fwRefContainer(this), fn]()
 		{
-			std::unique_lock<std::mutex> lock(g_frontendDeletionMutex);
-			auto ref = weakCanary.lock();
-
-			if (ref)
+			if (self.GetRefCount() > 1) // Don't bother creating the texture if we are the only reference left
 			{
-				(*ref)->m_texture = fn(*ref);
-			}
-			else
-			{
+				self->m_texture = fn(self.GetRef());
 			}
 		});
 	}
@@ -462,12 +467,15 @@ fwRefContainer<GITexture> GtaNuiInterface::CreateTextureBacking(int width, int h
 	assert(format == GITextureFormat::ARGB);
 
 #if defined(GTA_FIVE)
-	rage::grcManualTextureDef textureDef;
-	memset(&textureDef, 0, sizeof(textureDef));
-	textureDef.isStaging = 0;
-	textureDef.arraySize = 1;
-
-	return new GtaNuiTexture(rage::grcTextureFactory::getInstance()->createManualTexture(width, height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef));
+	return new GtaNuiTexture([width, height](GtaNuiTexture*)
+	{
+		rage::grcManualTextureDef textureDef;
+		memset(&textureDef, 0, sizeof(textureDef));
+		textureDef.isStaging = 1;
+		textureDef.usage = 1;
+		textureDef.arraySize = 1;
+		return rage::grcTextureFactory::getInstance()->createManualTexture(width, height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
+	});
 #elif defined(IS_RDR3)
 	return new GtaNuiDynamicTexture([width, height](GtaNuiDynamicTexture*)
 	{
@@ -504,6 +512,10 @@ fwRefContainer<GITexture> GtaNuiInterface::CreateTextureBacking(int width, int h
 
 #pragma comment(lib, "vulkan-1.lib")
 
+#ifdef IS_RDR3
+#include <VulkanHelper.h>
+#endif
+
 fwRefContainer<GITexture> GtaNuiInterface::CreateTextureFromShareHandle(HANDLE shareHandle, int width, int height)
 {
 #ifndef GTA_NY
@@ -513,57 +525,56 @@ fwRefContainer<GITexture> GtaNuiInterface::CreateTextureFromShareHandle(HANDLE s
 #ifdef GTA_FIVE
 	ID3D11Device* device = ::GetD3D11Device();
 
-	WRL::ComPtr<ID3D11Texture2D> texture;
-	if (SUCCEEDED(device->OpenSharedResource(shareHandle, IID_PPV_ARGS(&texture))))
+	WRL::ComPtr<ID3D11Texture2D> resource;
+	if (SUCCEEDED(device->OpenSharedResource(shareHandle, IID_PPV_ARGS(&resource))))
 	{
-		D3D11_TEXTURE2D_DESC desc;
-		texture->GetDesc(&desc);
-
-		struct
+		return new GtaNuiTexture([device, resource](GtaNuiTexture* texture)
 		{
-			void* vtbl;
-			ID3D11Device* rawDevice;
-		}*deviceStuff = (decltype(deviceStuff))device;
+			D3D11_TEXTURE2D_DESC desc;
+			resource->GetDesc(&desc);
 
-		rage::grcManualTextureDef textureDef;
-		memset(&textureDef, 0, sizeof(textureDef));
-		textureDef.isStaging = 0;
-		textureDef.arraySize = 1;
-
-		auto texRef = rage::grcTextureFactory::getInstance()->createManualTexture(desc.Width, desc.Height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
-
-		if (texRef)
-		{
-			if (texRef->texture)
+			struct
 			{
-#ifdef GTA_FIVE
-				rage::grcResourceCache::GetInstance()->QueueDelete(texRef->texture);
-				
-				g_onRenderQueue.push([]()
+				void* vtbl;
+				ID3D11Device* rawDevice;
+			}* deviceStuff = (decltype(deviceStuff))device;
+
+			rage::grcManualTextureDef textureDef;
+			memset(&textureDef, 0, sizeof(textureDef));
+			textureDef.isStaging = 1;
+			textureDef.usage = 1;
+			textureDef.arraySize = 1;
+
+			auto texRef = rage::grcTextureFactory::getInstance()->createManualTexture(desc.Width, desc.Height, 2 /* maps to BGRA DXGI format */, nullptr, true, &textureDef);
+
+			if (texRef)
+			{
+				if (texRef->texture)
 				{
+#ifdef GTA_FIVE
+					rage::grcResourceCache::GetInstance()->QueueDelete(texRef->texture);
 					rage::grcResourceCache::GetInstance()->FlushQueue();
-				});
 #else
-				texRef->texture->Release();
+					texRef->texture->Release();
 #endif
-				texRef->texture = NULL;
+					texRef->texture = NULL;
+				}
+
+				resource.CopyTo(&texRef->texture);
+
+				if (texRef->srv)
+				{
+					texRef->srv->Release();
+				}
+
+				deviceStuff->rawDevice->CreateShaderResourceView(resource.Get(), nullptr, &texRef->srv);
 			}
 
-			texture.CopyTo(&texRef->texture);
+			texture->MarkOverriddenSRV();
+			texture->MarkOverriddenTexture();
 
-			if (texRef->srv)
-			{
-				texRef->srv->Release();
-			}
-
-			deviceStuff->rawDevice->CreateShaderResourceView(texture.Get(), nullptr, &texRef->srv);
-		}
-
-		auto texture = new GtaNuiTexture(texRef);
-		texture->MarkOverriddenSRV();
-		texture->MarkOverriddenTexture();
-
-		return texture;
+			return texRef;
+		});
 	}
 #elif GTA_NY
 	// ?
@@ -653,8 +664,14 @@ fwRefContainer<GITexture> GtaNuiInterface::CreateTextureFromShareHandle(HANDLE s
 				ImageCreateInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
 				ImageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 				ImageCreateInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
 				VkImage Image;
-				assert(vkCreateImage(device, &ImageCreateInfo, nullptr, &Image) == VK_SUCCESS);
+				VkResult result = vkCreateImage(device, &ImageCreateInfo, nullptr, &Image);
+
+				if (result != VK_SUCCESS)
+				{
+					FatalError("Failed to create a Vulkan image. VkResult: %s", ResultToString(result));
+				}
 
 				VkMemoryRequirements MemoryRequirements;
 				vkGetImageMemoryRequirements(device, Image, &MemoryRequirements);
@@ -676,11 +693,23 @@ fwRefContainer<GITexture> GtaNuiInterface::CreateTextureFromShareHandle(HANDLE s
 				static auto _vkBindImageMemory2 = (PFN_vkBindImageMemory2)vkGetDeviceProcAddr(device, "vkBindImageMemory2");
 
 				VkDeviceMemory ImageMemory;
-				assert(vkAllocateMemory(device, &MemoryAllocateInfo, nullptr, &ImageMemory) == VK_SUCCESS);
+				result = vkAllocateMemory(device, &MemoryAllocateInfo, nullptr, &ImageMemory);
+
+				if (result != VK_SUCCESS)
+				{
+					FatalError("Failed to allocate memory for Vulkan. VkResult: %s", ResultToString(result));
+				}
+
 				VkBindImageMemoryInfo BindImageMemoryInfo = { VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO };
 				BindImageMemoryInfo.image = Image;
 				BindImageMemoryInfo.memory = ImageMemory;
-				assert(_vkBindImageMemory2(device, 1, &BindImageMemoryInfo) == VK_SUCCESS);
+
+				result = _vkBindImageMemory2(device, 1, &BindImageMemoryInfo);
+
+				if (result != VK_SUCCESS)
+				{
+					FatalError("Failed to bind Vulkan image memory. VkResult: %s", ResultToString(result));
+				}
 
 				auto newImage = new rage::sga::TextureVK::ImageData;
 				//memcpy(newImage, texRef->image, sizeof(*newImage));

@@ -1,11 +1,11 @@
 [
   "net:base",
+  "net:packet",
   "net:tcp-server",
   "net:http-server",
   "citizen:server:net",
   "citizen:scripting:core",
   "citizen:scripting:lua",
-  "citizen:scripting:lua54",
   "conhost:server",
   "citizen:server:main",
   "citizen:server:instance",
@@ -20,7 +20,10 @@
   "scripting:server",
   "svadhesive",
   "citizen:scripting:mono",
+  "citizen:scripting:mono-v2",
   "citizen:scripting:v8node",
+  "citizen:scripting:node",
   "voip-server:mumble",
-  "http-client"
+  "http-client",
+  "pool-sizes-state"
 ]

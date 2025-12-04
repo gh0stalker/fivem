@@ -8,6 +8,9 @@
 #include <atPool.h>
 #include <DirectXMath.h>
 #include <CrossBuildRuntime.h>
+#include <GameInit.h>
+
+#include "GameValueStub.h"
 
 #define DECLARE_ACCESSOR(x) \
 	decltype(impl.m2060.x)& x()        \
@@ -220,7 +223,7 @@ static CMloRoomDef* GetInteriorRoomDef(int interiorId, int roomId)
 {
 	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
 
-	if (arch == nullptr || roomId < 0 || roomId > arch->rooms->GetCount())
+	if (arch == nullptr || roomId < 0 || roomId >= arch->rooms->GetCount())
 	{
 		return nullptr;
 	}
@@ -232,7 +235,7 @@ static CMloPortalDef* GetInteriorPortalDef(int interiorId, int portalId)
 {
 	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
 
-	if (arch == nullptr || portalId < 0 || portalId > arch->portals->GetCount())
+	if (arch == nullptr || portalId < 0 || portalId >= arch->portals->GetCount())
 	{
 		return nullptr;
 	}
@@ -244,7 +247,7 @@ static CMloEntitySet* GetInteriorEntitySet(int interiorId, int setId)
 {
 	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
 
-	if (arch == nullptr || setId < 0 || setId > arch->entitySets->GetCount())
+	if (arch == nullptr || setId < 0 || setId >= arch->entitySets->GetCount())
 	{
 		return nullptr;
 	}
@@ -278,7 +281,7 @@ static CMloTimeCycleModifier* GetInteriorTimecycleModifier(int interiorId, int m
 {
 	CMloModelInfo* arch = GetInteriorArchetype(interiorId);
 
-	if (arch == nullptr || modId < 0 || modId > arch->timecycleModifiers->GetCount())
+	if (arch == nullptr || modId < 0 || modId >= arch->timecycleModifiers->GetCount())
 	{
 		return nullptr;
 	}
@@ -303,8 +306,37 @@ static int GetInteriorRoomIdByHash(CMloModelInfo* arch, int searchHash)
 	return -1;
 }
 
+static GameValueStub<float> g_emitterAudioEntityProbeLength;
+static float g_interiorProbeLengthOverride = 0.0;
+
+static bool (*g_CPortalTracker__Probe)(Vector3* pos, CInteriorInst** ppInteriorInstance, int* roomId, Vector3* traceImpactPoint, float traceLength);
+static bool CPortalTracker__Probe(Vector3* pos, CInteriorInst** ppInteriorInstance, int* roomId, Vector3* traceImpactPoint, float traceLength)
+{
+	// game code has a lot of different special case handling in CPortalTracker::vft0x8
+	// joaat('xs_arena_interior') seems to be the case with the longest traceLength override (150.f)
+	//
+	if (g_interiorProbeLengthOverride > 0.0f && traceLength < g_interiorProbeLengthOverride)
+	{
+		traceLength = g_interiorProbeLengthOverride;
+	}
+
+	return g_CPortalTracker__Probe(pos, ppInteriorInstance, roomId, traceImpactPoint, traceLength);
+}
+
 static HookFunction initFunction([]()
 {
+	{
+		auto location = hook::get_pattern<void>("E8 ? ? ? ? 40 8A F8 49 ? ? E8");
+		hook::set_call(&g_CPortalTracker__Probe, location);
+		hook::call(location, CPortalTracker__Probe);
+	}
+
+	{
+		auto location = hook::get_pattern<uint32_t>("33 ED 39 A9 ? ? ? ? 0F 86 ? ? ? ? F3", 18);
+		g_emitterAudioEntityProbeLength.Init(*hook::get_address<float*>(location));
+		g_emitterAudioEntityProbeLength.SetLocation(location);
+	}
+
 	{
 		auto location = hook::get_pattern<char>("BA A1 85 94 52 41 B8 01", 0x34);
 
@@ -388,6 +420,30 @@ static HookFunction initFunction([]()
 		}
 	});
 #endif
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_INTERIOR_PROBE_LENGTH", [=](fx::ScriptContext& context)
+	{
+		auto length = context.GetArgument<float>(0);
+		if (!std::isfinite(length))
+		{
+			return false;
+		}
+
+		g_interiorProbeLengthOverride = std::clamp(length, 0.0f, 150.0f);
+		return true;
+	});
+
+	fx::ScriptEngine::RegisterNativeHandler("SET_EMITTER_PROBE_LENGTH", [=](fx::ScriptContext& context)
+	{
+		auto length = context.GetArgument<float>(0);
+		if (!std::isfinite(length))
+		{
+			return false;
+		}
+
+		g_emitterAudioEntityProbeLength.Set(std::clamp(length, 20.0f, 150.0f));
+		return true;
+	});
 
 	fx::ScriptEngine::RegisterNativeHandler("GET_INTERIOR_ROOM_INDEX_BY_HASH", [=](fx::ScriptContext& context)
 	{
@@ -533,7 +589,7 @@ static HookFunction initFunction([]()
 
 		CMloPortalDef* portalDef = GetInteriorPortalDef(interiorId, portalId);
 
-		if (cornerIndex < 0 || cornerIndex > portalDef->corners.GetCount())
+		if (cornerIndex < 0 || cornerIndex >= portalDef->corners.GetCount())
 		{
 			return false;
 		}
@@ -864,5 +920,12 @@ static HookFunction initFunction([]()
 		*context.GetArgument<float*>(6) = entityDef->rotation.w;
 
 		return true;
+	});
+
+	// Sharing OnKillNetworkDone for probe lengths
+	OnKillNetworkDone.Connect([]()
+	{
+		g_interiorProbeLengthOverride = 0.0f;
+		g_emitterAudioEntityProbeLength.Reset();
 	});
 });

@@ -35,11 +35,10 @@ void MumbleUser::UpdateUser(MumbleProto::UserState& state)
 
 	if (state.has_name())
 	{
-		std::string name = state.name();
-		m_name = ConvertFromUTF8(name);
-		if (name.length() >= 2)
+		m_name = state.name();
+		if (m_name.length() >= 2)
 		{
-			m_serverId = atoi(name.substr(1, name.length() - 1).c_str());
+			m_serverId = atoi(m_name.substr(1, m_name.length() - 1).c_str());
 		} 
 		else
 		{
@@ -76,10 +75,13 @@ void MumbleUser::UpdateUser(MumbleProto::UserState& state)
 	{
 		m_currentChannelId = state.channel_id();
 	}
+
+	console::DPrintf("mumble", "%s joined channel %d\n", m_name, m_currentChannelId);
 }
 
 void MumbleClientState::ProcessUserState(MumbleProto::UserState& userState)
 {
+
 	std::shared_ptr<MumbleUser> createdUser;
 
 	if (userState.has_session())
@@ -97,7 +99,7 @@ void MumbleClientState::ProcessUserState(MumbleProto::UserState& userState)
 
 			createdUser = user;
 
-			console::DPrintf("Mumble", "New user: %s\n", ToNarrow(user->GetName()));
+			console::DPrintf("Mumble", "New user: %s\n", user->GetName());
 		}
 		else
 		{

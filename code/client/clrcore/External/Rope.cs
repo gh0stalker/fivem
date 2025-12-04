@@ -1,11 +1,21 @@
 using System;
+
+#if MONO_V2
+using CitizenFX.Core;
+using API = CitizenFX.FiveM.Native.Natives;
+
+namespace CitizenFX.FiveM
+#else
 using CitizenFX.Core.Native;
-using System.Security;
 
 namespace CitizenFX.Core
+#endif
 {
 	public enum RopeType
 	{
+		ThinRope = 0,
+		DefaultRope = 1,
+		DefaultWire = 3,
 		ThickRope = 4,
 		ThinMetalWire = 5,
 	}

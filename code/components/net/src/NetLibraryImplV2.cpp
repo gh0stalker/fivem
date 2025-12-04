@@ -26,7 +26,9 @@ public:
 
 	virtual void SendReliableCommand(uint32_t type, const char* buffer, size_t length) override;
 
-	virtual void SendUnreliableCommand(uint32_t type, const char* buffer, size_t length) override;
+	virtual void SendReliablePacket(uint32_t type, const char* buffer, size_t length) override;
+
+	virtual void SendUnreliablePacket(uint32_t type, const char* buffer, size_t length) override;
 
 	virtual bool HasTimedOut() override;
 
@@ -119,24 +121,38 @@ void NetLibraryImplV2::SendReliableCommand(uint32_t type, const char* buffer, si
 	if (!m_timedOut && m_serverPeer)
 	{
 		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), ENET_PACKET_FLAG_RELIABLE);
-
-		enet_peer_send(m_serverPeer, 0, packet);
+		if (enet_peer_send(m_serverPeer, 0, packet) != 0)
+		{
+			enet_packet_destroy(packet);
+		}
 	}
 
 	m_base->GetMetricSink()->OnOutgoingCommand(type, length, true);
 }
 
-void NetLibraryImplV2::SendUnreliableCommand(uint32_t type, const char* buffer, size_t length)
+void NetLibraryImplV2::SendReliablePacket(uint32_t type, const char* buffer, size_t length)
 {
-	net::Buffer msg;
-	msg.Write(type);
-	msg.Write(buffer, length);
-
 	if (!m_timedOut && m_serverPeer)
 	{
-		ENetPacket* packet = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), (ENetPacketFlag)0);
+		ENetPacket* packet = enet_packet_create(buffer, length, ENET_PACKET_FLAG_RELIABLE);
+		if (enet_peer_send(m_serverPeer, 0, packet) != 0)
+		{
+			enet_packet_destroy(packet);
+		}
+	}
 
-		enet_peer_send(m_serverPeer, 0, packet);
+	m_base->GetMetricSink()->OnOutgoingCommand(type, length, true);
+}
+
+void NetLibraryImplV2::SendUnreliablePacket(uint32_t type, const char* buffer, size_t length)
+{
+	if (!m_timedOut && m_serverPeer)
+	{
+		ENetPacket* packet = enet_packet_create(buffer, length, (ENetPacketFlag)0);
+		if (enet_peer_send(m_serverPeer, 0, packet) != 0)
+		{
+			enet_packet_destroy(packet);
+		}
 	}
 
 	m_base->GetMetricSink()->OnOutgoingCommand(type, length, false);
@@ -208,7 +224,10 @@ void NetLibraryImplV2::RunFrame()
 			buf.Write(m_connectData.c_str(), m_connectData.size());
 
 			ENetPacket* packet = enet_packet_create(buf.GetBuffer(), buf.GetCurOffset(), ENET_PACKET_FLAG_RELIABLE);
-			enet_peer_send(event.peer, 0, packet);
+			if (enet_peer_send(event.peer, 0, packet) != 0)
+			{
+				enet_packet_destroy(packet);
+			}
 			break;
 		}
 		case ENET_EVENT_TYPE_RECEIVE:
@@ -222,14 +241,7 @@ void NetLibraryImplV2::RunFrame()
 		}
 		case ENET_EVENT_TYPE_DISCONNECT:
 		{
-			if (Instance<ICoreGameInit>::Get()->NetProtoVersion >= 0x201902101056)
-			{
-				m_serverPeer = nullptr;
-			}
-			else
-			{
-				m_timedOut = true;
-			}
+			m_serverPeer = nullptr;
 
 			//m_timedOut = true;
 			break;
@@ -250,7 +262,11 @@ void NetLibraryImplV2::RunFrame()
 
 			msg.Write(packet.payload.c_str(), packet.payload.size());
 
-			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), (ENetPacketFlag)0));
+			ENetPacket* packetCopy = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), (ENetPacketFlag)0);
+			if (enet_peer_send(m_serverPeer, 1, packetCopy) != 0)
+			{
+				enet_packet_destroy(packetCopy);
+			}
 
 			m_base->GetMetricSink()->OnOutgoingCommand(HashRageString("msgRoute"), packet.payload.size() + 4, false);
 			m_base->GetMetricSink()->OnOutgoingRoutePackets(1);
@@ -262,7 +278,11 @@ void NetLibraryImplV2::RunFrame()
 			net::Buffer msg(8);
 			msg.Write(0xCA569E63); // msgEnd
 
-			enet_peer_send(m_serverPeer, 1, enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), ENET_PACKET_FLAG_UNSEQUENCED));
+			ENetPacket* pingPacket = enet_packet_create(msg.GetBuffer(), msg.GetCurOffset(), ENET_PACKET_FLAG_UNSEQUENCED);
+			if (enet_peer_send(m_serverPeer, 1, pingPacket) != 0)
+			{
+				enet_packet_destroy(pingPacket);
+			}
 
 			m_lastKeepaliveSent = timeGetTime();
 		}
@@ -311,7 +331,7 @@ void NetLibraryImplV2::RunFrame()
 			m_base->AddSendTick();
 		}
 
-		NetLibrary::OnBuildMessage(std::bind(&NetLibraryImplV2::SendReliableCommand, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+		NetLibrary::OnBuildMessage();
 	}
 }
 

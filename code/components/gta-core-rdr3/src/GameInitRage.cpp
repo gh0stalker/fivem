@@ -9,6 +9,7 @@
 #include <GameInit.h>
 
 #include <Hooking.h>
+#include <MinHook.h>
 
 #include <GlobalEvents.h>
 #include <nutsnbolts.h>
@@ -18,6 +19,7 @@
 #include <gameSkeleton.h>
 
 #include <Error.h>
+#include <CrossBuildRuntime.h>
 
 RageGameInit g_gameInit;
 fwEvent<const char*> OnKillNetwork;
@@ -161,7 +163,7 @@ static InitFunction initFunctionTwo([]()
 		{
 			while (!canContinueLoad || (g_callBeforeLoad && !g_callBeforeLoad()))
 			{
-				Sleep(0);
+				Sleep(50);
 
 				_doLookAlive();
 
@@ -246,6 +248,17 @@ static void LogStubLog1(void* stub, const char* type, const char* format, ...)
 	}
 }
 
+static bool (*g_fiAssetManagerExists)(void*, const char*, const char*);
+static bool fiAssetManagerExists(void* self, const char* name, const char* extension)
+{
+	if ((extension && strcmp(extension, "meta") == 0) && strcmp(name, "platformcrc:/data/startup") == 0)
+	{
+		return false;
+	}
+
+	return g_fiAssetManagerExists(self, name, extension);
+}
+
 static HookFunction hookFunctionNet([]()
 {
 	// tunable privilege check
@@ -255,6 +268,12 @@ static HookFunction hookFunctionNet([]()
 	// player can-clone SP model skip
 	hook::jump(hook::get_pattern("84 C0 74 04 32 C0 EB 0E 4C 8B C7 48 8B D6", -0x1D), ReturnTrueAndForcePedMPFlag);
 	hook::jump(hook::get_pattern("40 8A F2 48 8B F9 E8 ? ? ? ? 84 C0 74", -0x12), ReturnTrueAndForcePedMPFlag);
+
+	// nop checks used for not syncing some "unwanted" metaped components
+	hook::nop(hook::get_pattern("8B 40 18 3D CC E2 69 9D"), 0x2F);
+
+	// skip tunable checks for explosion/fire related natives
+	hook::jump(hook::get_pattern("B9 BD C5 AF E3 BA B2 A0 A7 92", -0x14), Return1);
 
 	//hook::jump(0x1406B50E8, LogStubLog1);
 
@@ -274,4 +293,12 @@ static HookFunction hookFunctionNet([]()
 
 	// ignore collision-related archetype flag in /CREATE_OBJECT(_NO_OFFSET)?/
 	hook::nop(hook::get_pattern("8B 48 50 48 C1 E9 11 F6 C1 01 0F 84 ? ? 00 00 45", 10), 6);
+
+	// allow the game to ensure static bounds, but don't block on it.
+	hook::nop(hook::get_pattern("E8 ? ? ? ? 66 44 39 65 ? 74 ? 48 8B 4D ? E8 ? ? ? ? 4C 8D 5C 24 ? 49 8B 5B ? 49 8B 73 ? 49 8B 7B ? 4D 8B 63"), 5);
+
+	// Block loading of custom startup.meta file. Completely breaks game loading
+	MH_Initialize();
+	MH_CreateHook(hook::get_call(hook::get_pattern("E8 ? ? ? ? 3C ? 75 ? 48 8B 0D")), fiAssetManagerExists, (void**)&g_fiAssetManagerExists);
+	MH_EnableHook(MH_ALL_HOOKS);
 });

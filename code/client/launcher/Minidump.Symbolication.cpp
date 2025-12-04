@@ -6,13 +6,23 @@
 #include <json.hpp>
 #include <objbase.h>
 #include <sstream>
+#include <string>
 #include <regex>
 
 #include <CrossBuildRuntime.h>
+#include <CfxReleaseInfo.h>
 
 #include <boost/algorithm/string.hpp>
 
 #include <cpr/cpr.h>
+#include <openssl/sha.h>
+
+static std::string GetGameName()
+{
+	auto baseGame = ToNarrow(GAME_EXECUTABLE);
+	baseGame = baseGame.substr(0, baseGame.rfind(L'.'));
+	return fmt::sprintf("%s_b%d.exe", baseGame, xbr::GetGameBuild());
+}
 
 void ParseSymbolicCrash(nlohmann::json& crash, std::string* signature, std::string* stackTrace)
 {
@@ -39,10 +49,7 @@ void ParseSymbolicCrash(nlohmann::json& crash, std::string* signature, std::stri
 			if (modName.find("GTAProcess") != std::string::npos ||
 				modName.find("GameProcess") != std::string::npos)
 			{
-				auto baseGame = ToNarrow(GAME_EXECUTABLE);
-				baseGame = baseGame.substr(0, baseGame.rfind(L'.'));
-
-				modName = fmt::sprintf("%s_b%d.exe", baseGame, xbr::GetGameBuild());
+				modName = GetGameName();
 			}
 
 			std::string lineDetail = "";
@@ -73,7 +80,7 @@ void ParseSymbolicCrash(nlohmann::json& crash, std::string* signature, std::stri
 					
 					if (!appPath.empty())
 					{
-						lineDetail = fmt::sprintf(" (<A HREF=\"https://github.com/citizenfx/fivem/blob/master/%s#L%d\">%s:%d</A>)",
+						lineDetail = fmt::sprintf(" (<A HREF=\"https://sourcegraph.com/github.com/citizenfx/fivem/-/blob/%s?L%d\">%s:%d</A>)",
 						appPath,
 						frame.value("lineno", 0),
 						fn,
@@ -284,12 +291,40 @@ static nlohmann::json SymbolicateCrashRequest(HANDLE hProcess, HANDLE hThread, P
 	return std::move(symb);
 }
 
+static std::string CalculateSHA256(const std::vector<std::string_view>& input)
+{
+	SHA256_CTX sha;
+	SHA256_Init(&sha);
+	for (const auto& s: input)
+	{
+		SHA256_Update(&sha, s.data(), s.size());
+	}
+
+	std::vector<uint8_t> sha256(256 / 8, 0);
+	SHA256_Final(sha256.data(), &sha);
+
+	std::string sha256Hex;
+	for (uint8_t byte : sha256)
+	{
+		sha256Hex += fmt::sprintf("%02x", byte);
+	}
+	return sha256Hex;
+}
+
 nlohmann::json SymbolicateCrash(HANDLE hProcess, HANDLE hThread, PEXCEPTION_RECORD er, PCONTEXT ctx)
 {
+#ifdef CFX_CRASH_INGRESS_URL
 	auto symb = SymbolicateCrashRequest(hProcess, hThread, er, ctx);
+	auto payload = symb.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace);
+	auto hash = CalculateSHA256({ GetGameName(), std::to_string(cfx::GetPlatformRelease()), payload });
 
-	auto r = cpr::Post(cpr::Url{ "https://crash-ingress.fivem.net/symbolicate?timeout=5" }, cpr::Body{ symb.dump(-1, ' ', false, nlohmann::detail::error_handler_t::replace) },
-	cpr::Timeout{ std::chrono::seconds(10) }, cpr::Header{ { "content-type", "application/json" } }, cpr::VerifySsl{ false });
+	auto r = cpr::Post(
+		cpr::Url{ va("%s/symbolicate?timeout=5&hash=%s", CFX_CRASH_INGRESS_URL, hash) },
+		cpr::Body{ payload },
+		cpr::Timeout{ std::chrono::seconds(10) },
+		cpr::Header{ { "content-type", "application/json" } },
+		cpr::VerifySsl{ false }
+	);
 
 	if (!r.error && r.status_code <= 299)
 	{
@@ -303,9 +338,9 @@ nlohmann::json SymbolicateCrash(HANDLE hProcess, HANDLE hThread, PEXCEPTION_RECO
 		}
 		catch (std::exception&)
 		{
-		
 		}
 	}
+#endif
 
 	return {};
 }

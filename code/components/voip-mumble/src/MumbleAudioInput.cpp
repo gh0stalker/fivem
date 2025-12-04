@@ -20,6 +20,10 @@
 
 extern "C"
 {
+#if __has_include(<rnnoise.h>)
+#include <rnnoise.h>
+#endif
+
 #include <libswresample/swresample.h>
 };
 
@@ -27,7 +31,9 @@ MumbleAudioInput::MumbleAudioInput()
 	: m_likelihood(MumbleVoiceLikelihood::ModerateLikelihood), m_ptt(false), m_mode(MumbleActivationMode::VoiceActivity), m_deviceId(""), m_audioLevel(0.0f),
 	  m_avr(nullptr), m_opus(nullptr), m_apm(nullptr), m_isTalking(false), m_lastBitrate(48000), m_curBitrate(48000)
 {
-
+#if __has_include(<rnnoise.h>)
+	m_denoiseState = rnnoise_create(NULL);
+#endif
 }
 
 enum class InputIntentMode {
@@ -41,7 +47,12 @@ static InputIntentMode g_lastIntentMode = InputIntentMode::SPEECH;
 void MumbleAudioInput::Initialize()
 {
 	m_bitrateVar = std::make_shared<ConVar<int>>("voice_inBitrate", ConVar_None, m_curBitrate, &m_curBitrate);
+	// NOTE: If the maximum here is ever increased we need to properly split audio packets into smaller buffers so we don't send packets
+	// that are to large to the server, for FiveM mumble sending too large of a packet will result in the client being dropped, in the mumble-server
+	// implementation this will just cause the packet to be ignored.
 	m_bitrateVar->GetHelper()->SetConstraints(16000, 128000);
+
+	m_denoiseVar = std::make_shared<ConVar<bool>>("voice_enableNoiseSuppression", ConVar_Archive, m_denoise, &m_denoise);
 
 	m_startEvent = CreateEvent(0, 0, 0, 0);
 
@@ -88,15 +99,15 @@ void MumbleAudioInput::ThreadFunc()
 {
 	SetThreadName(-1, "[Mumble] Audio Input Thread");
 
+	HANDLE mmcssHandle;
+	DWORD mmcssTaskIndex;
+
+	mmcssHandle = AvSetMmThreadCharacteristics(L"Capture", &mmcssTaskIndex);
+
+	AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_HIGH);
+
 	// initialize COM for the current thread
 	CoInitialize(nullptr);
-
-	HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_INPROC_SERVER, IID_IMMDeviceEnumerator, (void**)m_mmDeviceEnumerator.GetAddressOf());
-
-	if (FAILED(hr))
-	{
-		return;
-	}
 
 	InitializeAudioDevice();
 
@@ -113,7 +124,7 @@ void MumbleAudioInput::ThreadFunc()
 		m_audioClient->Start();
 	}
 
-	m_audioBuffer.resize((m_waveFormat.nSamplesPerSec / 100) * m_waveFormat.nBlockAlign);
+	m_audioBuffer.resize((static_cast<std::vector<uint8_t>::size_type>(m_waveFormat.nSamplesPerSec / 100)) * m_waveFormat.nBlockAlign);
 
 	bool recreateDevice = false;
 
@@ -131,22 +142,26 @@ void MumbleAudioInput::ThreadFunc()
 
 		if (g_curInputIntentMode != g_lastIntentMode)
 		{
-			switch (g_curInputIntentMode)
+			if (m_apm)
 			{
-			case InputIntentMode::MUSIC:
-			{
-				m_apm->noise_suppression()->Enable(false);
-				m_apm->high_pass_filter()->Enable(false);
-				break;
+				switch (g_curInputIntentMode)
+				{
+				case InputIntentMode::MUSIC:
+				{
+					m_apm->noise_suppression()->Enable(false);
+					m_apm->high_pass_filter()->Enable(false);
+					break;
+				}
+				case InputIntentMode::SPEECH:
+				default:
+				{
+					m_apm->noise_suppression()->Enable(true);
+					m_apm->high_pass_filter()->Enable(true);
+					break;
+				}
+				};
 			}
-			case InputIntentMode::SPEECH:
-			default:
-			{
-				m_apm->noise_suppression()->Enable(true);
-				m_apm->high_pass_filter()->Enable(true);
-				break;
-			}
-			};
+
 			g_lastIntentMode = g_curInputIntentMode;
 		}
 
@@ -257,11 +272,46 @@ void MumbleAudioInput::HandleData(const uint8_t* buffer, size_t numBytes)
 			m_apm->gain_control()->set_stream_analog_level(int(audioLevel * 255.0f));
 		}
 
-		int numVoice = 0;
+		bool hasVoice = false;
 
 		for (int off = 0; off < frameSize; off += 10)
 		{
 			int frameStart = (off * 48 * sizeof(int16_t)); // 1ms = 48 samples
+
+#if __has_include(<rnnoise.h>)
+			if (m_denoise && g_curInputIntentMode == InputIntentMode::SPEECH)
+			{
+				// mirroring https://github.com/mumble-voip/mumble/blob/16a495430054e2c8e059715a57406b373b2d7ef2/src/mumble/AudioInput.cpp#L916
+
+				/// Clip the given float value to a range that can be safely converted into a short (without causing integer overflow)
+				auto clampFloatSample = [](float v) -> short
+				{
+					return static_cast<short>(std::min(std::max(v, static_cast<float>(std::numeric_limits<short>::min())),
+					static_cast<float>(std::numeric_limits<short>::max())));
+				};
+
+				int16_t* psSource = reinterpret_cast<int16_t*>(&m_resampledBytes[frameStart]);
+
+				float denoiseFrames[480];
+				for (int i = 0; i < 480; i++)
+				{
+					denoiseFrames[i] = psSource[i];
+				}
+
+				rnnoise_process_frame(m_denoiseState, denoiseFrames, denoiseFrames);
+
+				for (int i = 0; i < 480; i++)
+				{
+					psSource[i] = clampFloatSample(denoiseFrames[i]);
+				}
+			}
+#endif
+
+			// if we're using music speech intent we should always try to send voice
+			if (g_curInputIntentMode == InputIntentMode::MUSIC)
+			{
+				hasVoice = true;
+			}
 
 			// is this voice?
 			webrtc::AudioFrame frame;
@@ -277,13 +327,13 @@ void MumbleAudioInput::HandleData(const uint8_t* buffer, size_t numBytes)
 
 			if (m_apm->voice_detection()->stream_has_voice())
 			{
-				numVoice++;
+				hasVoice = true;
 			}
 
 			memcpy(&m_resampledBytes[frameStart], frame.data_, 480 * sizeof(int16_t));
 		}
 
-		if (m_mode == MumbleActivationMode::VoiceActivity && numVoice < 1)
+		if (m_mode == MumbleActivationMode::VoiceActivity && !hasVoice)
 		{
 			m_isTalking = false;
 			m_audioLevel = 0.0f;
@@ -357,6 +407,8 @@ void MumbleAudioInput::HandleData(const uint8_t* buffer, size_t numBytes)
 	SendQueuedOpusPackets();
 }
 
+constexpr uint16_t kMaxUdpPacket = 1024;
+
 void MumbleAudioInput::EnqueueOpusPacket(std::string&& packet, int numFrames)
 {
 	m_opusPackets.push({ std::move(packet), numFrames });
@@ -376,14 +428,20 @@ void MumbleAudioInput::SendQueuedOpusPackets()
 
 		const auto& [packet, frames] = packetChunk;
 
-		char outBuf[16384];
+		// Maximum size of Opus audio frames is 8191, but we *can't* actually send that much, FiveMs mumble will drop the player, while other implementations will just ignore the packet.
+		// This should be split into multiple packets for higher voice bitrates.
+		// https://mumble-protocol.readthedocs.io/en/latest/voice_data.html#packet-format 
+		// https://mumble-protocol.readthedocs.io/en/latest/voice_data.html#opus-audio-frames
+		char outBuf[kMaxUdpPacket];
 		PacketDataStream buffer(outBuf, sizeof(outBuf));
 
 		buffer.append((4 << 5) | (m_client->GetVoiceTarget() & 31));
 
 		buffer << m_sequence;
 
-		bool bTerminate = false;
+		// This fixed stuttering a while back 
+		// https://github.com/citizenfx/fivem/commit/6b341dc0d71a63a8992c18afe8e6048418978adc
+		constexpr bool bTerminate = false;
 
 		buffer << (packet.size() | (bTerminate ? (1 << 13) : 0));
 		buffer.append(packet.c_str(), packet.size());
@@ -480,6 +538,8 @@ WRL::ComPtr<IMMDevice> GetMMDeviceFromGUID(bool input, const std::string& guid);
 
 void DuckingOptOut(WRL::ComPtr<IMMDevice> device);
 
+extern std::mutex g_mmDeviceMutex;
+
 void MumbleAudioInput::InitializeAudioDevice()
 {
 	// destroy
@@ -504,43 +564,68 @@ void MumbleAudioInput::InitializeAudioDevice()
 	HRESULT hr = 0;
 	ComPtr<IMMDevice> device;
 
-	std::string lastDeviceId;
-
-	while (!device.Get())
+	// same Steam race condition workaround as in MumbleAudioOutput.cpp
 	{
-		if (m_deviceId.empty())
+		if (!m_mmDeviceEnumerator)
 		{
-			if (FAILED(hr = m_mmDeviceEnumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.ReleaseAndGetAddressOf())))
+			std::unique_lock _(g_mmDeviceMutex);
+			HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_INPROC_SERVER, IID_IMMDeviceEnumerator, (void**)m_mmDeviceEnumerator.GetAddressOf());
+
+			if (FAILED(hr))
 			{
-				console::DPrintf("voip:mumble", __FUNCTION__ ": Obtaining default audio endpoint failed. HR = 0x%08x\n", hr);
-
-				// retry with the last device in case the only device was intermittently unplugged
-				// #TODO: retry default device on change/preferred device on return
-				Sleep(5000);
-
-				m_deviceId = lastDeviceId;
+				return;
 			}
 		}
-		else
+
+		std::string lastDeviceId;
+
+		while (!device.Get())
 		{
-			device = GetMMDeviceFromGUID(true, m_deviceId);
-
-			if (!device)
+			if (m_deviceId.empty())
 			{
-				lastDeviceId = m_deviceId;
+				{
+					std::unique_lock _(g_mmDeviceMutex);
+					hr = m_mmDeviceEnumerator->GetDefaultAudioEndpoint(eCapture, eCommunications, device.ReleaseAndGetAddressOf());
+				}
 
-				trace(__FUNCTION__ ": Obtaining audio device for %s failed.\n", m_deviceId);
-				m_deviceId = "";
+				if (FAILED(hr))
+				{
+					console::DPrintf("voip:mumble", __FUNCTION__ ": Obtaining default audio endpoint failed. HR = 0x%08x\n", hr);
+
+					// retry with the last device in case the only device was intermittently unplugged
+					// #TODO: retry default device on change/preferred device on return
+					Sleep(5000);
+
+					m_deviceId = lastDeviceId;
+				}
+			}
+			else
+			{
+				{
+					std::unique_lock _(g_mmDeviceMutex);
+					device = GetMMDeviceFromGUID(true, m_deviceId);
+				}
+
+				if (!device)
+				{
+					lastDeviceId = m_deviceId;
+
+					trace(__FUNCTION__ ": Obtaining audio device for %s failed.\n", m_deviceId);
+					m_deviceId = "";
+				}
 			}
 		}
-	}
 
-	DuckingOptOut(device);
+		{
+			std::unique_lock _(g_mmDeviceMutex);
+			DuckingOptOut(device);
 
-	if (FAILED(hr = device->Activate(IID_IAudioClient, CLSCTX_INPROC_SERVER, nullptr, (void**)m_audioClient.ReleaseAndGetAddressOf())))
-	{
-		trace(__FUNCTION__ ": Activating IAudioClient for capture device failed. HR = %08x\n", hr);
-		return;
+			if (FAILED(hr = device->Activate(IID_IAudioClient, CLSCTX_INPROC_SERVER, nullptr, (void**)m_audioClient.ReleaseAndGetAddressOf())))
+			{
+				trace(__FUNCTION__ ": Activating IAudioClient for capture device failed. HR = %08x\n", hr);
+				return;
+			}
+		}
 	}
 
 	WAVEFORMATEX* waveFormat;
@@ -641,10 +726,12 @@ void MumbleAudioInput::InitializeAudioDevice()
 
 	m_apm->Initialize(pconfig);
 
-	m_apm->high_pass_filter()->Enable(true);
-	m_apm->echo_cancellation()->Enable(false);
-	m_apm->noise_suppression()->Enable(true);
+	const bool isVoiceIntent = g_curInputIntentMode == InputIntentMode::SPEECH;
+	m_apm->high_pass_filter()->Enable(isVoiceIntent);
+	m_apm->noise_suppression()->Enable(isVoiceIntent);
 	m_apm->noise_suppression()->set_level(webrtc::NoiseSuppression::kHigh);
+
+	m_apm->echo_cancellation()->Enable(false);
 	m_apm->level_estimator()->Enable(true);
 	m_apm->voice_detection()->set_likelihood(ConvertLikelihood(m_likelihood));
 	//m_apm->voice_detection()->set_frame_size_ms(10);
@@ -668,7 +755,7 @@ void MumbleAudioInput::Enable()
 void MumbleAudioInput::ThreadStart(MumbleAudioInput* instance)
 {
 	HANDLE mmcssHandle;
-	DWORD mmcssTaskIndex;
+	DWORD mmcssTaskIndex = 0;
 
 	mmcssHandle = AvSetMmThreadCharacteristics(L"Pro Audio", &mmcssTaskIndex);
 	instance->ThreadFunc();

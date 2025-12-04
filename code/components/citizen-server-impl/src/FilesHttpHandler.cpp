@@ -2,6 +2,7 @@
 #include <ServerInstanceBase.h>
 #include <HttpServerManager.h>
 #include <TcpServerManager.h>
+#include <TcpListenManager.h>
 
 #include <ResourceManager.h>
 #include <ResourceFilesComponent.h>
@@ -13,7 +14,10 @@
 #include <array>
 #include <filesystem>
 
+#include "FormData.h"
+
 constexpr const size_t kFileSendSize = 128 * 1024;
+std::shared_ptr<ConVar<bool>> g_httpFileServerProxyOnly;
 
 namespace fx
 {
@@ -64,8 +68,22 @@ namespace fx
 	{
 		auto clientRegistry = instance->GetComponent<fx::ClientRegistry>();
 
-		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response, const std::string& resourceName, const std::string& fileName, const fx::ClientSharedPtr& client)
+		auto sendFile = [=](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response, const std::string& resourceName, const std::string& fileName, const fx::ClientSharedPtr& client)
 		{
+
+			// Check is proxy only
+			if (g_httpFileServerProxyOnly->GetValue())
+			{
+				auto remoteAddr = request->GetRemoteAddress();
+				auto remoteHost = remoteAddr.substr(0, remoteAddr.find_last_of(':'));
+				if (!fx::IsProxyAddress(remoteHost) && fileName != "resource.rpf")
+				{
+					response->SetStatusCode(403);
+					response->End(fmt::sprintf("Host %s is not allowed to access this endpoint.", remoteHost));
+					return;
+				}
+			}
+
 			// get resource manager and resource
 			auto resourceManager = instance->GetComponent<fx::ResourceManager>();
 			auto resource = resourceManager->GetResource(resourceName);
@@ -106,6 +124,17 @@ namespace fx
 				{
 					fn = sit->second.onDiskPath;
 				}
+			}
+
+			auto filter = filesComponent->CreateFilesFilter(fileName, request);
+
+			std::string reason;
+
+			if (filter && filter->ShouldTerminate(&reason))
+			{
+				response->SetStatusCode(403);
+				response->End(fmt::sprintf("Filter failed: %s.", reason));
+				return;
 			}
 
 			// get the TCP manager for a libuv loop
@@ -159,17 +188,6 @@ namespace fx
 
 					auto file = std::make_shared<UvFileHandle>(uvLoop, req->result);
 
-					auto filter = filesComponent->CreateFilesFilter(fileName, request);
-
-					std::string reason;
-
-					if (filter && filter->ShouldTerminate(&reason))
-					{
-						response->SetStatusCode(403);
-						response->End(fmt::sprintf("Filter failed: %s.", reason));
-						return;
-					}
-
 					// write header information and a 200 OK
 					response->SetHeader("content-length", std::to_string(size));
 					response->SetHeader("transfer-encoding", "identity");
@@ -188,7 +206,7 @@ namespace fx
 
 					// to keep a reference to readCallback inside of itself
 					auto readCallback = std::make_shared<std::function<void(uv_fs_t*)>>();
-					*readCallback = [=](uv_fs_t* fsReq) mutable
+					*readCallback = [=](uv_fs_t* fsReq)
 					{
 						// read failed? report back
 						if (fsReq->result < 0)
@@ -212,7 +230,7 @@ namespace fx
 						}
 
 						// write to response
-						response->Write(std::move(*buffer), fsReq->result, [=](bool result) mutable
+						response->Write(std::move(*buffer), fsReq->result, [=](bool result)
 						{
 							if (!*readCallback)
 							{
@@ -260,7 +278,7 @@ namespace fx
 					};
 
 					// on-close handler
-					request->SetCancelHandler([=]() mutable
+					request->SetCancelHandler([=]()
 					{
 						// if so, end response (closing should be done automatically)
 						response->End();
@@ -275,7 +293,7 @@ namespace fx
 			}));
 		};
 
-		return [=](const fwRefContainer<net::HttpRequest>& request, const fwRefContainer<net::HttpResponse>& response)
+		return [=](const fwRefContainer<net::HttpRequest>& request, fwRefContainer<net::HttpResponse> response)
 		{
 			if (request->GetRequestMethod() != "GET")
 			{
@@ -318,7 +336,7 @@ namespace fx
 					} while (resourceEnd != std::string::npos);
 
 					std::string filesPathDecoded;
-					UrlDecode(filesPath, filesPathDecoded);
+					net::UrlDecode(filesPath, filesPathDecoded);
 
 					auto queryOffset = filesPathDecoded.rfind('?');
 					if (queryOffset != std::string::npos)
@@ -346,6 +364,7 @@ static InitFunction initFunction([]()
 {
 	fx::ServerInstanceBase::OnServerCreate.Connect([](fx::ServerInstanceBase* instance)
 	{
+		g_httpFileServerProxyOnly = instance->AddVariable<bool>("sv_httpFileServerProxyOnly", ConVar_None, false);
 		instance->GetComponent<fx::HttpServerManager>()->AddEndpoint("/files", fx::GetFilesEndpointHandler(instance));
 	});
 });

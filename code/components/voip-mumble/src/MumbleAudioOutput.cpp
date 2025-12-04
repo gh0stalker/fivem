@@ -528,7 +528,7 @@ MumbleAudioOutput::ClientAudioState::~ClientAudioState()
 }
 
 DLL_EXPORT
-fwEvent<const std::wstring&, fwRefContainer<IMumbleAudioSink>*>
+fwEvent<const std::string&, fwRefContainer<IMumbleAudioSink>*>
 OnGetMumbleAudioSink;
 
 DLL_EXPORT
@@ -717,7 +717,9 @@ void MumbleAudioOutput::HandleClientConnect(const MumbleUser& user)
 		sendDescriptors[1].pOutputVoice = m_submixVoice;
 	}
 
-	const XAUDIO2_VOICE_SENDS sendList = { (m_submixVoice) ? 2 : 1, sendDescriptors };
+	uint32_t sendCount = (m_submixVoice) ? 2 : 1;
+
+	const XAUDIO2_VOICE_SENDS sendList = { sendCount , sendDescriptors };
 
 	IXAudio2SourceVoice* voice = nullptr;
 	HRESULT hr = xa2->CreateSourceVoice(&voice, &format, 0, 2.0f, state.get(), &sendList);
@@ -1469,6 +1471,8 @@ void MumbleAudioOutput::ThreadFunc()
 
 	mmcssHandle = AvSetMmThreadCharacteristics(L"Audio", &mmcssTaskIndex);
 
+	AvSetMmThreadPriority(mmcssHandle, AVRT_PRIORITY_HIGH);
+
 	// initialize COM for the current thread
 	CoInitialize(nullptr);
 
@@ -1495,15 +1499,6 @@ void MumbleAudioOutput::SetAudioDevice(const std::string& deviceId)
 
 	{
 		std::unique_lock<std::shared_mutex> _(m_clientsMutex);
-
-		for (auto& client : m_clients)
-		{
-			if (client.second)
-			{
-				m_ids.push_back(client.first);
-			}
-		}
-
 		// delete all clients
 		m_clients.clear();
 	}
@@ -1511,12 +1506,10 @@ void MumbleAudioOutput::SetAudioDevice(const std::string& deviceId)
 	// reinitialize audio device
 	InitializeAudioDevice();
 
-	// recreate clients
-	for (auto& client : m_ids)
+	m_client->GetState().ForAllUsers([this](const std::shared_ptr<MumbleUser>& user)
 	{
-		MumbleUser fakeUser(client);
-		HandleClientConnect(fakeUser);
-	}
+		HandleClientConnect(*user);
+	});
 }
 
 void MumbleAudioOutput::SetDistance(float distance)
@@ -1560,8 +1553,6 @@ void DuckingOptOut(WRL::ComPtr<IMMDevice> device);
 
 std::shared_ptr<lab::AudioContext> MumbleAudioOutput::GetAudioContext(const std::string& name)
 {
-	auto wideName = ToWide(name);
-
 	std::shared_lock<std::shared_mutex> _(m_clientsMutex);
 
 	for (auto& client : m_clients)
@@ -1573,7 +1564,7 @@ std::shared_ptr<lab::AudioContext> MumbleAudioOutput::GetAudioContext(const std:
 
 		auto user = m_client->GetState().GetUser(client.first);
 
-		if (!user || user->GetName() != wideName)
+		if (!user || user->GetName() != name)
 		{
 			continue;
 		}
@@ -1583,6 +1574,8 @@ std::shared_ptr<lab::AudioContext> MumbleAudioOutput::GetAudioContext(const std:
 
 	return {};
 }
+
+extern std::mutex g_mmDeviceMutex;
 
 void MumbleAudioOutput::InitializeAudioDevice()
 {
@@ -1612,41 +1605,47 @@ void MumbleAudioOutput::InitializeAudioDevice()
 		MumbleAudioOutput* self;
 	} unlocker(this);
 
-	if (!m_mmDeviceEnumerator)
+	// this initialization *needs* to be locked as otherwise it'll expose a race condition in Steam's 'gameoverlayrenderer64.dll' leading to a
+	// stack overflow with the built-in OS mic monitoring shim in apphelp.dll and Steam's hook calling itself recursively
 	{
-		HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_INPROC_SERVER, IID_IMMDeviceEnumerator, (void**)m_mmDeviceEnumerator.GetAddressOf());
+		std::unique_lock _(g_mmDeviceMutex);
 
-		if (FAILED(hr))
+		if (!m_mmDeviceEnumerator)
 		{
-			trace("%s: failed MMDeviceEnumerator (%08x)\n", __func__, hr);
-			return;
-		}
-	}
+			HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr, CLSCTX_INPROC_SERVER, IID_IMMDeviceEnumerator, (void**)m_mmDeviceEnumerator.GetAddressOf());
 
-	while (!device.Get())
-	{
-		if (m_deviceGuid.empty())
-		{
-			if (FAILED(m_mmDeviceEnumerator->GetDefaultAudioEndpoint(eRender, eCommunications, device.ReleaseAndGetAddressOf())))
+			if (FAILED(hr))
 			{
-				trace("%s: failed GetDefaultAudioEndpoint\n", __func__);
+				trace("%s: failed MMDeviceEnumerator (%08x)\n", __func__, hr);
 				return;
 			}
 		}
-		else
-		{
-			device = GetMMDeviceFromGUID(false, m_deviceGuid);
 
-			if (!device.Get())
+		while (!device.Get())
+		{
+			if (m_deviceGuid.empty())
 			{
-				trace("%s: failed GetMMDeviceFromGUID\n", __func__);
-				m_deviceGuid = "";
+				if (FAILED(m_mmDeviceEnumerator->GetDefaultAudioEndpoint(eRender, eCommunications, device.ReleaseAndGetAddressOf())))
+				{
+					trace("%s: failed GetDefaultAudioEndpoint\n", __func__);
+					return;
+				}
+			}
+			else
+			{
+				device = GetMMDeviceFromGUID(false, m_deviceGuid);
+
+				if (!device.Get())
+				{
+					trace("%s: failed GetMMDeviceFromGUID\n", __func__);
+					m_deviceGuid = "";
+				}
 			}
 		}
-	}
 
-	// opt out of ducking
-	DuckingOptOut(device);
+		// opt out of ducking
+		DuckingOptOut(device);
+	}
 
 	auto xa2Dll = LoadLibraryExW(L"XAudio2_8.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
 	decltype(&CreateAudioReverb) _CreateAudioReverb;
@@ -1859,6 +1858,30 @@ struct scrBindArgument<lab::FilterType>
 	}
 };
 
+template <>
+struct scrBindParent<lab::BiquadFilterNode>
+{
+	using type = lab::AudioBasicProcessorNode;
+};
+
+template<>
+struct scrBindParent<lab::WaveShaperNode>
+{
+	using type = lab::AudioBasicProcessorNode;
+};
+
+template<>
+struct scrBindParent<lab::AudioBasicProcessorNode>
+{
+	using type = lab::AudioNode;
+};
+
+template<>
+struct scrBindParent<lab::AudioSourceNode>
+{
+	using type = lab::AudioNode;
+};
+
 static std::shared_ptr<lab::BiquadFilterNode> createBiquadFilterNode(lab::AudioContext* self)
 {
 	return std::make_shared<lab::BiquadFilterNode>();
@@ -1876,7 +1899,7 @@ static std::shared_ptr<lab::AudioSourceNode> getSource(lab::AudioContext* self)
 
 static InitFunction initFunctionScript([]()
 {
-	scrBindClass<std::shared_ptr<lab::AudioContext>>()
+	scrBindClass<lab::AudioContext>()
 		.AddMethod("AUDIOCONTEXT_CONNECT", &lab::AudioContext::connect)
 		.AddMethod("AUDIOCONTEXT_DISCONNECT", &lab::AudioContext::disconnect)
 		.AddMethod("AUDIOCONTEXT_GET_CURRENT_TIME", &lab::AudioContext::currentTime)
@@ -1885,7 +1908,7 @@ static InitFunction initFunctionScript([]()
 		.AddMethod("AUDIOCONTEXT_CREATE_BIQUADFILTERNODE", &createBiquadFilterNode)
 		.AddMethod("AUDIOCONTEXT_CREATE_WAVESHAPERNODE", &createWaveShaperNode);
 	
-	scrBindClass<std::shared_ptr<lab::BiquadFilterNode>>()
+	scrBindClass<lab::BiquadFilterNode>()
 		.AddMethod("BIQUADFILTERNODE_SET_TYPE", &lab::BiquadFilterNode::setType)
 		.AddMethod("BIQUADFILTERNODE_Q", &lab::BiquadFilterNode::q)
 		// needs msgpack wrappers for in/out and a weird lock thing
@@ -1895,13 +1918,13 @@ static InitFunction initFunctionScript([]()
 		.AddMethod("BIQUADFILTERNODE_DETUNE", &lab::BiquadFilterNode::detune)
 		.AddDestructor("BIQUADFILTERNODE_DESTROY");
 
-	scrBindClass<std::shared_ptr<lab::WaveShaperNode>>()
+	scrBindClass<lab::WaveShaperNode>()
 		// this is if 0'd?
 		//.AddMethod("WAVESHAPERNODE_GET_CURVE", &lab::WaveShaperNode::curve)
 		.AddMethod("WAVESHAPERNODE_SET_CURVE", &lab::WaveShaperNode::setCurve)
 		.AddDestructor("WAVESHAPERNODE_DESTROY");
 
-	scrBindClass<std::shared_ptr<lab::AudioParam>>()
+	scrBindClass<lab::AudioParam>()
 		.AddMethod("AUDIOPARAM_SET_VALUE", &lab::AudioParam::setValue)
 		.AddMethod("AUDIOPARAM_SET_VALUE_AT_TIME", &lab::AudioParam::setValueAtTime)
 		.AddMethod("AUDIOPARAM_SET_VALUE_CURVE_AT_TIME", &lab::AudioParam::setValueCurveAtTime)

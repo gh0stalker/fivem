@@ -15,7 +15,6 @@
 #include <InputHook.h>
 #include <IteratorView.h>
 
-#include <LaunchMode.h>
 #include <CrossBuildRuntime.h>
 
 #include <memory>
@@ -66,11 +65,8 @@ static FishScript* g_fishScript;
 
 void FishScript::Tick()
 {
-	if (!CfxIsSinglePlayer())
-	{
-		if (!Instance<ICoreGameInit>::Get()->ShAllowed) return;
-		if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited")) return;
-	}
+	if (!Instance<ICoreGameInit>::Get()->ShAllowed) return;
+	if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited")) return;
 
 	if (g_mainFiber == nullptr)
 	{
@@ -108,7 +104,7 @@ void FishScript::Yield(uint32_t time)
 	SwitchToFiber(g_mainFiber);
 }
 
-class FishThread : public GtaThread
+class FishThread : public CfxThread
 {
 private:
 	std::vector<std::shared_ptr<FishScript>> m_scripts;
@@ -122,9 +118,7 @@ public:
 	{
 		if (!m_hasScriptHandler)
 		{
-			CGameScriptHandlerMgr::GetInstance()->AttachScript(this);
-
-			m_hasScriptHandler = true;
+			AttachScriptHandler();
 		}
 
 		if (!m_initedNet)
@@ -145,14 +139,14 @@ public:
 
 	virtual void Kill() override;
 
-	virtual rage::eThreadState Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount) override;
+	virtual void Reset() override;
 
 	void AddScript(void(*fn)());
 
 	void RemoveScript(void(*fn)());
 };
 
-rage::eThreadState FishThread::Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount)
+void FishThread::Reset()
 {
 	// uninit net
 	m_initedNet = false;
@@ -173,8 +167,6 @@ rage::eThreadState FishThread::Reset(uint32_t scriptHash, void* pArgs, uint32_t 
 	{
 		AddScript(fn);
 	}
-
-	return GtaThread::Reset(scriptHash, pArgs, argCount);
 }
 
 void FishThread::Kill()
@@ -269,17 +261,26 @@ enum eGameVersion : int
 	VER_1_0_2189_0_NOSTEAM = 64,
 	VER_1_0_2372_0_NOSTEAM = 70,
 	VER_1_0_2545_0_NOSTEAM = 72,
+	VER_1_0_2612_1_NOSTEAM = 74,
+	VER_1_0_2699_0_NOSTEAM = 78,
+	VER_1_0_2802_0_NOSTEAM = 80,
+	VER_1_0_2944_0_NOSTEAM = 83,
+	VER_1_0_3095_0_NOSTEAM = 85,
 };
 
 // ScriptHookV uses incremental numbers instead of build
 DLL_EXPORT eGameVersion getGameVersion()
 {
-	if (xbr::IsGameBuild<372>()) return VER_1_0_372_2_NOSTEAM;
-	if (xbr::IsGameBuild<1604>()) return VER_1_0_1604_0_NOSTEAM;
-	if (xbr::IsGameBuild<2060>()) return VER_1_0_2060_0_NOSTEAM;
-	if (xbr::IsGameBuild<2189>()) return VER_1_0_2189_0_NOSTEAM;
-	if (xbr::IsGameBuild<2372>()) return VER_1_0_2372_0_NOSTEAM;
-	if (xbr::IsGameBuild<2545>()) return VER_1_0_2545_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<3095>()) return VER_1_0_3095_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2944>()) return VER_1_0_2944_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2802>()) return VER_1_0_2802_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2699>()) return VER_1_0_2699_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2612>()) return VER_1_0_2612_1_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2545>()) return VER_1_0_2545_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2372>()) return VER_1_0_2372_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2189>()) return VER_1_0_2189_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<2060>()) return VER_1_0_2060_0_NOSTEAM;
+	if (xbr::IsGameBuildOrGreater<1604>()) return VER_1_0_1604_0_NOSTEAM;
 
 	return VER_1_0_1604_0_NOSTEAM; // Default build
 }
@@ -350,11 +351,8 @@ DLL_EXPORT uint64_t* nativeCall()
 
 	if (valid)
 	{
-		if (!CfxIsSinglePlayer())
-		{
-			if (!Instance<ICoreGameInit>::Get()->ShAllowed) valid = false;
-			if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited")) valid = false;
-		}
+		if (!Instance<ICoreGameInit>::Get()->ShAllowed) valid = false;
+		if (!Instance<ICoreGameInit>::Get()->HasVariable("networkInited")) valid = false;
 	}
 
 	if (fn != 0 && valid)
@@ -439,7 +437,7 @@ static InitFunction initFunction([]()
 {
 	rage::scrEngine::OnScriptInit.Connect([]()
 	{
-		rage::scrEngine::CreateThread(&g_fish);
+		rage::scrEngine::CreateThread(g_fish.GetThread());
 	});
 
 	InputHook::QueryInputTarget.Connect([](std::vector<InputTarget*>& targets)

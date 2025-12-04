@@ -11,6 +11,7 @@
 #include <functional>
 #include <mutex>
 #include <queue>
+#include <thread>
 
 #include <VFSDevice.h>
 
@@ -53,19 +54,14 @@ struct HttpRequestOptions
 	std::shared_ptr<int> responseCode;
 	std::function<void(const ProgressInfo&)> progressCallback;
 	std::function<bool(const std::string&)> streamingCallback;
-	std::chrono::milliseconds timeoutNoResponse;
-	int weight;
-	bool ipv4;
-	bool addErrorBody;
-	bool followLocation = true;
+	std::chrono::milliseconds timeoutNoResponse{ 0 };
+	int weight = 16;
+	uint64_t maxFilesize = 0;
 
-	inline HttpRequestOptions()
-	{
-		timeoutNoResponse = std::chrono::milliseconds(0);
-		weight = 16;
-		ipv4 = false;
-		addErrorBody = false;
-	}
+	bool ipv4 = false;
+	bool addErrorBody = false;
+	bool followLocation = true;
+	bool addRawBody = false;
 };
 
 struct HttpRequestHandle
@@ -78,11 +74,30 @@ public:
 	virtual void SetRequestWeight(int weight) = 0;
 
 	virtual void Abort() = 0;
+
+	virtual std::string GetRawBody() = 0;
+
+	inline void Wait()
+	{
+		while (!HasCompleted())
+		{
+			std::this_thread::yield();
+		}
+	}
+};
+
+struct ManualHttpRequestHandle : HttpRequestHandle
+{
+public:
+	virtual void Start() = 0;
+
+	virtual void OnCompletion(std::function<void(bool, std::string_view)>&& callback) = 0;
 };
 
 using HttpRequestPtr = std::shared_ptr<HttpRequestHandle>;
+using ManualHttpRequestPtr = std::shared_ptr<ManualHttpRequestHandle>;
 
-class HTTP_EXPORT HttpClient
+class HTTP_EXPORT HttpClient final
 {
 public:
 	HttpClient(const wchar_t* userAgent = L"CitizenFX/1", const std::string& loopId = {});
@@ -102,6 +117,7 @@ public:
 	HttpRequestPtr DoPostRequest(const std::wstring& host, uint16_t port, const std::wstring& url, const std::string& postData, const fwMap<fwString, fwString>& headers, const std::function<void(bool, const char*, size_t)>& callback, std::function<void(const std::map<std::string, std::string>&)> headerCallback = std::function<void(const std::map<std::string, std::string>&)>());
 
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::map<std::string, std::string>& fields, const std::function<void(bool, const char*, size_t)>& callback);
+	HttpRequestPtr DoPostRequest(const std::string& url, const std::map<std::string, std::string>& fields, const HttpRequestOptions& options, const std::function<void(bool, const char*, size_t)>& callback);
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::string& postData, const std::function<void(bool, const char*, size_t)>& callback);
 	HttpRequestPtr DoPostRequest(const std::string& url, const std::string& postData, const fwMap<fwString, fwString>& headers, const std::function<void(bool, const char*, size_t)>& callback, std::function<void(const std::map<std::string, std::string>&)> headerCallback = std::function<void(const std::map<std::string, std::string>&)>());
 
@@ -121,11 +137,14 @@ public:
 	// compatibility wrapper
 	HttpRequestPtr DoFileGetRequest(const std::wstring& host, uint16_t port, const std::wstring& url, rage::fiDevice* outDevice, const std::string& outFilename, const std::function<void(bool, const char*, size_t)>& callback);
 
+	// 'newer' API
+	ManualHttpRequestPtr Get(const std::string& url, const HttpRequestOptions& options = {});
+
 public:
 	fwEvent<void*, const std::string&> OnSetupCurlHandle;
 
 private:
-	HttpClientImpl* m_impl;
+	std::unique_ptr<HttpClientImpl> m_impl;
 };
 
 DECLARE_INSTANCE_TYPE(HttpClient);

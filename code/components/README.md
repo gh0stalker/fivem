@@ -16,7 +16,6 @@ CitizenFX implementation components.
 * [**citizen-scripting-lua/**](./citizen-scripting-lua): Lua ScRT.
 * [**citizen-scripting-mono/**](./citizen-scripting-mono): Mono ScRT loader. Most of the implementation is in `CitizenFX.Core.dll`.
 * [**citizen-scripting-v8/**](./citizen-scripting-v8): V8 ScRT.
-* [**comptest/**](./comptest): Testing component.
 * [**conhost-posh/**](./conhost-posh): Deprecated PowerShell console host.
 * [**conhost-v2/**](./conhost-v2): dear ImGui-based console host.
 * [**debug-net/**](./debug-net): Debug visualizations for `net`.
@@ -26,7 +25,6 @@ CitizenFX implementation components.
 * [**font-renderer/**](./font-renderer): Watermark renderer and DirectWrite font client.
 * [**glue/**](./glue): High-level 'glue' to link other components together.
 * [**http-client/**](./http-client): Async cURL wrapper library.
-* [**legacy-game-re3/**](./legacy-game-re3): ...
 * [**lovely-script/**](./lovely-script): Background script.
 * [**n19ui/**](./n19ui): Jupiter-based UI. Not currently used.
 * [**net/**](./net): Network client for game servers.
@@ -38,6 +36,7 @@ CitizenFX implementation components.
 * [**nui-profiles/**](./nui-profiles): NUI user profile functionality.
 * [**nui-resources/**](./nui-resources): NUI bindings to the resource system.
 * [**profiles/**](./profiles): User profile functionality.
+* [**pool-sizes-state/**](./pool-sizes-state): Track and validate server requests to increase sizes of pools.
 * [**rage-formats-x/**](./rage-formats-x): RAGE file format library.
 * [**scrbind-base/**](./scrbind-base): High-level C++ class script binding support.
 * [**scrbind-formats/**](./scrbind-formats): Uses scrBind to bind to rage:formats:x.
@@ -85,7 +84,6 @@ CitizenFX implementation components.
 * [**rage-input-five/**](./rage-input-five): Wraps RAGE grcore input.
 * [**rage-nutsnbolts-five/**](./rage-nutsnbolts-five): Generic 'nuts and bolts' for RAGE.
 * [**rage-scripting-five/**](./rage-scripting-five): Wraps RAGE scripting.
-* [**ros-patches-five/**](./ros-patches-five): ROS compatibility.
 
 ### RDR2
 * [**citizen-level-loader-rdr3/**](./citizen-level-loader-rdr3): SP level loading support.
@@ -102,4 +100,3 @@ CitizenFX implementation components.
 * [**rage-input-rdr3/**](./rage-input-rdr3): ...
 * [**rage-nutsnbolts-rdr3/**](./rage-nutsnbolts-rdr3): ...
 * [**rage-scripting-rdr3/**](./rage-scripting-rdr3): ...
-* [**ros-patches-rdr3/**](./ros-patches-rdr3): Symlinked ROS compatibility.

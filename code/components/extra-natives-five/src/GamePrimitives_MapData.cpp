@@ -40,13 +40,13 @@ static hook::thiscall_stub<rage::strLocalIndex(streaming::strStreamingModule*, c
 static rage::fwEntity* (*g_origConstructEntity)(fwEntityDef* entityDef, int mapDataIdx, rage::fwArchetype* archetype, void* unkId);
 static int g_curEntityIndex;
 
-static auto IsMapDataCustom(int localIdx)
+static auto IsMapDataFromRawStreamer(int localIdx)
 {
 	static auto mapDataStore = streaming::Manager::GetInstance()->moduleMgr.GetStreamingModule("ymap");
 	auto strIdx = mapDataStore->baseIdx + localIdx;
 
 	const auto& strEntry = streaming::Manager::GetInstance()->Entries[strIdx];
-	return (strEntry.handle & 0xFFFF) < 2;
+	return streaming::GetCollectionIndex(strEntry.handle) < 3;
 }
 
 class MapDataOwnerExtension : public rage::fwExtension
@@ -72,7 +72,7 @@ public:
 		}
 
 		// custom entries are either in pgRawStreamer 0 or our custom variant at 1
-		if (IsMapDataCustom(mapDataIdx))
+		if (IsMapDataFromRawStreamer(mapDataIdx))
 		{
 			this->isCustom = true;
 		}
@@ -127,7 +127,8 @@ private:
 	bool isCustom = false;
 };
 
-class CustomMatrixDef : public fwExtensionDef
+template<int Build>
+class CustomMatrixDef : public fwExtensionDefImpl<Build>
 {
 public:
 	CustomMatrixDef()
@@ -151,6 +152,16 @@ public:
 	Matrix4x4 mat44;
 };
 
+static fwExtensionDef* _new_CustomMatrixDef(const float* matrix)
+{
+	if (xbr::IsGameBuildOrGreater<2802>())
+	{
+		return reinterpret_cast<fwExtensionDef*>(new CustomMatrixDef<2802>(matrix));
+	}
+
+	return reinterpret_cast<fwExtensionDef*>(new CustomMatrixDef<0>(matrix));
+}
+
 static bool g_isEditorRuntime = false;
 
 static rage::fwEntity* ConstructEntity(fwEntityDef* entityDef, int mapDataIdx, rage::fwArchetype* archetype, void* unkId)
@@ -170,7 +181,8 @@ static rage::fwEntity* ConstructEntity(fwEntityDef* entityDef, int mapDataIdx, r
 		{
 			if (extensionDef->name == HashRageString("CustomMatrixDef"))
 			{
-				CustomMatrixDef* ext = static_cast<CustomMatrixDef*>(extensionDef);
+				// we don't actually care about the build here
+				auto ext = reinterpret_cast<CustomMatrixDef<0>*>(extensionDef);
 				entity->UpdateTransform(ext->mat44, true);
 			}
 		}
@@ -288,7 +300,7 @@ static int GetEntityDefFromMapData(int mapData, uint32_t internalIndex)
 		}
 
 		// if not found, and this is custom, just return the index
-		if (IsMapDataCustom(mapData))
+		if (IsMapDataFromRawStreamer(mapData))
 		{
 			if (internalIndex < mapDataContents->numEntities)
 			{
@@ -367,7 +379,7 @@ static int UpdateMapdataEntity(int mapDataIdx, int entityIdx, const char* msgDat
 
 				if (matrixArray.size() == 16)
 				{
-					entityDef->extensions.Set(entityDef->extensions.GetCount(), new CustomMatrixDef(matrixArray.data()));
+					entityDef->extensions.Set(entityDef->extensions.GetCount(), _new_CustomMatrixDef(matrixArray.data()));
 
 					if (entity)
 					{
@@ -583,7 +595,7 @@ static void rage__fwEntity__InitExtensionsFromDefinition(rage::fwEntity* entity,
 			auto extensionIdx = rage__fwMapData__GetExtensionFactory(extensionParser->m_nameHash);
 			auto factory = (*rage__fwFactoryManager_rage__fwExtension___ms_Factories)[extensionIdx];
 
-			if (auto extension = factory->Get(ownerHash))
+			if (auto extension = factory->CreateBaseItem(ownerHash))
 			{
 				extension->InitEntityExtensionFromDefinition(extensionDef, entity);
 				entity->AddExtension(extension);

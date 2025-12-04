@@ -9,7 +9,10 @@ local unsupList = {
 	'SET_OBJECT_AS_NO_LONGER_NEEDED',
 	'SET_PED_AS_NO_LONGER_NEEDED',
 	'SET_VEHICLE_AS_NO_LONGER_NEEDED',
-	'SET_MISSION_TRAIN_AS_NO_LONGER_NEEDED'
+	'SET_MISSION_TRAIN_AS_NO_LONGER_NEEDED',
+	-- RDR3: This function can take multiple different types which OAL doesn't
+	-- currently support.
+	'VAR_STRING'
 }
 
 local unsup = {}
@@ -82,7 +85,9 @@ local function isSafeNative(native)
 		local nativeType = arg.type.nativeType or 'Any'
 
 		if arg.pointer then
-			if singlePointer then
+			if arg.type.name == 'Any' then -- nativeType of Any is int
+				safe = false
+			elseif singlePointer then
 				safe = false
 			elseif nativeType ~= "vector3" and not safeArguments[nativeType] then
 				safe = false
@@ -194,7 +199,11 @@ local function printTypeSetter(type, native, retval)
 	elseif type.nativeType == 'string' then
 		argType = template:format("const char*", retval)
 	elseif type.nativeType == 'int' then
-		argType = template:format("int32_t", retval)
+		if type.subType == 'long' then
+			argType = template:format("int64_t", retval)
+		else
+			argType = template:format("int32_t", retval)
+		end
 	elseif type.nativeType == 'float' then
 		argType = template:format("float", retval)
 	elseif type.nativeType == 'bool' then
@@ -325,6 +334,12 @@ local function printNative(native)
 			
 			aIdx = aIdx + ((arg.type.nativeType == 'vector3') and 3 or 1)
 		end
+	end
+
+	-- hacky zeroing of arguments, see https://github.com/citizenfx/fivem/issues/2135
+	for argn=1,math.min(2, 32 - #native.arguments) do
+		n = n .. t .. ("nCtx.SetArgument(%d, uintptr_t(0));\n"):format(aIdx)
+		aIdx = aIdx + 1
 	end
 	
 	n = n .. t .. ("LUA_EXC_WRAP_START(0x%016x)\n"):format(native.hash)

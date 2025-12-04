@@ -18,7 +18,12 @@
 #include <CoreConsole.h>
 #include <scrEngine.h>
 
+#include <KnownFolders.h>
+#include <ShlObj.h>
+#include <Error.h>
+
 #include <CrossBuildRuntime.h>
+#include <CL2LaunchMode.h>
 
 FiveGameInit g_gameInit;
 
@@ -29,12 +34,7 @@ void AddCustomText(const char* key, const char* value);
 
 static hook::cdecl_stub<void(int unk, uint32_t* titleHash, uint32_t* messageHash, uint32_t* subMessageHash, int flags, bool, int8_t, void*, void*, bool, bool)> setWarningMessage([] ()
 {
-	if (Is372())
-	{
-		return hook::get_call<void*>(hook::get_call(hook::pattern("57 41 56 41 57 48 83 EC 50 4C 63 F2").count(1).get(0).get<char>(0xAC)) + 0x6D);
-	}
-
-	return hook::get_pattern("44 38 ? ? ? ? ? 0F 85 C2 02 00 00 E8", -0x3A);
+	return hook::get_call(hook::get_pattern("4D 89 43 ? 4D 8D 43 ? 4D 8D 4B", 12));
 });
 
 static hook::cdecl_stub<int(bool, int)> getWarningResult([] ()
@@ -42,29 +42,26 @@ static hook::cdecl_stub<int(bool, int)> getWarningResult([] ()
 	return hook::get_call(hook::pattern("33 D2 33 C9 E8 ? ? ? ? 48 83 F8 04 0F 84").count(1).get(0).get<void>(4));
 });
 
-static bool g_showWarningMessage;
-static std::string g_warningMessage;
+extern volatile bool g_isNetworkKilled;
 
 void FiveGameInit::KillNetwork(const wchar_t* errorString)
 {
+	if (g_isNetworkKilled)
+	{
+		return;
+	}
+
 	if (errorString == (wchar_t*)1)
 	{
 		OnKillNetwork("Reloading game.");
 	}
 	else
 	{
-		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>, wchar_t> converter;
-		std::string smallReason = converter.to_bytes(errorString);
+		auto narrowReason = ToNarrow(errorString);
+		SetData("warningMessage", narrowReason);
 
-		if (!g_showWarningMessage)
-		{
-			g_warningMessage = smallReason;
-			g_showWarningMessage = true;
-
-			SetData("warningMessage", g_warningMessage);
-
-			OnKillNetwork(smallReason.c_str());
-		}
+		OnKillNetwork(narrowReason.c_str());
+		OnMsgConfirm();
 	}
 }
 
@@ -95,7 +92,7 @@ bool FiveGameInit::TriggerError(const char* message)
 
 static hook::cdecl_stub<void(rage::InitFunctionType)> gamerInfoMenu_init([]()
 {
-	return hook::get_pattern("83 F9 08 75 3F 53 48 83 EC 20 48 83 3D", 0);
+	return (xbr::IsGameBuildOrGreater<2802>()) ? hook::get_pattern("E9 ? ? ? ? 53 48 83  EC 20 48 83 3D") : hook::get_pattern("83 F9 08 75 3F 53 48 83 EC 20 48 83 3D");
 });
 
 static hook::cdecl_stub<void(rage::InitFunctionType)> gamerInfoMenu__shutdown([]()
@@ -117,29 +114,22 @@ void Void()
 static HookFunction hookFunction([]()
 {
 	MH_Initialize();
-
-	if (!Is372())
-	{
-		MH_CreateHook(hook::get_pattern("74 07 B0 01 E9 ? ? ? ? 83 65", (xbr::IsGameBuildOrGreater<2372>() ? -0x23 : -0x26)), Void, (void**)&g_origLoadMultiplayerTextChat);
-
-		g_textChat = hook::get_address<void**>(hook::get_pattern("74 04 C6 40 01 01 48 8B 0D", 9));
-	}
-
+	MH_CreateHook(hook::get_pattern("74 07 B0 01 E9 ? ? ? ? 83 65", (xbr::IsGameBuildOrGreater<2372>() ? -0x23 : -0x26)), Void, (void**)&g_origLoadMultiplayerTextChat);
 	MH_EnableHook(MH_ALL_HOOKS);
 
-	if (!Is372())
-	{
-		g_textInputBox = hook::get_address<void**>(hook::get_pattern("C7 45 D4 07 00 00 00 48 8B 0D", 10));
+	g_textChat = hook::get_address<void**>(hook::get_pattern("74 04 C6 40 01 01 48 8B 0D", 9));
+	g_textInputBox = hook::get_address<void**>(hook::get_pattern("C7 45 D4 07 00 00 00 48", xbr::IsGameBuildOrGreater<2802>() ? 36 : 10));
 
-		// disable text input box gfx unload
-		hook::nop(hook::get_pattern("E8 ? ? ? ? 83 8B A0 04 00 00 FF"), 5);
-	}
+	// disable text input box gfx unload
+	hook::nop(hook::get_pattern("E8 ? ? ? ? 83 8B A0 04 00 00 FF"), 5);
 
 	// disable gamer info menu shutdown (testing/temp dbg for blocking loads on host/join)
 	//hook::return_function(hook::get_pattern("83 F9 08 75 46 53 48 83 EC 20 48 83", 0));
 
 	// force SET_GAME_PAUSES_FOR_STREAMING (which makes collision loading, uh, blocking) to be off
-	hook::put<uint8_t>(hook::get_pattern("74 20 84 C9 74 1C 84 DB 74 18", 0), 0xEB);
+	// hook::put<uint8_t>(hook::get_pattern("74 20 84 C9 74 1C 84 DB 74 18", 0), 0xEB);
+	// New approach: allow the game to still ensure static bounds, but don't block on it.
+	hook::nop(hook::get_pattern("E8 ? ? ? ? 66 44 39 7D ? 74 ? 48 8B 4D ? E8 ? ? ? ? 4C 8D 5C 24"), 5);
 });
 
 static void __declspec(noinline) CrashCommand()
@@ -152,18 +142,59 @@ static hook::cdecl_stub<void(void*)> _textInputBox_loadGfx([]()
 	return hook::get_call(hook::get_pattern("38 59 59 75 05 E8", 5));
 });
 
+static bool (*g_isScWaitingForInit)();
+
+void RunRlInitServicing()
+{
+	using dummyVoidFunc = void(*)();
+	using dummyVoidFunc2 = void(*)(void*);
+
+	dummyVoidFunc rlInitFunc1 = (dummyVoidFunc)hook::get_pattern<void*>("48 89 5C 24 ? 48 89 74 24 ? 55 57 41 54 41 56 41 57 48 8D 6C 24 ? 48 81 EC ? ? ? ? E8");
+	dummyVoidFunc rlInitFunc2 = (dummyVoidFunc)hook::get_call(hook::get_pattern<void*>("E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? 80 3D ? ? ? ? ? 74 ? 33 C9"));
+	dummyVoidFunc rlInitFunc3 = (dummyVoidFunc)hook::get_pattern<void*>("48 83 EC ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? E8 ? ? ? ? 48 8D 0D");
+	dummyVoidFunc2 rlInitFunc4 = (dummyVoidFunc2)hook::get_pattern<void*>("48 83 EC ? 48 8D 0D ? ? ? ? 33 D2 E8 ? ? ? ? E8");
+	void* argToRlInitFunc4 = hook::get_by_offset<void, int32_t>(hook::get_pattern<uint8_t>("48 8D 0D ? ? ? ? C6 05 ? ? ? ? ? E8 ? ? ? ? 48 8D 0D ? ? ? ? B2"), 3);
+
+	rlInitFunc1();
+	rlInitFunc2();
+	rlInitFunc3();
+	rlInitFunc4(argToRlInitFunc4);
+}
+
+void WaitForRlInit()
+{
+	assert(g_isScWaitingForInit);
+
+	auto waitForRlInitStart = GetTickCount64();
+
+	while (g_isScWaitingForInit())
+	{
+		// if stuck waiting for over a minute, likely this errored out
+		if ((GetTickCount64() - waitForRlInitStart) > 60000)
+		{
+			{
+				PWSTR appdataPath = nullptr;
+				SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdataPath);
+
+				_wunlink(va(L"%s\\CitizenFX\\ros_id%s.dat", appdataPath, IsCL2() ? L"CL2" : L""));
+			}
+
+			FatalError("Took too long in WaitForRlInit\nWaiting for R* SC SDK initialization took too long. Please restart your game and try again.\n\nIf this issue reoccurs, there might be a problem with cached entitlement tickets.");
+		}
+
+		RunRlInitServicing();
+
+		Sleep(50);
+	}
+}
+
+void SetScInitWaitCallback(bool (*cb)())
+{
+	g_isScWaitingForInit = cb;
+}
+
 static InitFunction initFunction([] ()
 {
-	OnGameFrame.Connect([] ()
-	{
-		if (g_showWarningMessage)
-		{
-			g_showWarningMessage = false;
-
-			OnMsgConfirm();
-		}
-	});
-
 	OnKillNetworkDone.Connect([]()
 	{
 		gamerInfoMenu__shutdown(rage::INIT_SESSION);
@@ -183,9 +214,8 @@ static InitFunction initFunction([] ()
 				g_origLoadMultiplayerTextChat(*g_textChat);
 			}
 
-			if (!Is372())
+			// temp hook bits to prevent *opening* the gfx
 			{
-				// temp hook bits to prevent *opening* the gfx
 				auto func = hook::get_call(hook::get_pattern<char>("38 59 59 75 05 E8", 5));
 
 				uint8_t oldCode[128];
@@ -230,7 +260,7 @@ static InitFunction initFunction([] ()
 
 		if (game)
 		{
-			auto gameCrashPattern = hook::pattern("45 33 C9 49 8B D2 48 8B 01 48 FF 60 10").count_hint(2).get(1).get<void>();
+			auto gameCrashPattern = hook::pattern("45 33 C9 49 8B D2 48 8B 01 48 FF 60").count_hint(2).get(1).get<void>();
 			hook::put<uint8_t>(gameCrashPattern, 0xCC);
 		}
 		else

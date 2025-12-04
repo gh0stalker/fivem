@@ -34,6 +34,8 @@ inline std::chrono::microseconds usec()
 	return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now().time_since_epoch());
 }
 
+extern fx::OMPtr<IScriptRefRuntime> ValidateAndLookUpRef(const std::string& refString, int32_t* refIdx);
+
 struct Bookmark
 {
 	fx::Resource* resource;
@@ -296,7 +298,7 @@ result_t SAFE_BUFFERS TestScriptHost::InvokeNative(fxNativeContext & context)
 {
 #if SCRT_HAS_CALLNATIVEHANDLER
 	// prepare an invocation context
-	fx::ScriptContextRaw scriptContext(context.arguments, context.numArguments);
+	fx::ScriptContextRaw scriptContext(context.arguments, context.arguments, context.numArguments);
 
 	// call the native handler
 	try
@@ -312,12 +314,12 @@ result_t SAFE_BUFFERS TestScriptHost::InvokeNative(fxNativeContext & context)
 	}
 #else
 	// get a native handler for the identifier
-	auto nativeHandler = ScriptEngine::GetNativeHandler(context.nativeIdentifier);
+	auto nativeHandler = ScriptEngine::GetNativeHandlerPtr(context.nativeIdentifier);
 
 	if (nativeHandler)
 	{
 		// prepare an invocation context
-		fx::ScriptContextRaw scriptContext(context.arguments, context.numArguments);
+		fx::ScriptContextRaw scriptContext(context.arguments, context.arguments, context.numArguments);
 		
 		// invoke the native handler
 		try
@@ -416,6 +418,19 @@ result_t TestScriptHost::CanonicalizeRef(int32_t refIdx, int32_t instanceId, cha
 	strcpy(*outRefText, refString);
 
 	return FX_S_OK;
+}
+
+result_t TestScriptHost::InvokeFunctionReference(char* refId, char* argsSerialized, uint32_t argsSize, IScriptBuffer** ret)
+{
+	int32_t refIdx;
+	fx::OMPtr<IScriptRefRuntime> refRuntime = ValidateAndLookUpRef(refId, &refIdx);
+
+	if (refRuntime.GetRef())
+	{
+		return refRuntime->CallRef(refIdx, argsSerialized, argsSize, ret);
+	}
+
+	return FX_E_INVALIDARG;
 }
 
 result_t TestScriptHost::GetResourceName(char** outResourceName)
@@ -670,16 +685,16 @@ static InitFunction initFunction([]()
 {
 	fx::ScriptEngine::RegisterNativeHandler("FORMAT_STACK_TRACE", [](fx::ScriptContext& context)
 	{
-		if (fx::g_suppressErrors)
+		auto topLevelStackBlob = context.GetArgument<char*>(0);
+		auto topLevelStackSize = context.GetArgument<uint32_t>(1);
+
+		if (fx::g_suppressErrors && topLevelStackBlob != nullptr)
 		{
 			context.SetResult(nullptr);
 			return;
 		}
 
 		fx::g_suppressErrors = true;
-
-		auto topLevelStackBlob = context.GetArgument<char*>(0);
-		auto topLevelStackSize = context.GetArgument<uint32_t>(1);
 
 		auto vis = fx::MakeNew<StringifyingStackVisitor>();
 
@@ -716,7 +731,7 @@ static InitFunction initFunction([]()
 				auto& b = bit->first;
 				auto& e = bit->second;
 
-				srt->WalkStack(e ? (char*)e->data() : NULL, e ? e->size() : 0, b ? (char*)b->data() : NULL, b ? b->size() : NULL, vis.GetRef());
+				srt->WalkStack(e ? (char*)e->data() : NULL, e ? e->size() : 0, b ? (char*)b->data() : NULL, b ? b->size() : 0, vis.GetRef());
 			}
 		}
 

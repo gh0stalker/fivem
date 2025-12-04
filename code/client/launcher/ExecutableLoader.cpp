@@ -39,6 +39,8 @@ void ExecutableLoader::LoadImports(IMAGE_NT_HEADERS* ntHeader)
 	{
 		const char* name = GetTargetRVA<char>(descriptor->Name);
 
+		m_moduleNames.push_back(name);
+
 		HMODULE module = ResolveLibrary(name);
 
 		if (!module)
@@ -320,11 +322,9 @@ void ExecutableLoader::LoadIntoModule(HMODULE module)
 
 	IMAGE_NT_HEADERS* ntHeader = (IMAGE_NT_HEADERS*)(m_origBinary + header->e_lfanew);
 
-	LoadSections(ntHeader);
-
-	//if (getenv("CitizenFX_ToolMode") == nullptr)
+	if (!LoadSnapshot(ntHeader))
 	{
-		LoadSnapshot(ntHeader);
+		LoadSections(ntHeader);
 	}
 
 	DWORD oldProtect;
@@ -452,8 +452,6 @@ bool ExecutableLoader::ApplyRelocations()
 			uint32_t rva = (relocStart[i] & 0xFFF) + relocation->VirtualAddress;
 
 			void* addr = GetTargetRVA<void>(rva);
-			DWORD oldProtect;
-			VirtualProtect(addr, 4, PAGE_EXECUTE_READWRITE, &oldProtect);
 
 			if (type == IMAGE_REL_BASED_HIGHLOW)
 			{
@@ -467,8 +465,6 @@ bool ExecutableLoader::ApplyRelocations()
 			{
 				return false;
 			}
-
-			VirtualProtect(addr, 4, oldProtect, &oldProtect);
 		}
 
 		// on to the next one!

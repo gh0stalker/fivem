@@ -1,11 +1,17 @@
-using CitizenFX.Core.Native;
-using System;
+using System.Collections;
 using System.Collections.Generic;
-using System.Security;
+
+#if MONO_V2
+using API = CitizenFX.FiveM.Native.Natives;
+
+namespace CitizenFX.FiveM
+#else
+using CitizenFX.Core.Native;
 
 namespace CitizenFX.Core
+#endif
 {
-	public sealed class WeaponCollection
+	public sealed class WeaponCollection : IEnumerable<Weapon>
 	{
 		#region Fields
 		Ped _owner;
@@ -15,6 +21,19 @@ namespace CitizenFX.Core
 		internal WeaponCollection(Ped owner)
 		{
 			_owner = owner;
+		}
+
+		public IEnumerator<Weapon> GetEnumerator()
+		{
+			foreach (Weapon weapon in _weapons.Values)
+			{
+				yield return weapon;
+			}
+		}
+
+		IEnumerator IEnumerable.GetEnumerator()
+		{
+			return GetEnumerator();
 		}
 
 		public Weapon this[WeaponHash hash]

@@ -5,7 +5,7 @@
  * regarding licensing.
  */
 
-// This file contains code adapted from the original GTA IV script hook, the 
+// This file contains code adapted from the original GTA IV script hook, the
 // copyright notice for which follows below.
 
 /*****************************************************************************\
@@ -38,6 +38,8 @@ misrepresented as being the original software.
 #define RAGE_SCRIPTING_EXPORT DLL_IMPORT
 #endif
 
+#include <CrossBuildRuntime.h>
+
 namespace rage
 {
 class scriptHandler;
@@ -48,7 +50,7 @@ enum eThreadState
 	ThreadStateRunning,
 	ThreadStateKilled,
 	ThreadState3,
-	ThreadState4,			// Sets opsToExecute to 1100000, and state to Idle in CallNative
+	ThreadState4, // Sets opsToExecute to 1100000, and state to Idle in CallNative
 };
 
 struct scrVector
@@ -98,7 +100,10 @@ public:
 	{
 		intptr_t* returnValues = (intptr_t*)m_pReturn;
 
-		*(T*)&returnValues[idx] = value;
+		if (returnValues)
+		{
+			*(T*)&returnValues[idx] = value;
+		}
 	}
 
 	inline int GetArgumentCount()
@@ -111,12 +116,22 @@ public:
 	{
 		intptr_t* returnValues = (intptr_t*)m_pReturn;
 
-		return *(T*)&returnValues[idx];
+		if (returnValues)
+		{
+			return *(T*)&returnValues[idx];
+		}
+
+		return T{};
 	}
 
 	inline void* GetArgumentBuffer()
 	{
 		return m_pArgs;
+	}
+
+	inline void* GetResultBuffer()
+	{
+		return m_pReturn;
 	}
 
 	// copy vector3 pointer results to the initial argument
@@ -146,7 +161,7 @@ struct scrThreadContext
 	uint32_t ScriptHash; // + 4 (program id)
 	eThreadState State; // + 8
 	uint32_t IP; // + 12
-	uint32_t FrameSP; // 
+	uint32_t FrameSP; //
 	uint32_t SP; // + 20, aka + 28
 	uint32_t TimerA; // + 24
 	uint32_t TimerB; // + 28
@@ -175,74 +190,50 @@ struct scrThreadContext
 
 static_assert(sizeof(scrThreadContext) == 168, "scrThreadContext has wrong size!");
 
-class 
-#ifdef COMPILING_RAGE_SCRIPTING_FIVE
-	__declspec(dllexport)
-#endif
-	scrThread
+class RAGE_SCRIPTING_EXPORT scrThread
 {
-protected:
-	scrThreadContext		m_Context;
-	void*					m_pStack; // should be +176 including vtable
-	void*					pad;
-	void*					pad2;
-
-	// should be +200
-	const char*				m_pszExitMessage;
-
 public:
-	virtual ~scrThread()																	{}
-	virtual eThreadState	Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount)		= 0;
-	virtual eThreadState	Run(uint32_t opsToExecute)										= 0;
-	virtual eThreadState	Tick(uint32_t opsToExecute)										= 0;
-	virtual void			Kill()															= 0;
-
-	scrThreadContext*		GetContext()													{ return &m_Context; }
+	scrThreadContext* GetContext();
 };
 }
 
-class
-#ifdef COMPILING_RAGE_SCRIPTING_FIVE
-	__declspec(dllexport)
-#endif
-	GtaThread :
-		public rage::scrThread
+class RAGE_SCRIPTING_EXPORT GtaThread : public rage::scrThread
 {
-protected:
-	char scriptName[64];                        // 208
-	rage::scriptHandler* m_pScriptHandler;      // 272
-	void* m_pNetcomponent;                      // 280
-	char gta_pad2[24];                          // 288
-	uint32_t m_networkId;                       // 312
-	uint32_t gta_padInt;                        // 316
-	char flag1;                                 // 320
-	char m_networkFlag;                         // 321
-	uint16_t gta_pad3;                          // 322
-	char gta_pad4[12];                          // 324
-	uint8_t m_canRemoveBlipsFromOtherScripts;   // 336
-	char gta_pad5[7];                           // 337
-
 public:
-	virtual void					DoRun() = 0;
+	void SetScriptName(const char* name);
+	rage::scriptHandler* GetScriptHandler();
 
-	virtual rage::eThreadState		Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount);
-	virtual rage::eThreadState		Run(uint32_t opsToExecute);
-	virtual rage::eThreadState		Tick(uint32_t opsToExecute);
-	virtual void					Kill();
-
-	inline void SetScriptName(const char* name)
-	{
-		strncpy(scriptName, name, sizeof(scriptName) - 1);
-		scriptName[sizeof(scriptName) - 1] = '\0';
-	}
-
-	inline rage::scriptHandler* GetScriptHandler() { return m_pScriptHandler; }
-
-	inline void SetScriptHandler(void* scriptHandler) { m_pScriptHandler = reinterpret_cast<rage::scriptHandler*>(scriptHandler); }
-
-	inline void SetScriptHandler(rage::scriptHandler* scriptHandler) { m_pScriptHandler = scriptHandler; }
-
-	inline void RemoveCleanupFlag() {  }
+	rage::eThreadState Reset(uint32_t scriptHash, void* pArgs, uint32_t argCount);
+	rage::eThreadState Run(uint32_t opsToExecute);
+	rage::eThreadState Tick(uint32_t opsToExecute);
+	void Kill();
 };
 
-static_assert(sizeof(GtaThread) == 344, "GtaThread has wrong size!");
+class RAGE_SCRIPTING_EXPORT CfxThread
+{
+public:
+	CfxThread();
+
+	virtual ~CfxThread();
+
+	virtual void Reset()
+	{
+	}
+
+	virtual void DoRun() = 0;
+
+	virtual void Kill()
+	{
+	}
+
+	void AttachScriptHandler();
+	void DetachScriptHandler();
+
+	GtaThread* GetThread()
+	{
+		return Thread;
+	}
+
+private:
+	GtaThread* Thread;
+};

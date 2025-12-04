@@ -6,10 +6,14 @@
  */
 
 #include "StdInc.h"
+#include <CommCtrl.h>
+#include <ctime>
+#include <chrono>
 
 #ifdef LAUNCHER_PERSONALITY_MAIN
-#include <CommCtrl.h>
 #include <shobjidl.h>
+
+#include "launcher.rc.h"
 
 #include <ShellScalingApi.h>
 
@@ -75,7 +79,9 @@ struct CompositionEffect : winrt::implements
 	template<int N>
 	void SetProperty(const std::string& name, const float (&value)[N], GRAPHICS_EFFECT_PROPERTY_MAPPING mapping = GRAPHICS_EFFECT_PROPERTY_MAPPING_DIRECT)
 	{
-		m_properties.emplace_back(name, winrt::Windows::Foundation::PropertyValue::CreateSingleArray(winrt::array_view<const float>{ (float*)&value, (float*)&value + N }), mapping);
+		const float* valuePointerStart = &value[0];
+		const float* valuePointerEnd = valuePointerStart + N;
+		m_properties.emplace_back(name, winrt::Windows::Foundation::PropertyValue::CreateSingleArray(winrt::array_view<const float>{ valuePointerStart, valuePointerEnd }), mapping);
 	}
 
 	template<>
@@ -203,6 +209,7 @@ struct TenUI
 {
 	DesktopWindowXamlSource uiSource{ nullptr };
 
+	winrt::Windows::UI::Xaml::UIElement snailContainer{ nullptr };
 	winrt::Windows::UI::Xaml::Controls::TextBlock topStatic{ nullptr };
 	winrt::Windows::UI::Xaml::Controls::TextBlock bottomStatic{ nullptr };
 	winrt::Windows::UI::Xaml::Controls::ProgressBar progressBar{ nullptr };
@@ -334,6 +341,11 @@ R"(         </Viewbox>
 				<ProgressBar x:Name="progressBar" Foreground="White" Width="250" />
 			</Grid>
             <TextBlock x:Name="static2" Text=" " TextAlignment="Center" Foreground="#ffeeeeee" FontSize="18" />
+			<StackPanel Orientation="Horizontal" HorizontalAlignment="Center" x:Name="snailContainer" Visibility="Collapsed">
+				<TextBlock TextAlignment="Center" Foreground="#ddeeeeee" FontSize="14" Width="430" TextWrapping="Wrap">
+					🐌 RedM game storage downloads are peer-to-peer and may be slower than usual downloads. Please be patient.
+				</TextBlock>
+			</StackPanel>
         </StackPanel>
     </Grid>
 </Grid>
@@ -420,7 +432,7 @@ void BackdropBrush::OnConnected()
 		compEffect.AddSource(effect);
 		compEffect.AddSource(layerColor);
 
-		auto hRsc = FindResource(GetModuleHandle(NULL), MAKEINTRESOURCE(1010), L"MEOW");
+		auto hRsc = FindResource(GetModuleHandle(NULL), MAKEINTRESOURCE(IDM_BACKDROP), L"MEOW");
 		auto resSize = SizeofResource(GetModuleHandle(NULL), hRsc);
 		auto resData = LoadResource(GetModuleHandle(NULL), hRsc);
 
@@ -1054,14 +1066,71 @@ const BYTE g_VertyShader[] = {
 
 #include <dwmapi.h>
 #include <mmsystem.h>
+#include <setupapi.h>
+
+static const GUID GUID_DEVINTERFACE_DISPLAY_ADAPTER = { 0x5b45201d, 0xf2f2, 0x4f3b, { 0x85, 0xbb, 0x30, 0xff, 0x1f, 0x95, 0x35, 0x99 } };
 
 #pragma comment(lib, "dwmapi")
+
+static bool IsSafeGPUDriver()
+{
+	static auto hSetupAPI = LoadLibraryW(L"setupapi.dll");
+	if (!hSetupAPI)
+	{
+		return false;
+	}
+
+	static auto _SetupDiGetClassDevsW = (decltype(&SetupDiGetClassDevsW))GetProcAddress(hSetupAPI, "SetupDiGetClassDevsW");
+	static auto _SetupDiBuildDriverInfoList = (decltype(&SetupDiBuildDriverInfoList))GetProcAddress(hSetupAPI, "SetupDiBuildDriverInfoList");
+	static auto _SetupDiEnumDeviceInfo = (decltype(&SetupDiEnumDeviceInfo))GetProcAddress(hSetupAPI, "SetupDiEnumDeviceInfo");
+	static auto _SetupDiEnumDriverInfoW = (decltype(&SetupDiEnumDriverInfoW))GetProcAddress(hSetupAPI, "SetupDiEnumDriverInfoW");
+	static auto _SetupDiDestroyDeviceInfoList = (decltype(&SetupDiDestroyDeviceInfoList))GetProcAddress(hSetupAPI, "SetupDiDestroyDeviceInfoList");
+
+	HDEVINFO devInfoSet = _SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISPLAY_ADAPTER, NULL, NULL,
+	DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
+	bool safe = true;
+
+	for (int i = 0;; i++)
+	{
+		SP_DEVINFO_DATA devInfo = { sizeof(SP_DEVINFO_DATA) };
+		if (!_SetupDiEnumDeviceInfo(devInfoSet, i, &devInfo))
+		{
+			break;
+		}
+
+		if (!_SetupDiBuildDriverInfoList(devInfoSet, &devInfo, SPDIT_COMPATDRIVER))
+		{
+			safe = false;
+			break;
+		}
+
+		SP_DRVINFO_DATA drvInfo = { sizeof(SP_DRVINFO_DATA) };
+		if (_SetupDiEnumDriverInfoW(devInfoSet, &devInfo, SPDIT_COMPATDRIVER, 0, &drvInfo))
+		{
+			ULARGE_INTEGER driverDate = {0};
+			driverDate.HighPart = drvInfo.DriverDate.dwHighDateTime;
+			driverDate.LowPart = drvInfo.DriverDate.dwLowDateTime;
+			
+			// drivers from after 2007-01-01 (to prevent in-box driver from being wrong) and 2020-01-01 are 'unsafe' and might crash
+			if (driverDate.QuadPart >= 128120832000000000ULL && driverDate.QuadPart < 132223104000000000ULL)
+			{
+				safe = false;
+				break;
+			}
+		}
+	}
+
+	_SetupDiDestroyDeviceInfoList(devInfoSet);
+
+	return safe;
+}
 
 static void InitializeRenderOverlay(winrt::Windows::UI::Xaml::Controls::SwapChainPanel swapChainPanel, int w, int h)
 {
 	auto nativePanel = swapChainPanel.as<ISwapChainPanelNative>();
 
-	std::thread([w, h, swapChainPanel, nativePanel]()
+	auto run = [w, h, swapChainPanel, nativePanel]()
 	{
 		auto loadSystemDll = [](auto dll)
 		{
@@ -1220,15 +1289,16 @@ static void InitializeRenderOverlay(winrt::Windows::UI::Xaml::Controls::SwapChai
 
 			g_pd3dDeviceContext->OMSetBlendState(bs.Get(), NULL, 0xFFFFFFFF);
 
-			static auto startTime = timeGetTime();
+			static auto startTime = std::chrono::steady_clock::now();
 
 			D3D11_MAPPED_SUBRESOURCE mapped_resource;
 			if (SUCCEEDED(g_pd3dDeviceContext->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped_resource)))
 			{
-				auto c = (CBuf*)mapped_resource.pData;
-				c->res[0] = float(w);
-				c->res[1] = float(h);
-				c->sec = (timeGetTime() - startTime) / 1000.0f;
+				auto c = static_cast<CBuf*>(mapped_resource.pData);
+				c->res[0] = static_cast<float>(w);
+				c->res[1] = static_cast<float>(h);
+				auto now = std::chrono::steady_clock::now();
+				c->sec = std::chrono::duration<float>(now - startTime).count();
 				g_pd3dDeviceContext->Unmap(cb, 0);
 			}
 
@@ -1237,6 +1307,14 @@ static void InitializeRenderOverlay(winrt::Windows::UI::Xaml::Controls::SwapChai
 
 			g_pSwapChain->Present(0, 0);
 			DwmFlush();
+		}
+	};
+
+	std::thread([run]()
+	{
+		if (IsSafeGPUDriver())
+		{
+			run();
 		}
 
 		// prevent the thread from exiting (the CRT is broken and will crash on thread exit in some cases)
@@ -1311,7 +1389,12 @@ void UI_CreateWindow()
 		{
 			auto sc = ui.FindName(L"Overlay").as<winrt::Windows::UI::Xaml::Controls::SwapChainPanel>();
 
-			if (_time64(NULL) < 1643670000)
+			auto time = std::time(nullptr);
+			auto datetime = std::localtime(&time);
+			auto month = datetime->tm_mon + 1;
+
+			// Snow effect for December and January
+			if (month == 12 || month == 1)
 			{
 				InitializeRenderOverlay(sc, g_dpi.ScaleX(wwidth), g_dpi.ScaleY(wheight));
 			}
@@ -1323,6 +1406,7 @@ void UI_CreateWindow()
 		ten->topStatic = ui.FindName(L"static1").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
 		ten->bottomStatic = ui.FindName(L"static2").as<winrt::Windows::UI::Xaml::Controls::TextBlock>();
 		ten->progressBar = ui.FindName(L"progressBar").as<winrt::Windows::UI::Xaml::Controls::ProgressBar>();
+		ten->snailContainer = ui.FindName(L"snailContainer").as<winrt::Windows::UI::Xaml::UIElement>();
 
 		ten->uiSource.Content(ui);
 
@@ -1635,6 +1719,16 @@ void UI_DoDestruction()
 	DestroyWindow(g_uui.rootWindow);
 }
 
+void UI_SetSnailState(bool snail)
+{
+	if (g_uui.ten)
+	{
+		g_uui.ten->snailContainer.Visibility(snail ? winrt::Windows::UI::Xaml::Visibility::Visible : winrt::Windows::UI::Xaml::Visibility::Collapsed);
+
+		return;
+	}
+}
+
 void UI_UpdateText(int textControl, const wchar_t* text)
 {
 	if (g_uui.ten)
@@ -1701,7 +1795,17 @@ bool UI_IsCanceled()
 
 void UI_DisplayError(const wchar_t* error)
 {
-	MessageBoxW(UI_GetWindowHandle(), error, L"Error", MB_OK | MB_ICONSTOP);
+	static TASKDIALOGCONFIG taskDialogConfig = { 0 };
+	taskDialogConfig.cbSize = sizeof(taskDialogConfig);
+	taskDialogConfig.hInstance = GetModuleHandle(nullptr);
+	taskDialogConfig.dwFlags = TDF_ENABLE_HYPERLINKS | TDF_SIZE_TO_CONTENT;
+	taskDialogConfig.dwCommonButtons = TDCBF_CLOSE_BUTTON;
+	taskDialogConfig.pszWindowTitle = L"Error updating " PRODUCT_NAME;
+	taskDialogConfig.pszMainIcon = TD_ERROR_ICON;
+	taskDialogConfig.pszMainInstruction = NULL;
+	taskDialogConfig.pszContent = error;
+
+	TaskDialogIndirect(&taskDialogConfig, nullptr, nullptr, nullptr);
 }
 
 #include <wrl/module.h>

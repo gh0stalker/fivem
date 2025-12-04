@@ -68,6 +68,40 @@ std::vector<uint8_t> Stream::ReadToEnd()
 	if (fileLength - curSize == 0)
 		return std::vector<uint8_t>();
 
+	if (int64_t(fileLength - curSize) < 0)
+		return std::vector<uint8_t>();
+
 	return Read(fileLength - curSize);
+}
+
+size_t Stream::ReadToEndBuffered(std::vector<uint8_t>& buffer)
+{
+	const size_t fileLength = m_device->GetLength(m_handle);
+	const size_t curSize = Seek(0, SEEK_CUR);
+	const size_t sizeToRead = fileLength - curSize;
+
+	if (sizeToRead <= 0)
+	{
+		return 0;
+	}
+
+	// increase buffer if required
+	if (buffer.size() < sizeToRead)
+	{
+		buffer.resize(sizeToRead);
+	}
+
+	const size_t fileSizeRead = Read(buffer.data(), sizeToRead);
+	return fileSizeRead;
+}
+
+bool Stream::Flush()
+{
+	if (m_handle != INVALID_DEVICE_HANDLE)
+	{
+		return m_device->Flush(m_handle);
+	}
+
+	return false;
 }
 }

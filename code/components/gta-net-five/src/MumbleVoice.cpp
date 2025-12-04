@@ -33,6 +33,8 @@
 #include <ResourceManager.h>
 #include <ResourceEventComponent.h>
 
+#include "ScriptWarnings.h"
+
 #if __has_include(<GameInput.h>)
 #include <GameInput.h>
 #endif
@@ -46,6 +48,11 @@ using json = nlohmann::json;
 static NetLibrary* g_netLibrary;
 
 #ifdef GTA_FIVE
+static uint32_t g_gamerInfoGamerIdOffset;
+static uint32_t g_playerInfoPedOffset;
+#endif
+
+#ifdef GTA_FIVE
 static hook::cdecl_stub<void()> _initVoiceChatConfig([]()
 {
 	return hook::get_pattern("89 44 24 58 0F 29 44 24 40 E8", -0x12E);
@@ -53,7 +60,7 @@ static hook::cdecl_stub<void()> _initVoiceChatConfig([]()
 #elif IS_RDR3
 static hook::cdecl_stub<void(void*)> _initVoiceChatConfig([]()
 {
-	return hook::get_pattern("8B 83 ? ? ? ? F2 0F 10 8B ? ? ? ? 48", (xbr::IsGameBuildOrGreater<1436>()) ? -0xDD : -0x81);
+	return hook::get_pattern("8B 83 ? ? ? ? F2 0F 10 8B ? ? ? ? 48", -0xDD);
 });
 
 static hook::cdecl_stub<int(void*, uint64_t, uint32_t)> rage__atDataHash([]()
@@ -78,24 +85,59 @@ public:
 #ifdef GTA_FIVE
 static uint32_t* g_preferenceArray;
 
-// 1290
-// #TODO1365
-// #TODO1493
-// #TODO1604
-enum PrefEnum
+// Virtual mapping - incomplete
+enum eMenuPref
 {
-	PREF_VOICE_ENABLE = 0x60,
-	PREF_VOICE_OUTPUT_DEVICE = 0x61,
-	PREF_VOICE_OUTPUT_VOLUME = 0x62,
-	PREF_VOICE_SOUND_VOLUME = 0x63,
-	PREF_VOICE_MUSIC_VOLUME = 0x64,
-	PREF_VOICE_TALK_ENABLED = 0x65,
-	PREF_VOICE_FEEDBACK = 0x66,
-	PREF_VOICE_INPUT_DEVICE = 0x67,
-	PREF_VOICE_CHAT_MODE = 0x68,
-	PREF_VOICE_MIC_VOLUME = 0x69,
-	PREF_VOICE_MIC_SENSITIVITY = 0x6A
+	PREF_VOICE_ENABLE = 0,
+	PREF_VOICE_OUTPUT = 1, // NOT A VOICE PREF - needed for index to match
+	PREF_VOICE_OUTPUT_DEVICE = 2,
+	PREF_VOICE_OUTPUT_VOLUME = 3,
+	PREF_VOICE_SOUND_VOLUME = 9,
+	PREF_VOICE_MUSIC_VOLUME = 10,
+	PREF_VOICE_TALK_ENABLED = 4,
+	//PREF_VOICE_FEEDBACK,
+	PREF_VOICE_INPUT_DEVICE = 5,
+	PREF_VOICE_CHAT_MODE = 6,
+	PREF_VOICE_MIC_VOLUME = 7,
+	PREF_VOICE_MIC_SENSITIVITY = 8,
 };
+
+static std::array<uint8_t, 11> voicePrefEnums;
+
+static int MapPrefsEnum(const int index)
+{
+	return voicePrefEnums[index];
+}
+
+static void GetDynamicVoicePrefEnums()
+{
+	uint8_t inserted = 0;
+	uint8_t offset = 0xFF;
+
+	auto instructionPtr = hook::get_pattern<uint8_t>("40 56 48 83 EC ? BE");
+
+	while (inserted < 11)
+	{
+		if (instructionPtr[0] == 0xBE && offset == 0xFF)
+		{
+			assert(inserted == 0);
+			offset = instructionPtr[1];
+		}
+
+		if (instructionPtr[0] == 0x8D && instructionPtr[1] == 0x4E)
+		{
+			assert(offset != 0xFF && inserted < 11);
+
+			const uint8_t enumVal = offset + instructionPtr[2];
+
+			voicePrefEnums[inserted++] = enumVal;
+		}
+
+		++instructionPtr;
+	}
+
+	assert(inserted == 11);
+}
 
 void VoiceChatPrefs::InitConfig()
 {
@@ -104,37 +146,37 @@ void VoiceChatPrefs::InitConfig()
 
 bool VoiceChatPrefs::IsEnabled()
 {
-	return g_preferenceArray[PREF_VOICE_ENABLE];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_ENABLE)];
 }
 
 bool VoiceChatPrefs::IsMicEnabled()
 {
-	return g_preferenceArray[PREF_VOICE_TALK_ENABLED];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_TALK_ENABLED)];
 }
 
 int VoiceChatPrefs::GetOutputDevice()
 {
-	return g_preferenceArray[PREF_VOICE_OUTPUT_DEVICE];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_OUTPUT_DEVICE)];
 }
 
 int VoiceChatPrefs::GetInputDevice()
 {
-	return g_preferenceArray[PREF_VOICE_INPUT_DEVICE];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_INPUT_DEVICE)];
 }
 
 int VoiceChatPrefs::GetOutputVolume()
 {
-	return g_preferenceArray[PREF_VOICE_OUTPUT_VOLUME];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_OUTPUT_VOLUME)];
 }
 
 int VoiceChatPrefs::GetMicSensitivity()
 {
-	return g_preferenceArray[PREF_VOICE_MIC_SENSITIVITY];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_MIC_SENSITIVITY)];
 }
 
 int VoiceChatPrefs::GetChatMode()
 {
-	return g_preferenceArray[PREF_VOICE_CHAT_MODE];
+	return g_preferenceArray[MapPrefsEnum(PREF_VOICE_CHAT_MODE)];
 }
 #elif IS_RDR3
 struct VoiceChatMgrPrefs
@@ -342,6 +384,16 @@ static float* g_actorPos;
 
 #pragma comment(lib, "dsound.lib")
 
+bool IsMumbleConnected()
+{
+	if (!g_mumble.connectionInfo)
+	{
+		return false;
+	}
+	
+	return g_mumble.connected && g_mumble.connectionInfo->isConnected;
+}
+
 static void Mumble_RunFrame()
 {
 	if (!Instance<ICoreGameInit>::Get()->HasVariable("gameSettled"))
@@ -354,20 +406,15 @@ static void Mumble_RunFrame()
 		return;
 	}
 
-	if (!g_mumble.connected || (g_mumble.connectionInfo && !g_mumble.connectionInfo->isConnected))
+	if (!IsMumbleConnected())
 	{
 		if (Mumble_ShouldConnect() && !g_mumble.connecting && !g_mumble.errored)
 		{
 			if (GetTickCount64() > g_mumble.nextConnectAt)
 			{
 				Mumble_Connect();
-
-				g_mumble.nextConnectDelay *= 2;
-
-				if (g_mumble.nextConnectDelay > 30 * 1000)
-				{
-					g_mumble.nextConnectDelay = 30 * 1000;
-				}
+				
+				g_mumble.nextConnectDelay = std::min(g_mumble.nextConnectDelay * 2, 30'000);
 
 				g_mumble.nextConnectAt = GetTickCount64() + g_mumble.nextConnectDelay;
 			}
@@ -436,14 +483,19 @@ static void Mumble_RunFrame()
 #ifdef GTA_FIVE
 	static auto getCam1 = fx::ScriptEngine::GetNativeHandler(0x19CAFA3C87F7C2FF);
 	static auto getCam2 = fx::ScriptEngine::GetNativeHandler(0xEE778F8C7E1142E2);
+	bool isInFirstPerson = FxNativeInvoke::Invoke<int>(getCam2, FxNativeInvoke::Invoke<int>(getCam1)) == 4;
+#elif IS_RDR3
+	static auto isInFullFirstPersonMode = fx::ScriptEngine::GetNativeHandler(0xD1BA66940E94C547);
+	static auto isFirstPersonCameraActive = fx::ScriptEngine::GetNativeHandler(0xA24C1D341C6E0D53);
+	bool isInFirstPerson = FxNativeInvoke::Invoke<bool>(isInFullFirstPersonMode) && FxNativeInvoke::Invoke<bool>(isFirstPersonCameraActive, 1, 0, 0);
+#endif
 
-	if (FxNativeInvoke::Invoke<int>(getCam2, FxNativeInvoke::Invoke<int>(getCam1)) == 4)
+	if (isInFirstPerson)
 	{
 		actorPos[0] = cameraPos[0];
 		actorPos[1] = cameraPos[1];
 		actorPos[2] = cameraPos[2];
 	}
-#endif
 
 	g_mumbleClient->SetListenerMatrix(actorPos, cameraFront, cameraTop);
 	g_mumbleClient->SetActorPosition(actorPos);
@@ -685,6 +737,8 @@ static bool(*g_origIsPlayerTalking)(void*, void*);
 
 extern CNetGamePlayer* netObject__GetPlayerOwner(rage::netObject* object);
 
+extern rage::netObject* GetNetObjectFromEntity(void* entity);
+
 static bool _isPlayerTalking(void* mgr, char* playerData)
 {
 	if (g_origIsPlayerTalking(mgr, playerData))
@@ -693,11 +747,9 @@ static bool _isPlayerTalking(void* mgr, char* playerData)
 	}
 
 #ifdef GTA_FIVE
-	// 1290
-	// #TODO1365
-	// #TODO1493
-	// #TODO1604
-	auto playerInfo = playerData - 32 - 48 - 16 - (xbr::IsGameBuildOrGreater<2060>() ? 8 : 0);
+	// rlGamerInfo = rlGamerId - (1604: 64, 2060: 72, 2372: 104, 2944: 192, ...)
+	// CPlayerInfo = rlGamerInfo - 32 (fwExtensibleBase offset, unlikely to change)
+	auto playerInfo = playerData - g_gamerInfoGamerIdOffset - 32;
 
 	// preemptive check for invalid players (FIVEM-CLIENT-1604-TQKV) with uncertain server changes
 	if ((uintptr_t)playerInfo < 0xFFFF)
@@ -706,28 +758,28 @@ static bool _isPlayerTalking(void* mgr, char* playerData)
 	}
 
 	// get the ped
-	auto ped = *(char**)(playerInfo + 456);
+	auto ped = *(char**)(playerInfo + g_playerInfoPedOffset);
 #elif IS_RDR3
-	// rlGamerInfo = playerData - 200, rlGamerInfo + 896 = CPed
+	// rlGamerInfo = playerData - 200
+	// CPed = rlGamerInfo + 896
 	auto ped = *(char**)(playerData + 696);
 #endif
 
 	if (ped)
 	{
-#ifdef GTA_FIVE
-		auto netObj = *(rage::netObject**)(ped + 208);
-#elif IS_RDR3
-		auto netObj = *(rage::netObject**)(ped + 224);
-#endif
+		auto netObj = GetNetObjectFromEntity(ped);
 
 		if (netObj)
 		{
 			// actually: netobj owner
-			auto index = netObject__GetPlayerOwner(netObj)->physicalPlayerIndex();
-
-			if (g_talkers.test(index) || o_talkers.test(index))
+			if (auto owner = netObject__GetPlayerOwner(netObj))
 			{
-				return true;
+				auto index = owner->physicalPlayerIndex();
+
+				if (g_talkers.test(index) || o_talkers.test(index))
+				{
+					return true;
+				}
 			}
 		}
 	}
@@ -739,7 +791,7 @@ static bool(*g_origGetPlayerHasHeadset)(void*, void*);
 
 static bool _getPlayerHasHeadset(void* mgr, void* plr)
 {
-	if (g_mumble.connected)
+	if (IsMumbleConnected())
 	{
 		return true;
 	}
@@ -751,7 +803,7 @@ static float(*g_origGetLocalAudioLevel)(void* mgr, int localIdx);
 
 static float _getLocalAudioLevel(void* mgr, int localIdx)
 {
-	float mumbleLevel = (g_mumble.connected) ? g_mumbleClient->GetInputAudioLevel() : 0.0f;
+	float mumbleLevel = (IsMumbleConnected()) ? g_mumbleClient->GetInputAudioLevel() : 0.0f;
 
 	return std::max(g_origGetLocalAudioLevel(mgr, localIdx), mumbleLevel);
 }
@@ -766,7 +818,7 @@ static void _filterVoiceChatConfig(void* engine, char* config)
 #endif
 
 	// disable voice if mumble is used
-	if (g_mumble.connected)
+	if (IsMumbleConnected())
 	{
 		*config = 0;
 	}
@@ -776,38 +828,84 @@ static void _filterVoiceChatConfig(void* engine, char* config)
 
 #include <LabSound/extended/LabSound.h>
 
-static boost::optional<fx::TNativeHandler> getPlayerName;
-static boost::optional<fx::TNativeHandler> getServerId;
+static fx::TNativeHandler getPlayerName;
+static fx::TNativeHandler getServerId;
+
+static std::optional<std::string> getMumbleName(int playerId)
+{
+	int serverId = FxNativeInvoke::Invoke<int>(getServerId, playerId);
+
+	// if the server id is 0 then we don't have a player.
+	if (serverId == 0)
+	{
+		return std::nullopt;
+	}
+	
+	return fmt::sprintf("[%d] %s",
+		serverId,
+		FxNativeInvoke::Invoke<const char*>(getPlayerName, playerId));
+}
 
 static std::shared_ptr<lab::AudioContext> getAudioContext(int playerId)
 {
-	if (!g_mumble.connected)
+	const auto name = getMumbleName(playerId);
+
+	// if the server id is 0 then we don't have a player.
+	if (!IsMumbleConnected() || !name)
 	{
 		return {};
 	}
 
-	std::string name = fmt::sprintf("[%d] %s",
-		FxNativeInvoke::Invoke<int>(getServerId, playerId),
-		FxNativeInvoke::Invoke<const char*>(getPlayerName, playerId));
-	return g_mumbleClient->GetAudioContext(name);
+	return g_mumbleClient->GetAudioContext(*name);
 }
 
 static std::shared_ptr<lab::AudioContext> getAudioContextByServerId(int serverId)
 {
-	if (!g_mumble.connected)
+	if (!IsMumbleConnected())
 	{
 		return {};
 	}
-
-	std::string name = ToNarrow(g_mumbleClient->GetPlayerNameFromServerId(serverId));
+	
+	std::string name = g_mumbleClient->GetPlayerNameFromServerId(serverId);
+	if (name.empty())
+	{
+		return {};
+	}
+	
 	return g_mumbleClient->GetAudioContext(name);
 }
 
-std::wstring getMumbleName(int playerId)
+std::string GetMumbleChannel(int channelId)
 {
-	return ToWide(fmt::sprintf("[%d] %s",
-		FxNativeInvoke::Invoke<int>(getServerId, playerId),
-		FxNativeInvoke::Invoke<const char*>(getPlayerName, playerId)));
+	return fmt::sprintf("Game Channel %d", channelId);
+}
+
+// Returns true if the voice target id valid to use with the `VoiceTarget` packet (1..30)
+// see: https://github.com/citizenfx/fivem/blob/0ec3c8f9f6e715e65beca971712384d0300a553a/code/components/voip-server-mumble/src/Mumble.proto#L438-L441
+bool IsVoiceTargetIdValid(int id)
+{
+	return id >= 1 && id <= 30;
+}
+
+// Ensures that mumble is connected before calling any mumble related functions
+template<typename MumbleFn>
+inline auto MakeMumbleNative(MumbleFn fn, uintptr_t defaultValue = 0)
+{
+	return [=](fx::ScriptContext& context)
+	{
+		if (!IsMumbleConnected())
+		{
+			context.SetResult(defaultValue);
+			return;
+		}
+		
+		fn(context);
+	};
+};
+
+static void InvalidTargetIdWarning(const std::string_view& nativeName)
+{
+	fx::scripting::Warningf("mumble", "%s: Tried to use an invalid targetId, the minimum target id is 1, the maximum is 30.", nativeName);
 }
 
 #include <scrBind.h>
@@ -818,21 +916,23 @@ static HookFunction hookFunction([]()
 	g_preferenceArray = hook::get_address<uint32_t*>(hook::get_pattern("48 8D 15 ? ? ? ? 8D 43 01 83 F8 02 77 2D", 3));
 	g_viewportGame = hook::get_address<CViewportGame**>(hook::get_pattern("33 C0 48 39 05 ? ? ? ? 74 2E 48 8B 0D ? ? ? ? 48 85 C9 74 22", 5));
 	g_actorPos = hook::get_address<float*>(hook::get_pattern("BB 00 00 40 00 48 89 7D F8 89 1D", -4)) + 12;
+
+	{
+		auto location = hook::get_pattern<char>("BA 11 00 00 00 0F 10");
+		g_gamerInfoGamerIdOffset = xbr::IsGameBuildOrGreater<2944>() ? *(uint32_t*)(location + 8) : *(uint8_t*)(location - 1);
+	}
+
+	g_playerInfoPedOffset = *hook::get_pattern<uint32_t>("4C 8B 81 ? ? ? ? 41 8B 80", 3);
+
+	GetDynamicVoicePrefEnums();
 #elif IS_RDR3
 	g_viewportGame = hook::get_address<CViewportGame**>(hook::get_pattern("0F 2F F0 76 ? 4C 8B 35", 8));
 
-	if (xbr::IsGameBuildOrGreater<1436>())
-	{
-		g_actorPos = hook::get_address<float*>(hook::get_pattern("45 33 C9 48 89 5D E0 8D 53 01", 63)) + 16;
-	}
-	else
-	{
-		g_actorPos = hook::get_address<float*>(hook::get_pattern("8B C2 48 03 C0 41 8D 49 FF 48 03 C9", -4)) + 16;
-	}
+	g_actorPos = hook::get_address<float*>(hook::get_pattern("45 33 C9 48 89 5D E0 8D 53 01", 63)) + 16;
 
 	{
 		auto location = hook::get_pattern<char>("75 0D 8B C8 E8 ? ? ? ? 84 C0 B0 01 75 03");
-		auto prefsOffset = *(uint32_t*)(location + (xbr::IsGameBuildOrGreater<1436>() ? 40 : 48));
+		auto prefsOffset = *(uint32_t*)(location +  40);
 
 		g_voiceChatMgr = *hook::get_address<void**>(location - 16);
 		g_voiceChatMgrPrefs = (VoiceChatMgrPrefs*)((uint64_t)g_voiceChatMgr + prefsOffset);
@@ -859,7 +959,7 @@ static HookFunction hookFunction([]()
 				func();
 			}
 
-			if (!g_mumble.connected)
+			if (!IsMumbleConnected())
 			{
 				return;
 			}
@@ -895,22 +995,18 @@ static HookFunction hookFunction([]()
 			}
 		});
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_TALKER_PROXIMITY", [](fx::ScriptContext& context)
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_TALKER_PROXIMITY", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			float proximity = context.GetArgument<float>(0);
 
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->SetAudioDistance(proximity);
-			}
-		});
+			g_mumbleClient->SetAudioDistance(proximity);
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_GET_TALKER_PROXIMITY", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_GET_TALKER_PROXIMITY", MakeMumbleNative([](fx::ScriptContext& context)
 		{
-			float proximity = (g_mumble.connected) ? g_mumbleClient->GetAudioDistance() : 0.0f;
-
-			context.SetResult<float>(proximity);
-		});
+			context.SetResult<float>(g_mumbleClient->GetAudioDistance());
+		}, 0.0f));
 
 		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_ACTIVE", [](fx::ScriptContext& context)
 		{
@@ -922,299 +1018,315 @@ static HookFunction hookFunction([]()
 			context.SetResult<bool>(g_voiceActiveByScript);
 		});
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_IS_PLAYER_TALKING", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_IS_PLAYER_TALKING", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			int playerId = context.GetArgument<int>(0);
 			bool isTalking = false;
 
-			if (g_mumble.connected)
+			if (playerId >= 0 && playerId < g_talkers.size())
 			{
-				if (playerId >= 0 && playerId < g_talkers.size())
-				{
-					isTalking = g_talkers.test(playerId);
-				}
+				isTalking = g_talkers.test(playerId);
 			}
 
 			context.SetResult(isTalking);
-		});
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOLUME_OVERRIDE", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOLUME_OVERRIDE", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			int playerId = context.GetArgument<int>(0);
 			float volume = context.GetArgument<float>(1);
 
-			if (g_mumble.connected)
+			if (auto name = getMumbleName(playerId))
 			{
-				std::wstring name = getMumbleName(playerId);
-
-				g_mumbleClient->SetClientVolumeOverride(name, volume);
+				g_mumbleClient->SetClientVolumeOverride(*name, volume);
 			}
-		});
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOLUME_OVERRIDE_BY_SERVER_ID", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOLUME_OVERRIDE_BY_SERVER_ID", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			int serverId = context.GetArgument<int>(0);
 			float volume = context.GetArgument<float>(1);
 
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->SetClientVolumeOverrideByServerId(serverId, volume);
-			}
-		});
+			g_mumbleClient->SetClientVolumeOverrideByServerId(serverId, volume);
+		}));
 
 		static VoiceTargetConfig vtConfigs[31];
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET", [](fx::ScriptContext& context)
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			auto id = context.GetArgument<int>(0);
 
-			if (id >= 0 && id < 31)
+			if (IsVoiceTargetIdValid(id))
 			{
-				if (g_mumble.connected)
-				{
-					vtConfigs[id] = {};
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_CHANNEL", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
-			auto channel = context.GetArgument<int>(1);
-
-			if (id >= 0 && id < 31)
-			{
-				if (g_mumble.connected)
-				{
-					auto targetChannel = fmt::sprintf("Game Channel %d", channel);
-					auto& targets = vtConfigs[id].targets;
-					targets.remove_if([targetChannel](auto& target)
-					{
-						return target.channel == targetChannel;
-					});
-
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_PLAYER", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
-			auto playerId = context.GetArgument<int>(1);
-
-			if (id >= 0 && id < 31)
-			{
-				if (g_mumble.connected)
-				{
-					std::wstring targetName = getMumbleName(playerId);
-
-					auto& targets = vtConfigs[id].targets;
-					targets.remove_if([targetName](auto& target)
-					{
-						return target.users.size() > 0 && std::find(target.users.begin(), target.users.end(), targetName) != target.users.end();
-					});
-
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_PLAYER_BY_SERVER_ID", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
-			auto serverId = context.GetArgument<int>(1);
-
-			if (id >= 0 && id < 31)
-			{
-				if (g_mumble.connected)
-				{
-					VoiceTargetConfig::Target ch;
-					std::wstring targetName = g_mumbleClient->GetPlayerNameFromServerId(serverId);
-
-					if (!targetName.empty())
-					{
-						auto& targets = vtConfigs[id].targets;
-						targets.remove_if([targetName](auto& target)
-						{
-							return target.users.size() > 0 && std::find(target.users.begin(), target.users.end(), targetName) != target.users.end();
-						});
-					}
-				}
-
+				vtConfigs[id] = {};
 				g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
 			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET_CHANNELS", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
-
-			if (id >= 0 && id < 31)
+			else
 			{
-				if (g_mumble.connected)
-				{
-					auto& targets = vtConfigs[id].targets;
-					targets.remove_if([](auto& target)
-					{
-						return !target.channel.empty();
-					});
-
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
+				InvalidTargetIdWarning("MUMBLE_CLEAR_VOICE_TARGET");
 			}
-		});
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET_PLAYERS", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
 
-			if (id >= 0 && id < 31)
-			{
-				if (g_mumble.connected)
-				{
-					auto& targets = vtConfigs[id].targets;
-					targets.remove_if([](auto& target)
-					{
-						return target.users.size() > 0;
-					});
-
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_CHANNEL_LISTEN", [](fx::ScriptContext& context)
-		{
-			auto channel = context.GetArgument<int>(0);
-
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->AddListenChannel(fmt::sprintf("Game Channel %d", channel));
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_CHANNEL_LISTEN", [](fx::ScriptContext& context)
-		{
-			auto channel = context.GetArgument<int>(0);
-
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->RemoveListenChannel(fmt::sprintf("Game Channel %d", channel));
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_CHANNEL", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_CHANNEL", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			auto id = context.GetArgument<int>(0);
 			auto channel = context.GetArgument<int>(1);
 
-			if (id >= 0 && id < 31)
+			if (IsVoiceTargetIdValid(id))
 			{
-				if (g_mumble.connected)
-				{
-					VoiceTargetConfig::Target ch;
-					ch.channel = fmt::sprintf("Game Channel %d", channel);
+				auto targetChannel = GetMumbleChannel(channel);
+				auto& targets = vtConfigs[id];
 
-					vtConfigs[id].targets.push_back(ch);
+				// we only want to mark the voice target config as pending if we actually modified it
+				// `erase()` will return `0` if it didn't remove anything or `1` if it did
+				if (targets.channels.erase(targetChannel))
+				{
 					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
 				}
 			}
-		});
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_REMOVE_VOICE_TARGET_CHANNEL");
+			}
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_PLAYER", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_PLAYER", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			auto id = context.GetArgument<int>(0);
 			auto playerId = context.GetArgument<int>(1);
 
-			if (id >= 0 && id < 31)
+			if (IsVoiceTargetIdValid(id))
 			{
-				if (g_mumble.connected)
+				if (auto targetName = getMumbleName(playerId))
 				{
-					VoiceTargetConfig::Target ch;
-					std::wstring name = getMumbleName(playerId);
+					auto& targets = vtConfigs[id];
 
-					ch.users.push_back(name);
-
-					vtConfigs[id].targets.push_back(ch);
-					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
-				}
-			}
-		});
-
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_PLAYER_BY_SERVER_ID", [](fx::ScriptContext& context)
-		{
-			auto id = context.GetArgument<int>(0);
-			int serverId = context.GetArgument<int>(1);
-
-			if (id >= 0 && id < 31)
-			{
-				if (g_mumble.connected)
-				{
-					VoiceTargetConfig::Target ch;
-					std::wstring name = g_mumbleClient->GetPlayerNameFromServerId(serverId);
-
-					if (!name.empty())
+					// we only want to mark the voice target config as pending if we actually modified it
+					// `erase()` will return `0` if it didn't remove anything or `1` if it did
+					if (targets.users.erase(*targetName))
 					{
-						ch.users.push_back(name);
-
-						vtConfigs[id].targets.push_back(ch);
 						g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
 					}
 				}
 			}
-		});
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_REMOVE_VOICE_TARGET_PLAYER");
+			}
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOICE_TARGET", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_TARGET_PLAYER_BY_SERVER_ID", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+			auto serverId = context.GetArgument<int>(1);
+
+			if (IsVoiceTargetIdValid(id))
+			{
+				std::string targetName = g_mumbleClient->GetPlayerNameFromServerId(serverId);
+
+				// if the player doesn't exist then we don't want to update targetting 
+				if (targetName.empty())
+				{
+					return;
+				}
+				
+				auto& targets = vtConfigs[id];
+
+				if (targets.users.erase(targetName))
+				{
+					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
+				}
+			}
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_REMOVE_VOICE_TARGET_PLAYER_BY_SERVER_ID");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET_CHANNELS", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			auto id = context.GetArgument<int>(0);
 
-			if (id >= 0 && id < 31)
+			if (IsVoiceTargetIdValid(id))
 			{
-				if (g_mumble.connected)
+				auto& targets = vtConfigs[id];
+				
+				targets.channels.clear();
+
+				g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
+			}
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_CLEAR_VOICE_TARGET_CHANNELS");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_TARGET_PLAYERS", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+
+			if (IsVoiceTargetIdValid(id))
+			{
+				auto& targets = vtConfigs[id];
+
+				targets.users.clear();
+
+				g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
+			}
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_CLEAR_VOICE_TARGET_PLAYERS");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_CHANNEL_LISTEN", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto channel = context.GetArgument<int>(0);
+
+			const std::string channelName =	GetMumbleChannel(channel); 
+			if (g_mumbleClient->DoesChannelExist(channelName))
+			{
+				g_mumbleClient->AddListenChannel(channelName);
+			}
+			else
+			{
+				fx::scripting::Warningf("mumble", "MUMBLE_ADD_VOICE_CHANNEL_LISTEN: Tried to call native on a channel that didn't exist");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_REMOVE_VOICE_CHANNEL_LISTEN", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto channel = context.GetArgument<int>(0);
+
+			g_mumbleClient->RemoveListenChannel(GetMumbleChannel(channel));
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_CHANNEL", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+			auto channel = context.GetArgument<int>(1);
+
+			if (IsVoiceTargetIdValid(id))
+			{
+				auto& targets = vtConfigs[id];
+				
+				targets.channels.emplace(GetMumbleChannel(channel));
+				
+				g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
+			}
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_ADD_VOICE_TARGET_CHANNEL");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_DOES_CHANNEL_EXIST", MakeMumbleNative([](fx::ScriptContext& context) {
+			auto channel = context.GetArgument<int>(0);
+
+			context.SetResult<bool>(g_mumbleClient->DoesChannelExist(GetMumbleChannel(channel)));
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_PLAYER", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+			auto playerId = context.GetArgument<int>(1);
+
+			if (IsVoiceTargetIdValid(id))
+			{
+				auto& targets = vtConfigs[id];
+				if (auto name = getMumbleName(playerId))
 				{
-					g_mumbleClient->SetVoiceTarget(id);
+					targets.users.emplace(*name);
+					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
 				}
 			}
-		});
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_ADD_VOICE_TARGET_PLAYER");
+			}
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_GET_VOICE_CHANNEL_FROM_SERVER_ID", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_ADD_VOICE_TARGET_PLAYER_BY_SERVER_ID", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+			int serverId = context.GetArgument<int>(1);
+
+			if (IsVoiceTargetIdValid(id))
+			{
+				std::string name = g_mumbleClient->GetPlayerNameFromServerId(serverId);
+
+				if (!name.empty())
+				{
+					vtConfigs[id].users.emplace(name);
+					g_mumbleClient->UpdateVoiceTarget(id, vtConfigs[id]);
+				}
+			}
+			else
+			{
+				InvalidTargetIdWarning("MUMBLE_ADD_VOICE_TARGET_PLAYER_BY_SERVER_ID");
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOICE_TARGET", MakeMumbleNative([](fx::ScriptContext& context)
+		{
+			auto id = context.GetArgument<int>(0);
+
+			// We can set our voice target to 0..31 here (and only here!)
+			if (id >= 0 && id < 31)
+			{
+				g_mumbleClient->SetVoiceTarget(id);
+			}
+			else
+			{
+				fx::scripting::Warningf("mumble", "Invalid voice target id %d", id);
+			}
+		}));
+
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_GET_VOICE_CHANNEL_FROM_SERVER_ID", MakeMumbleNative([](fx::ScriptContext& context)
 		{
 			int serverId = context.GetArgument<int>(0);
 			int channelId = -1;
 
-			if (g_mumble.connected)
-			{
-				auto channelName = g_mumbleClient->GetVoiceChannelFromServerId(serverId);
+			auto channelName = g_mumbleClient->GetVoiceChannelFromServerId(serverId);
 
-				if (!channelName.empty())
+			if (!channelName.empty())
+			{
+				if (channelName.find("Game Channel ") == 0)
 				{
-					if (channelName.find("Game Channel ") == 0)
-					{
-						channelId = std::stoi(channelName.substr(13));
-					}
-					else if (channelName == "Root")
-					{
-						channelId = 0;
-					}
+					channelId = std::stoi(channelName.substr(13));
+				}
+				else if (channelName == "Root")
+				{
+					channelId = 0;
 				}
 			}
 
 			context.SetResult<int>(channelId);
-		});
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_IS_CONNECTED", [](fx::ScriptContext& context)
+		// MakeMumbleNative will return false automatically if we're not connected.
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_IS_CONNECTED", MakeMumbleNative([](fx::ScriptContext& context)
 		{
-			context.SetResult<bool>(g_mumble.connected ? true : false);
-		});
+			context.SetResult<bool>(true);
+		}));
 		
 		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_SERVER_ADDRESS", [](fx::ScriptContext& context)
 		{
 			auto address = context.GetArgument<const char*>(0);
 			int port = context.GetArgument<int>(1);
+			
+			// If we set our address to an empty and our port is -1 we should reset our override
+			if (address == "" && port == -1)
+			{
+				g_mumble.overridePeer = {};
+				Mumble_Disconnect(true);
+				return;
+			}
 
-			boost::optional<net::PeerAddress> overridePeer = net::PeerAddress::FromString(fmt::sprintf("%s:%d", address, port), port);
+			auto formattedAddress = fmt::sprintf("%s:%d", address, port);
+			boost::optional<net::PeerAddress> overridePeer = net::PeerAddress::FromString(formattedAddress, port);
 
 			if (overridePeer)
 			{
@@ -1224,7 +1336,7 @@ static HookFunction hookFunction([]()
 			}
 			else
 			{
-				throw std::exception("Couldn't resolve Mumble server address.");
+				throw std::exception(va("Couldn't resolve Mumble server address %s.", formattedAddress));
 			}
 		});
 
@@ -1242,21 +1354,15 @@ static HookFunction hookFunction([]()
 			g_mumbleClient->SetAudioOutputDistance(dist);
 		});
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_CHANNEL", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_CLEAR_VOICE_CHANNEL", MakeMumbleNative([](fx::ScriptContext& context)
 		{
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->SetChannel("Root");
-			}
-		});
+			g_mumbleClient->SetChannel("Root");
+		}));
 
-		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOICE_CHANNEL", [](fx::ScriptContext& context)
+		fx::ScriptEngine::RegisterNativeHandler("MUMBLE_SET_VOICE_CHANNEL", MakeMumbleNative([](fx::ScriptContext& context)
 		{
-			if (g_mumble.connected)
-			{
-				g_mumbleClient->SetChannel(fmt::sprintf("Game Channel %d", context.GetArgument<int>(0)));
-			}
-		});
+			g_mumbleClient->SetChannel(GetMumbleChannel(context.GetArgument<int>(0)));
+		}));
 
 		scrBindGlobal("GET_AUDIOCONTEXT_FOR_CLIENT", getAudioContext);
 		scrBindGlobal("GET_AUDIOCONTEXT_FOR_SERVERID", getAudioContextByServerId);
@@ -1287,9 +1393,9 @@ static HookFunction hookFunction([]()
 
 		fx::ScriptEngine::RegisterNativeHandler(0x031E11F3D447647E, [=](fx::ScriptContext& context)
 		{
-			if (!g_mumble.connected)
+			if (!IsMumbleConnected())
 			{
-				(*origIsTalking)(context);
+				origIsTalking(context);
 				return;
 			}
 
@@ -1309,19 +1415,19 @@ static HookFunction hookFunction([]()
 
 		fx::ScriptEngine::RegisterNativeHandler(0xEF6212C2EFEF1A23, [=](fx::ScriptContext& context)
 		{
-			(*origSetChannel)(context);
+			origSetChannel(context);
 
-			if (g_mumble.connected)
+			if (IsMumbleConnected())
 			{
-				g_mumbleClient->SetChannel(fmt::sprintf("Game Channel %d", context.GetArgument<int>(0)));
+				g_mumbleClient->SetChannel(GetMumbleChannel(context.GetArgument<int>(0)));
 			}
 		});
 
 		fx::ScriptEngine::RegisterNativeHandler(0xE036A705F989E049, [=](fx::ScriptContext& context)
 		{
-			(*origClearChannel)(context);
+			origClearChannel(context);
 
-			if (g_mumble.connected)
+			if (IsMumbleConnected())
 			{
 				g_mumbleClient->SetChannel("Root");
 			}
@@ -1332,7 +1438,7 @@ static HookFunction hookFunction([]()
 
 		fx::ScriptEngine::RegisterNativeHandler(0xCBF12D65F95AD686, [=](fx::ScriptContext& context)
 		{
-			(*origSetProximity)(context);
+			origSetProximity(context);
 
 			float dist = context.GetArgument<float>(0);
 
@@ -1341,7 +1447,7 @@ static HookFunction hookFunction([]()
 
 		fx::ScriptEngine::RegisterNativeHandler(0x84F0F13120B4E098, [=](fx::ScriptContext& context)
 		{
-			(*origGetProximity)(context);
+			origGetProximity(context);
 
 			float proximity = g_mumbleClient->GetAudioDistance();
 
@@ -1352,7 +1458,7 @@ static HookFunction hookFunction([]()
 
 		fx::ScriptEngine::RegisterNativeHandler(0xBABEC9E69A91C57B, [origSetVoiceActive](fx::ScriptContext& context)
 		{
-			(*origSetVoiceActive)(context);
+			origSetVoiceActive(context);
 
 			g_voiceActiveByScript = context.GetArgument<bool>(0);
 		});
@@ -1366,7 +1472,7 @@ static HookFunction hookFunction([]()
 	MH_CreateHook(hook::get_call(hook::get_pattern("48 8B D0 E8 ? ? ? ? 40 8A F0 8B 8F", 3)), _isPlayerTalking, (void**)&g_origIsPlayerTalking);
 	MH_CreateHook(hook::get_call(hook::get_pattern("89 44 24 58 0F 29 44 24 40 E8", 9)), _filterVoiceChatConfig, (void**)&g_origInitVoiceEngine);
 	MH_CreateHook(hook::get_pattern("48 8B F8 48 85 C0 74 33 48 83 C3 30", -0x19), _getLocalAudioLevel, (void**)&g_origGetLocalAudioLevel);
-	MH_CreateHook(hook::get_pattern("80 78 05 00 B9", -0x1B), _getPlayerHasHeadset, (void**)&g_origGetPlayerHasHeadset);
+	MH_CreateHook(hook::get_call(hook::get_pattern("E8 ? ? ? ? 84 C0 74 ? 48 8D 4D ? E8 ? ? ? ? 84 C0 75 ? 48 8D 55 ? 49 8B CF")), _getPlayerHasHeadset, (void**)&g_origGetPlayerHasHeadset);
 #elif IS_RDR3
 	MH_CreateHook(hook::get_call(hook::get_pattern("E8 ? ? ? ? 84 C0 74 13 F3 0F 10 35")), _isAnyoneTalking, (void**)&g_origIsAnyoneTalking);
 	MH_CreateHook(hook::get_call(hook::get_pattern("E8 ? ? ? ? 8A D8 45 84 ED 75 08")), _isPlayerTalking, (void**)&g_origIsPlayerTalking);
